@@ -1,0 +1,320 @@
+клас, давай зробимо «варіант B» по-дорослому: повністю пропишу, коли й що пишемо в lock-таблицю, як беремо/відпускаємо замок, і як це вбудувати в усі сценарії з колекціями (create/truncate → fill, update, delete). Плюс — дам готовий пакунок, щоб не копіпастити шматками.
+
+---
+
+# 0) Таблиця-замок (разово)
+
+```sql
+-- створюємо один раз у схемі додатка
+create table app_coll_lock (
+  app_session   number       not null,
+  coll_name     varchar2(64) not null,
+  created_at    date         default sysdate not null,
+  last_used     date         default sysdate not null,
+  constraint app_coll_lock_uk unique (app_session, coll_name)
+);
+
+create index app_coll_lock_last_used_ix on app_coll_lock (last_used);
+```
+
+**Ідея:** на кожну пару `(APP_SESSION, COLL_NAME)` у нас є рівно один рядок — «якір», за який ми робимо `SELECT … FOR UPDATE`. Рядок можна не видаляти після операцій — ми просто лочимо його щоразу, оновлюючи `last_used`. При необхідності чистимо старі рядки джобом.
+
+---
+
+# 1) Пакет для роботи з замком
+
+## SPEC
+
+```plsql
+create or replace package app_coll_lock_pkg as
+  -- Взяти ексклюзивний замок на (session, collection). Чекаємо до p_wait_seconds.
+  procedure acquire(p_coll_name in varchar2, p_wait_seconds in integer default 10);
+
+  -- Взяти замки відразу на кілька колекцій (завжди в стабільному алфавітному порядку, щоб не ловити дедлоки)
+  procedure acquire_many(p_coll_names in apex_t_varchar2, p_wait_seconds in integer default 10);
+
+  -- Оновити last_used (не обовʼязково викликати — acquire робить це сам)
+  procedure touch(p_coll_name in varchar2);
+
+  -- Прибрати «застарілі» рядки (наприклад, старші за Х хвилин)
+  procedure cleanup_stale(p_older_than_minutes in number default 1440); -- 24h
+end app_coll_lock_pkg;
+/
+```
+
+## BODY
+
+```plsql
+create or replace package body app_coll_lock_pkg as
+
+  function sess return number is
+  begin
+    return to_number(v('APP_SESSION'));
+  end;
+
+  procedure ensure_row(p_coll_name in varchar2) is
+  begin
+    begin
+      insert into app_coll_lock(app_session, coll_name) values (sess, p_coll_name);
+    exception when dup_val_on_index then null;
+    end;
+  end;
+
+  procedure do_lock(p_coll_name in varchar2, p_wait_seconds in integer) is
+    l_dummy number;
+  begin
+    -- сам рядок гарантовано існує
+    select 1
+      into l_dummy
+      from app_coll_lock
+     where app_session = sess
+       and coll_name   = p_coll_name
+     for update wait p_wait_seconds;
+
+    update app_coll_lock
+       set last_used = sysdate
+     where app_session = sess
+       and coll_name   = p_coll_name;
+    -- замок тримається до COMMIT/ROLLBACK поточного процесу
+  end;
+
+  procedure acquire(p_coll_name in varchar2, p_wait_seconds in integer default 10) is
+  begin
+    ensure_row(p_coll_name);
+    do_lock(p_coll_name, p_wait_seconds);
+  exception
+    when others then
+      apex_error.add_error(
+        p_message          => 'Lock failed for collection '||p_coll_name||': '||sqlerrm,
+        p_display_location => apex_error.c_inline_in_notification
+      );
+      raise;
+  end;
+
+  procedure acquire_many(p_coll_names in apex_t_varchar2, p_wait_seconds in integer default 10) is
+  begin
+    -- стабільне сортування, щоб уникати дедлоків, коли два процеси лочать набір колекцій
+    for r in (select column_value as name
+                from table(p_coll_names)
+               order by 1) loop
+      ensure_row(r.name);
+    end loop;
+
+    for r in (select column_value as name
+                from table(p_coll_names)
+               order by 1) loop
+      do_lock(r.name, p_wait_seconds);
+    end loop;
+  exception
+    when others then
+      apex_error.add_error(
+        p_message          => 'Lock failed (many): '||sqlerrm,
+        p_display_location => apex_error.c_inline_in_notification
+      );
+      raise;
+  end;
+
+  procedure touch(p_coll_name in varchar2) is
+  begin
+    update app_coll_lock
+       set last_used = sysdate
+     where app_session = sess
+       and coll_name   = p_coll_name;
+  end;
+
+  procedure cleanup_stale(p_older_than_minutes in number default 1440) is
+  begin
+    delete from app_coll_lock
+     where last_used < (sysdate - (p_older_than_minutes/1440));
+    commit;
+  end;
+
+end app_coll_lock_pkg;
+/
+```
+
+> **Реліз замка:** відбувається автоматично на `COMMIT/ROLLBACK` вашого APEX-процесу. Окремої `release()` не треба. Просто не робіть `commit` посеред критичної секції.
+
+---
+
+# 2) Як це вбудувати у ваші сценарії з колекціями
+
+## 2.1. Створення/перечищення і наповнення (create\_or\_truncate → add\_member)
+
+```plsql
+declare
+  l_coll_name varchar2(64) :=
+    case
+      when :P6_TASK_MODE = 0 and :P6_TASK_TYPE = 2 then 'TASK_SUBTASKS_COLLECTION'
+      when :P6_TASK_MODE = 1 and :P6_TASK_TYPE = 2 then 'TASK_TEMPLATE_SUBTASKS_COLLECTION'
+    end;
+begin
+  if l_coll_name is null then
+    return;
+  end if;
+
+  -- 1) беремо замок
+  app_coll_lock_pkg.acquire(l_coll_name, p_wait_seconds => 10);
+
+  -- 2) атомарно чистимо/створюємо колекцію
+  apex_collection.create_or_truncate_collection(l_coll_name);
+
+  -- 3) наповнюємо
+  if l_coll_name = 'TASK_SUBTASKS_COLLECTION' then
+    if :P6_TASK_ID is not null then
+      for r in (
+        select t.task_id, t.subtask_content, t.planning_date_end,
+               t.parent_id, t.subtask_order, t.status_id, t.id as subtask_id
+          from TaskTracker.TASK_SUBTASKS@TO_TASKTRACKER10 t
+         where t.task_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001 => r.task_id,
+          p_c002 => r.subtask_content,
+          p_d001 => r.planning_date_end,
+          p_c003 => r.parent_id,
+          p_c004 => r.subtask_order,
+          p_c005 => r.status_id,
+          p_d002 => sysdate,
+          p_d003 => null,
+          p_c006 => :PO_CUR_USER_TABNO,
+          p_c007 => null,
+          p_c009 => r.subtask_id,
+          p_n001 => 0
+        );
+      end loop;
+    end if;
+
+  else -- TASK_TEMPLATE_SUBTASKS_COLLECTION
+    if :P6_TASK_ID is not null then
+      for r in (
+        select t.template_id, t.subtask_content, t.parent_id, t.subtask_order,
+               t.status_id, t.id as subtask_id, t.term_days
+          from TaskTracker.TASK_TEMPLATE_SUBTASKS@TO_TASKTRACKER10 t
+         where t.template_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001 => r.template_id,
+          p_c002 => r.subtask_content,
+          p_d001 => null,
+          p_c003 => r.parent_id,
+          p_c004 => r.subtask_order,
+          p_c005 => r.status_id,
+          p_d002 => sysdate,
+          p_d003 => null,
+          p_c006 => :PO_CUR_USER_TABNO,
+          p_c007 => null,
+          p_c009 => r.subtask_id,
+          p_n001 => 1,
+          p_n002 => r.term_days
+        );
+      end loop;
+    end if;
+  end if;
+
+  -- 4) коміт наприкінці процесу зніме замок
+exception
+  when others then
+    apex_error.add_error(
+      p_message          => 'Помилка завантаження колекції: '||sqlerrm,
+      p_display_location => apex_error.c_inline_in_notification
+    );
+    raise;
+end;
+```
+
+## 2.2. Оновлення елементів колекції (будь-які `apex_collection.update_member`, `add_member`, `delete_member`)
+
+```plsql
+begin
+  app_coll_lock_pkg.acquire('TASK_SUBTASKS_COLLECTION'); -- або інша ваша
+  -- ... робимо будь-які update/add/delete по колекції ...
+  -- коміт наприкінці процесу зніме замок
+end;
+```
+
+## 2.3. Видалення колекції повністю
+
+```plsql
+begin
+  app_coll_lock_pkg.acquire('TASK_SUBTASKS_COLLECTION');
+  apex_collection.delete_collection('TASK_SUBTASKS_COLLECTION');
+  -- commit звільнить замок
+end;
+```
+
+## 2.4. Робота з кількома колекціями в одному процесі
+
+```plsql
+declare
+  l_names apex_t_varchar2 := apex_t_varchar2('A_COLL','B_COLL','TASK_SUBTASKS_COLLECTION');
+begin
+  app_coll_lock_pkg.acquire_many(l_names, p_wait_seconds => 10);
+
+  apex_collection.create_or_truncate_collection('A_COLL');
+  apex_collection.create_or_truncate_collection('B_COLL');
+  -- ... наповнення кількох колекцій ...
+
+  -- commit наприкінці → одночасно відпустить усі замки
+end;
+```
+
+> `acquire_many` завжди лочить у **алфавітному порядку**, тож два паралельних процеси, що лочать один і той самий набір колекцій, не створять дедлок.
+
+---
+
+# 3) Коли вставляти/видаляти рядок у lock-таблицю?
+
+Є 2 стратегії:
+
+### Стратегія 1 (рекомендована): **«insert once per (session, collection)»**
+
+* Рядок створюється автоматично в `ensure_row()` при **першому** зверненні до колекції в межах сесії.
+* Далі ви **не видаляєте** його після кожної операції; просто берете `FOR UPDATE` коли треба замок.
+* Переваги:
+
+  * немає гонок «видалив — інший не зміг залочити»;
+  * менше DML; простіше.
+* Прибирання: або джобом `cleanup_stale` (наприклад, 1 раз на годину видаляємо `last_used < SYSDATE - 1`), або на логін/логаут подіях.
+
+### Стратегія 2: **«insert-lock-delete щоразу»** (я не раджу, але можна)
+
+* На старті — `insert` (із `dup_val_on_index` → значить хтось вже працює), далі `FOR UPDATE`, наприкінці — `delete`.
+* Мінуси:
+
+  * коли інший процес **чекає** на `FOR UPDATE`, а ви **видалите** рядок раніше коміту — він отримає помилку замість очікування;
+  * більше DML, більше шансів на колізії.
+* Якщо таки хочете — видаляйте лише **після** коміту всієї критичної секції і переконайтесь, що інший ніхто не чекає (це важко гарантувати).
+
+**Висновок:** лишайте рядок, не видаляйте на кожну операцію. Прибирайте «старі» рядки періодично.
+
+---
+
+# 4) Джоб для чистки (опційно)
+
+```plsql
+begin
+  dbms_scheduler.create_job(
+    job_name        => 'APP_COLL_LOCK_CLEANUP',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => 'begin app_coll_lock_pkg.cleanup_stale(60*24); end;', -- 24h
+    start_date      => systimestamp,
+    repeat_interval => 'FREQ=HOURLY;INTERVAL=1',
+    enabled         => true
+  );
+end;
+/
+```
+
+---
+
+# 5) Правила використання (коротко)
+
+* Будь-яка **мутація** колекції (create/truncate/fill, add/update/delete member, delete\_collection) → **спочатку** `app_coll_lock_pkg.acquire(<COLL>)`.
+* **Не робіть COMMIT** усередині критичної секції — інакше замок зніметься завчасно. Коміт наприкінці APEX-процесу — ок.
+* Для **кількох** колекцій у межах однієї транзакції — використовуйте `acquire_many` (уникнеш дедлоків).
+* Рядок в таблиці **не видаляємо** після кожної операції; його тримаємо до кінця сесії/прибираємо джобом.
+
+Якщо хочеш, можу впаяти ці виклики прямо в твій наявний процес (із `CREATE_OR_TRUNCATE_COLLECTION` і наповненням) — просто кинь актуальний блок, і я вбудую `acquire(...)` у правильних місцях.

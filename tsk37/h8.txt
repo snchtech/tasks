@@ -1,0 +1,156 @@
+Ось **повний код “Варіант B”** (лок через службову таблицю + атомарне створення/очищення колекції), у тій самій формі, що й “Варіант А”.
+
+---
+
+### 1) Разово створити службову таблицю-замок
+
+```sql
+-- Виконується один раз у схемі додатку
+create table app_coll_lock (
+  app_session number       not null,
+  coll_name   varchar2(64) not null,
+  constraint app_coll_lock_uk unique (app_session, coll_name)
+);
+```
+
+> Таблиця гарантує, що завжди є рядок для `SELECT ... FOR UPDATE`, навіть якщо колекція ще не створена.
+
+---
+
+### 2) APEX Server Process / PL/SQL блок (повний)
+
+```plsql
+declare
+  -- Яка колекція потрібна під режим
+  l_coll_name   varchar2(64);
+
+  -- Для блокування рядка у службовій таблиці
+  l_app_sess    number := to_number(v('APP_SESSION'));
+  l_dummy       number;
+
+  -- Скільки секунд чекати, якщо хтось уже вантажить цю ж колекцію
+  c_lock_wait_s constant integer := 10;
+
+  -- Хелпер: забезпечити рядок-«замок» і взяти блокування
+  procedure lock_collection_row(p_coll_name in varchar2) is
+  begin
+    -- гарантуємо існування рядка
+    begin
+      insert into app_coll_lock (app_session, coll_name)
+      values (l_app_sess, p_coll_name);
+    exception
+      when dup_val_on_index then
+        null; -- уже є
+    end;
+
+    -- беремо ексклюзивну блокіровку на рядок (чекаємо до c_lock_wait_s сек)
+    select 1
+      into l_dummy
+      from app_coll_lock
+     where app_session = l_app_sess
+       and coll_name   = p_coll_name
+     for update wait c_lock_wait_s;
+  end;
+
+begin
+  -- 0) Визначаємо ім'я колекції за режимом
+  if :P6_TASK_MODE = 0 and :P6_TASK_TYPE = 2 then
+    l_coll_name := 'TASK_SUBTASKS_COLLECTION';
+  elsif :P6_TASK_MODE = 1 and :P6_TASK_TYPE = 2 then
+    l_coll_name := 'TASK_TEMPLATE_SUBTASKS_COLLECTION';
+  else
+    return; -- інші режими не обробляємо
+  end if;
+
+  -- 1) Критична секція: блокування рядка для цієї (session, collection)
+  lock_collection_row(l_coll_name);
+
+  -- 2) Атомарно створюємо/чистимо колекцію
+  apex_collection.create_or_truncate_collection(l_coll_name);
+
+  -- 3) Наповнюємо колекцію
+  if l_coll_name = 'TASK_SUBTASKS_COLLECTION' then
+    if :P6_TASK_ID is not null then
+      for r in (
+        select
+          t.task_id,
+          t.subtask_content,
+          t.planning_date_end,
+          t.parent_id,
+          t.subtask_order,
+          t.status_id,
+          t.id as subtask_id
+        from TaskTracker.TASK_SUBTASKS@TO_TASKTRACKER10 t
+        where t.task_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001            => r.task_id,
+          p_c002            => r.subtask_content,
+          p_d001            => r.planning_date_end,
+          p_c003            => r.parent_id,
+          p_c004            => r.subtask_order,
+          p_c005            => r.status_id,
+          p_d002            => sysdate,
+          p_d003            => null,
+          p_c006            => :PO_CUR_USER_TABNO,  -- уважно: латинська 'c'
+          p_c007            => null,
+          p_c009            => r.subtask_id,        -- ID підзавдання в БД
+          p_n001            => 0                    -- task_mode = 0
+        );
+      end loop;
+    end if;
+
+  else -- 'TASK_TEMPLATE_SUBTASKS_COLLECTION'
+    if :P6_TASK_ID is not null then
+      for r in (
+        select
+          t.template_id,
+          t.subtask_content,
+          t.parent_id,
+          t.subtask_order,
+          t.status_id,
+          t.id         as subtask_id,
+          t.term_days
+        from TaskTracker.TASK_TEMPLATE_SUBTASKS@TO_TASKTRACKER10 t
+        where t.template_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001            => r.template_id,
+          p_c002            => r.subtask_content,
+          p_d001            => null,
+          p_c003            => r.parent_id,
+          p_c004            => r.subtask_order,
+          p_c005            => r.status_id,
+          p_d002            => sysdate,
+          p_d003            => null,
+          p_c006            => :PO_CUR_USER_TABNO,
+          p_c007            => null,
+          p_c009            => r.subtask_id, -- ID підшаблону в БД
+          p_n001            => 1,            -- task_mode = 1
+          p_n002            => r.term_days
+        );
+      end loop;
+    end if;
+  end if;
+
+  -- 4) Явний COMMIT не робимо. Блокування зніметься автоматично на коміті процесу.
+exception
+  when others then
+    apex_error.add_error(
+      p_message          => 'Помилка завантаження колекції: '||sqlerrm,
+      p_display_location => apex_error.c_inline_in_notification
+    );
+    raise;
+end;
+```
+
+---
+
+#### Важливі дрібниці
+
+* Використовується `APEX_COLLECTION.CREATE_OR_TRUNCATE_COLLECTION` (швидше та без гонок, ніж `EXISTS/DELETE/CREATE`).
+* Замок діє **на рівні (APP\_SESSION, COLL\_NAME)**, тому паралельні кліки одного користувача по цій же колекції не зламають процес.
+* Не став `COMMIT` у середині — інакше можна «відпустити» замок надто рано.
+* Перевір правильність назв (`TASK_SUBTASKS_COLLECTION`, `TASK_TEMPLATE_SUBTASKS_COLLECTION`) і полів (`p_c006` саме латиницею).

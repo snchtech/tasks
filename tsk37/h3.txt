@@ -1,0 +1,255 @@
+!!!!!  При update subtask в грі треба прописати subtask_id з БД, щоб воно не занулялось при збереженні.
+
+Так, маркер `r.c008 = 'UPDATE'` можна враховувати. Нижче дав 2 варіанти:
+
+* **Варіант А (універсальний)** — один процес, що обробляє `NEW/UPDATE/DELETE` за маркером у `c008`, але й **fallback**: якщо є `subtask_id`, оновлюємо навіть без маркера.
+* **Варіант B (точкове оновлення)** — окремий `MERGE` тільки для рядків з `c008='UPDATE'`.
+
+> Примітка: якщо ти й так надійно опираєшся на `subtask_id`, маркер не обов’язковий. Але код нижче показує, як його використати.
+
+---
+
+## Варіант А. Один процес «Зберегти підзавдання»
+
+```plsql
+declare
+  c_coll_name constant varchar2(64) := 'TASK_SUBTASKS_COLLECTION';
+  l_task_id   number := :P5_TASK_ID; -- візьми свій item з ID завдання
+
+  cursor c_sub is
+    select
+      seq_id,
+      c001 as c_task_id,           -- опційно (може бути null під час створення)
+      c002 as c_subtask_content,
+      d001 as d_planning_date_end,
+      c003 as c_parent_id_raw,     -- може бути tmp parent (обробимо нижче)
+      c004 as c_subtask_order,
+      c005 as c_status_id,
+      c006 as c_creator,
+      c007 as c_updator,
+      c008 as c_action,            -- 'NEW' | 'UPDATE' | 'DELETE' | NULL
+      d002 as d_date_create,
+      d003 as d_date_update,
+      n001 as n_task_mode,         -- якщо потрібно
+      c016 as c_subtask_id         -- існуючий ID підзавдання (якщо є)
+    from apex_collections
+   where collection_name = c_coll_name;
+
+  -- якщо у тебе бувають тимчасові parent_id типу 'TMP:123'
+  function parse_parent_id(p_raw in varchar2) return number is
+    l_id number;
+  begin
+    if p_raw is null then return null; end if;
+    -- якщо формат 'TMP:123' — не мапимо, повертаємо null (пізніше оновиш після вставки батьків)
+    if instr(p_raw, 'TMP:') = 1 then
+      return null;
+    else
+      l_id := to_number(p_raw);
+      return l_id;
+    end if;
+  exception when value_error then
+    return null;
+  end;
+
+  -- хелпер: оновлення підзавдання
+  procedure do_update(
+    p_id                in number,
+    p_content           in varchar2,
+    p_plan_end          in date,
+    p_parent_id         in number,
+    p_order             in number,
+    p_status_id         in number,
+    p_updator           in varchar2,
+    p_date_update       in date
+  ) is
+  begin
+    update task_subtasks
+       set subtask_content   = p_content,
+           planning_date_end = p_plan_end,
+           parent_id         = p_parent_id,
+           subtask_order     = p_order,
+           status_id         = p_status_id,
+           updator           = nvl(p_updator, :APP_USER),
+           date_update       = nvl(p_date_update, sysdate)
+     where id = p_id;
+  end;
+
+  -- хелпер: вставка нового підзавдання
+  procedure do_insert(
+    p_task_id           in number,
+    p_content           in varchar2,
+    p_plan_end          in date,
+    p_parent_id         in number,
+    p_order             in number,
+    p_status_id         in number,
+    p_creator           in varchar2,
+    p_date_create       in date
+  ) is
+    l_new_id number;
+  begin
+    insert into task_subtasks (
+      id, task_id, subtask_content, planning_date_end,
+      parent_id, subtask_order, status_id, creator, date_create
+    )
+    values (
+      task_subtasks_seq.nextval,
+      p_task_id,
+      p_content,
+      p_plan_end,
+      p_parent_id,
+      p_order,
+      nvl(p_status_id, 1),
+      nvl(p_creator, :APP_USER),
+      nvl(p_date_create, sysdate)
+    )
+    returning id into l_new_id;
+
+    -- Якщо є потреба — тут можна оновити дітей, у яких був temp parent → l_new_id
+    null;
+  end;
+
+  -- хелпер: видалення
+  procedure do_delete(p_id in number) is
+  begin
+    delete from task_subtasks where id = p_id;
+  end;
+
+begin
+  for r in c_sub loop
+    -- підготувати дані
+    -- якщо task_id не заповнений у колекції, беремо з форми
+    -- (актуально для існуючого завдання)
+    -- якщо зберігаєш драфт без task_id — адаптуй під себе
+    if l_task_id is not null then
+      null; -- тримаємо з форми
+    elsif r.c_task_id is not null then
+      l_task_id := to_number(r.c_task_id);
+    end if;
+
+    -- парсимо parent_id
+    declare
+      l_parent_id number := parse_parent_id(r.c_parent_id_raw);
+    begin
+      -- 1) Явний DELETE
+      if upper(nvl(r.c_action, '')) = 'DELETE' and r.c_subtask_id is not null then
+        do_delete(to_number(r.c_subtask_id));
+
+      -- 2) Явний UPDATE за маркером
+      elsif upper(nvl(r.c_action, '')) = 'UPDATE' and r.c_subtask_id is not null then
+        do_update(
+          p_id          => to_number(r.c_subtask_id),
+          p_content     => r.c_subtask_content,
+          p_plan_end    => r.d_planning_date_end,
+          p_parent_id   => l_parent_id,
+          p_order       => to_number(r.c_subtask_order),
+          p_status_id   => to_number(r.c_status_id),
+          p_updator     => r.c_updator,
+          p_date_update => r.d_date_update
+        );
+
+      -- 3) Явний NEW за маркером
+      elsif upper(nvl(r.c_action, '')) = 'NEW' then
+        do_insert(
+          p_task_id     => l_task_id,
+          p_content     => r.c_subtask_content,
+          p_plan_end    => r.d_planning_date_end,
+          p_parent_id   => l_parent_id,
+          p_order       => to_number(r.c_subtask_order),
+          p_status_id   => to_number(r.c_status_id),
+          p_creator     => r.c_creator,
+          p_date_create => r.d_date_create
+        );
+
+      -- 4) Fallback-логіка:
+      --    якщо subtask_id є, а маркерів немає → вважаємо, що це UPDATE;
+      --    якщо subtask_id немає і це не DELETE → INSERT
+      elsif r.c_subtask_id is not null then
+        do_update(
+          p_id          => to_number(r.c_subtask_id),
+          p_content     => r.c_subtask_content,
+          p_plan_end    => r.d_planning_date_end,
+          p_parent_id   => l_parent_id,
+          p_order       => to_number(r.c_subtask_order),
+          p_status_id   => to_number(r.c_status_id),
+          p_updator     => r.c_updator,
+          p_date_update => r.d_date_update
+        );
+
+      elsif upper(nvl(r.c_action, '')) <> 'DELETE' then
+        do_insert(
+          p_task_id     => l_task_id,
+          p_content     => r.c_subtask_content,
+          p_plan_end    => r.d_planning_date_end,
+          p_parent_id   => l_parent_id,
+          p_order       => to_number(r.c_subtask_order),
+          p_status_id   => to_number(r.c_status_id),
+          p_creator     => r.c_creator,
+          p_date_create => r.d_date_create
+        );
+      end if;
+    end;
+  end loop;
+
+  -- коміт за політикою вашого додатку
+  -- commit;
+exception
+  when others then
+    -- лог/помилка на екран
+    apex_error.add_error(
+      p_message          => 'Помилка збереження підзавдань: '||sqlerrm,
+      p_display_location => apex_error.c_inline_in_notification
+    );
+    raise;
+end;
+```
+
+**Що змінилося проти звичного підходу по `subtask_id`:**
+
+* Додано гілку `elsif upper(nvl(r.c_action,'')) = 'UPDATE'` — виконується **тільки** якщо прийшов маркер `UPDATE`.
+* Залишено **fallback**: якщо `subtask_id` є, але маркеру нема — все одно робимо `UPDATE` (щоб не ламати поточні сценарії).
+* Для `NEW`/`DELETE` аналогічно за `c008`.
+
+---
+
+## Варіант B. Окремий процес «Оновити тільки позначені як UPDATE»
+
+Зручно, якщо хочеш **примусово** оновлювати лише ті рядки, де `c008='UPDATE'`, решту обробляти іншими процесами.
+
+```plsql
+merge /*+ use_hash(s) */ into task_subtasks t
+using (
+  select
+    to_number(c016)             as id,              -- subtask_id
+    c002                        as subtask_content,
+    d001                        as planning_date_end,
+    to_number(c003)             as parent_id,       -- якщо є tmp-значення, прибери або парси
+    to_number(c004)             as subtask_order,
+    to_number(c005)             as status_id,
+    nvl(c007, :APP_USER)        as updator,
+    nvl(d003, sysdate)          as date_update
+  from apex_collections
+  where collection_name = 'TASK_SUBTASKS_COLLECTION'
+    and upper(nvl(c008,'')) = 'UPDATE'
+    and c016 is not null
+) s
+on (t.id = s.id)
+when matched then update set
+  t.subtask_content   = s.subtask_content,
+  t.planning_date_end = s.planning_date_end,
+  t.parent_id         = s.parent_id,
+  t.subtask_order     = s.subtask_order,
+  t.status_id         = s.status_id,
+  t.updator           = s.updator,
+  t.date_update       = s.date_update;
+```
+
+> Якщо у `c003` може приїхати тимчасовий parent (типу `'TMP:123'`), краще в `using(...)` зробити безпечний `case when regexp_like(c003,'^\d+$') then to_number(c003) end as parent_id`.
+
+---
+
+### Коли маркер `UPDATE` має сенс?
+
+* Коли у колекції є **суміш**: нові, видалені, змінені й **незмінені** рядки, і ти хочеш не торкатися незмінених.
+* Коли треба **мінімізувати** DML (наприклад, щоби не чіпати AUDIT-тригери та не міняти `date_update` без потреби).
+
+Якщо ж ти **завжди** довіряєш `subtask_id` і зберігаєш *тільки* те, що реально редагували — маркер не обов’язковий. Але показаний код дозволяє обидва підходи паралельно, без лому існуючої логіки.

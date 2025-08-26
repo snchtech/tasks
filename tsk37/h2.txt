@@ -1,0 +1,707 @@
+Чудово. Нижче — **повний робочий пакет** (SPEC+BODY) з новою логікою побудови динамічного HTML‑блоку «картки відміток» на основі вашого коду.
+В APEX‑регіоні PL/SQL Dynamic Content ви залишаєте лише виклик `confirm_cart_pkg.render(...)` (приклад у кінці).
+
+> Я зберіг вашу структуру: етапи → підетапи → рядки з APEX\_COLLECTIONS, історія підписів, усі комбінації ролей (посада/відділ/unit/таб№), підзавдання, кнопка модератора.
+> Верстка збирається у CLOB (без тисяч `htp.p`), вся важка логіка винесена в окремі функції.
+
+---
+
+# 1) PACKAGE SPEC
+
+```plsql
+create or replace package confirm_cart_pkg as
+  ------------------------------------------------------------------------------
+  -- ПУБЛІЧНИЙ ІНТЕРФЕЙС
+  -- Головний рендерер повертає зібраний HTML як CLOB
+  ------------------------------------------------------------------------------
+  function render(
+    p_app_id             in number,
+    p_page_list_id       in number,
+    p_substitution_mode  in number,
+    p_cur_position_id    in number,
+    p_new_position_id    in number,
+    p_cur_tabno          in number,
+    p_new_tabno          in number,
+    p_cur_department_id  in number,
+    p_new_department_id  in number,
+    p_new_roles          in varchar2,
+    p_app_user           in varchar2,
+    p_p5_status_id       in number,     -- для логіки кнопки "Скасувати заявку"
+    p_stage_for_subtask  in number := 4 -- у якому етапі показувати текст підзавдання
+  ) return clob;
+end confirm_cart_pkg;
+/
+```
+
+---
+
+# 2) PACKAGE BODY
+
+```plsql
+create or replace package body confirm_cart_pkg as
+
+  ------------------------------------------------------------------------------
+  -- УТИЛІТИ ДЛЯ ЗБІРКИ HTML
+  ------------------------------------------------------------------------------
+
+  procedure append(p_buf in out nocopy clob, p_txt in varchar2) is
+  begin
+    if p_txt is not null then
+      dbms_lob.writeappend(p_buf, length(p_txt), p_txt);
+    end if;
+  end;
+
+  function h(p_txt in varchar2) return varchar2 is
+  begin
+    return apex_escape.html(p_txt);
+  end;
+
+  function nvl_str(p_val in varchar2, p_def in varchar2) return varchar2 is
+  begin
+    return case when p_val is null then p_def else p_val end;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- КОНТЕКСТ КОРИСТУВАЧА (вирішує реально активні ідентифікатори з урахуванням заміщення)
+  ------------------------------------------------------------------------------
+
+  procedure resolve_context_ids(
+    p_substitution_mode     in number,
+    p_cur_position_id       in number,
+    p_new_position_id       in number,
+    p_cur_tabno             in number,
+    p_new_tabno             in number,
+    p_cur_department_id     in number,
+    p_new_department_id     in number,
+    o_position_id           out number,
+    o_tabno                 out number,
+    o_department_id         out number
+  ) is
+  begin
+    if p_substitution_mode = 1 then
+      o_position_id   := p_new_position_id;
+      o_tabno         := p_new_tabno;
+      o_department_id := p_new_department_id;
+    else
+      o_position_id   := p_cur_position_id;
+      o_tabno         := p_cur_tabno;
+      o_department_id := p_cur_department_id;
+    end if;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ЧИ МОДЕРАТОР (R_4)
+  ------------------------------------------------------------------------------
+
+  function is_moderator(
+    p_substitution_mode in number,
+    p_new_roles         in varchar2,
+    p_app_id            in number,
+    p_app_user          in varchar2
+  ) return boolean
+  is
+  begin
+    if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles,'~'), 'R_4') > 0;
+    else
+      return apex_acl.has_user_role(p_app_id, p_app_user, 'R_4');
+    end if;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ПЕРЕВІРКА РОЛІ ДЛЯ РЯДКА (посада/відділ/unit/таб№)
+  ------------------------------------------------------------------------------
+
+  function has_role(
+    p_list_position_id   in number,
+    p_list_department_id in number,
+    p_list_unit_id       in number,
+    p_list_tab_no        in number,
+    p_ctx_position_id    in number,
+    p_ctx_department_id  in number,
+    p_ctx_tabno          in number,
+    p_substitution_mode  in number,
+    p_new_roles          in varchar2,
+    p_app_id             in number,
+    p_app_user           in varchar2
+  ) return boolean
+  is
+    l_is_position   boolean := true;
+    l_is_department boolean := true;
+    l_is_unit       boolean := true;
+    l_is_tabno      boolean := true;
+  begin
+    if p_list_position_id is not null then
+      l_is_position := (p_list_position_id = p_ctx_position_id);
+    end if;
+
+    if p_list_department_id is not null then
+      l_is_department := (p_list_department_id = p_ctx_department_id);
+    end if;
+
+    if p_list_unit_id is not null then
+      if p_substitution_mode = 1 then
+        l_is_unit := instr(nvl(p_new_roles,'~'), 'U_'||p_list_unit_id) > 0;
+      else
+        l_is_unit := apex_acl.has_user_role(p_app_id, p_app_user, 'U_'||p_list_unit_id);
+      end if;
+    end if;
+
+    if p_list_tab_no is not null then
+      l_is_tabno := (p_list_tab_no = p_ctx_tabno);
+    end if;
+
+    return (l_is_position and l_is_department and l_is_unit and l_is_tabno);
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ЕТАПИ / ПІДЕТАПИ
+  ------------------------------------------------------------------------------
+
+  function stages(p_page_list_id in number) return sys_refcursor is
+    rc sys_refcursor;
+  begin
+    open rc for
+      select t.id, t.stage, t.title
+        from tasktracker.dict_app_confirm_list@to_tasktracker10 t
+       where t.page_list_id = p_page_list_id
+         and t.parent_stage_id is null
+       order by t.stage;
+    return rc;
+  end;
+
+  function substages(p_page_list_id in number, p_stage_id in number) return sys_refcursor is
+    rc sys_refcursor;
+  begin
+    open rc for
+      select sbt.id, sbt.stage, sbt.title, sbt.text_button, sbt.text_post_sing
+        from tasktracker.dict_app_confirm_list@to_tasktracker10 sbt
+       where sbt.page_list_id = p_page_list_id
+         and sbt.parent_stage_id = p_stage_id
+       order by sbt.stage;
+    return rc;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ВИКОНАВЕЦЬ ДЛЯ ТАБЕЛЬНОГО (коли задано лише TAB_NO)
+  ------------------------------------------------------------------------------
+
+  procedure fetch_executor_by_tabno(
+    p_tabno     in number,
+    o_posada    out varchar2,
+    o_department out varchar2,
+    o_pib       out varchar2
+  ) is
+  begin
+    o_posada    := null;
+    o_department:= null;
+    o_pib       := null;
+
+    begin
+      select ps.spr_dolznost,
+             d.short_name,
+             u.familia || ' ' || substr(u.ima,1,1) || '. ' || substr(u.otchestvo,1,1) || '.'
+      into   o_posada, o_department, o_pib
+      from   kbs.personal@to_tasktracker10 u
+      left join kbs.spr_department@to_tasktracker10 d
+             on d.no = u.tseh
+      left join kbs.personal@to_tasktracker10 ps
+             on ps.tab_no = u.tab_no  -- джерело посади; за потреби замініть на правильний словник
+      where  u.tab_no = p_tabno
+        and  u.priznak is null
+        and (d.date_end is null and d.sprdepartment_id is null);
+    exception
+      when no_data_found then
+        o_posada    := 'Невідома посада';
+        o_department:= 'Невідомий відділ';
+        o_pib       := 'Невідомо';
+    end;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ПІДЗАВДАННЯ (для stage = p_stage_for_subtask)
+  ------------------------------------------------------------------------------
+
+  function fetch_subtask_content(
+    p_stage_no      in number,
+    p_stage_for_txt in number,
+    p_task_mode     in number,
+    p_subtask_id    in number
+  ) return varchar2
+  is
+    l_txt varchar2(4000);
+  begin
+    l_txt := null;
+    if p_stage_no = p_stage_for_txt and p_subtask_id is not null then
+      if p_task_mode = 0 then
+        begin
+          select subtask_content
+          into   l_txt
+          from   tasktracker.task_subtasks@to_tasktracker10
+          where  id = p_subtask_id;
+        exception when no_data_found then null; end;
+      elsif p_task_mode = 1 then
+        begin
+          select subtask_content
+          into   l_txt
+          from   tasktracker.task_template_subtasks@to_tasktracker10
+          where  id = p_subtask_id;
+        exception when no_data_found then null; end;
+      end if;
+    end if;
+    return l_txt;
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ІСТОРІЯ ПІДПИСУ
+  ------------------------------------------------------------------------------
+
+  function sign_history_rc(p_signright_id in number) return sys_refcursor is
+    rc sys_refcursor;
+  begin
+    open rc for
+      select to_char(sh.sdate, 'dd.mm.yyyy') as sdatev,
+             to_char(sh.sdate, 'hh24:mi')    as stimev,
+             (p.familia || ' ' || substr(p.imya,1,1) || '. ' || substr(p.otchestvo,1,1) || '.') as signer_by,
+             p.tseh_short as depart,
+             sh.note      as note_txt,
+             sh.new_status_id
+      from   tasktracker.signaturehistory@to_tasktracker10 sh
+      left join kbs.personal@to_tasktracker10 p
+             on p.tab_no = sh.signer_by
+            and p.priznak is null
+      where  sh.signright_id = p_signright_id
+      order by sh.sdate desc;
+    return rc;
+  end;
+
+  function has_any_signature(p_signright_id in number) return varchar2 is
+    l_dummy number;
+  begin
+    select 1
+      into l_dummy
+      from tasktracker.signaturehistory@to_tasktracker10
+     where signright_id = p_signright_id
+       and rownum = 1;
+    return 'Y';
+  exception when no_data_found then
+    return 'N';
+  end;
+
+  ------------------------------------------------------------------------------
+  -- РЯДКИ ПІДЕТАПУ З APEX_COLLECTIONS
+  ------------------------------------------------------------------------------
+
+  procedure render_substage_rows(
+    p_buf                in out nocopy clob,
+    p_app_id             in number,
+    p_app_user           in varchar2,
+    p_page_list_id       in number,
+    p_stage_id           in number,
+    p_stage_no           in number,
+    p_substage_id        in number,
+    p_substage_title     in varchar2,
+    p_substage_btn_text  in varchar2,
+    p_substage_after_text in varchar2,
+    p_ctx_position_id    in number,
+    p_ctx_department_id  in number,
+    p_ctx_tabno          in number,
+    p_substitution_mode  in number,
+    p_new_roles          in varchar2,
+    p_stage_for_subtask  in number
+  ) is
+    -- Поля з колекції:
+    -- SEQ_ID, c001(position), c002(department), c003(unit),
+    -- c009(position_id), c010(department_id), c011(unit_id), c012(signature_id),
+    -- c008(tab_no), c014(task_mode), c015(subtask_content? у вашому коді воно перезаписується), c016(subtask_id)
+    cursor c_list is
+      select seq_id,
+             c001 as list_position,
+             c002 as list_department,
+             c003 as list_unit,
+             to_number(c009) as list_position_id,
+             to_number(c010) as list_department_id,
+             to_number(c011) as list_unit_id,
+             to_number(c012) as signature_id,
+             to_number(c008) as list_tab_no,
+             to_number(c014) as task_mode,
+             c015             as subtask_content_opt, -- опційне; ми все одно підтягнемо з БД, якщо треба
+             to_number(c016) as subtask_id
+      from   apex_collections
+      where  collection_name = 'CONFIRM_CART_'||p_stage_id||'_'||p_substage_id
+      order  by to_number(c006); -- порядок як у вас
+
+    l_count_cb number := 0;
+
+    -- змінні на рядок
+    l_list_position       varchar2(255);
+    l_list_department     varchar2(255);
+    l_list_unit           varchar2(255);
+    l_list_position_id    number;
+    l_list_department_id  number;
+    l_list_unit_id        number;
+    l_signature_id        number;
+    l_list_tab_no         number;
+    l_task_mode           number;
+    l_subtask_content     varchar2(4000);
+    l_subtask_id          number;
+
+    -- оформлення для department/unit
+    l_dep_unit            varchar2(512);
+
+    -- для табельного
+    l_user_pos            varchar2(255);
+    l_user_dep            varchar2(255);
+    l_executor_pib        varchar2(255);
+
+    -- історія
+    l_have_sign           varchar2(1);
+
+  begin
+    append(p_buf, '<div class="confirm-cart-item confirm-cart-item_substg">');
+    append(p_buf, '<div class="c-cart-stage"><span class="c-cart_substg">'||h(p_substage_title)||'</span></div>');
+
+    for r in c_list loop
+      l_list_position       := r.list_position;
+      l_list_department     := r.list_department;
+      l_list_unit           := r.list_unit;
+      l_list_position_id    := r.list_position_id;
+      l_list_department_id  := r.list_department_id;
+      l_list_unit_id        := r.list_unit_id;
+      l_signature_id        := r.signature_id;
+      l_list_tab_no         := r.list_tab_no;
+      l_task_mode           := r.task_mode;
+      l_subtask_id          := r.subtask_id;
+
+      -- відображення department/unit
+      if l_list_department is not null and l_list_unit is not null then
+        l_dep_unit := '<span class="l-dep-unit">('||h(l_list_department)||' / '||h(l_list_unit)||')</span>';
+      elsif l_list_department is not null then
+        l_dep_unit := '<span class="l-dep-unit">('||h(l_list_department)||')</span>';
+      elsif l_list_unit is not null then
+        l_dep_unit := '<span class="l-dep-unit">('||h(l_list_unit)||')</span>';
+      else
+        l_dep_unit := '<span class="l-dep-unit"></span>';
+      end if;
+
+      -- якщо табельний без позиції/підрозділу/блоку → тягнемо ПІБ/посаду/відділ
+      if l_list_position is null and l_list_department is null and l_list_unit is null and l_list_tab_no is not null then
+        fetch_executor_by_tabno(l_list_tab_no, l_user_pos, l_user_dep, l_executor_pib);
+      else
+        l_user_pos := null; l_user_dep := null; l_executor_pib := null;
+      end if;
+
+      -- текст підзавдання (для конкретного етапу)
+      l_subtask_content := fetch_subtask_content(
+                             p_stage_no      => p_stage_no,
+                             p_stage_for_txt => p_stage_for_subtask,
+                             p_task_mode     => l_task_mode,
+                             p_subtask_id    => l_subtask_id);
+
+      -- оболонка одного запису
+      append(p_buf, '<div class="confirm-cart-item_wrapper">');
+
+      -- Виконавець (ліва колонка)
+      declare
+        l_full_line_class varchar2(30) := null;
+      begin
+        if l_list_position is null and l_list_department is null and l_list_unit is null and l_list_tab_no is not null then
+          l_full_line_class := ' full-line';
+        end if;
+
+        append(p_buf, '<div class="confirm-cart-item">');
+
+        append(p_buf, '<div class="c-cart-signer'||l_full_line_class||'">');
+        if l_list_position is not null or l_list_department is not null or l_list_unit is not null then
+          append(p_buf, '<span class="l-list-position">'||h(l_list_position)||'</span> '||l_dep_unit);
+        elsif l_list_tab_no is not null then
+          append(p_buf,
+                 '<span class="l-list-pib">'||h(l_executor_pib)||'</span><br />'||
+                 '<span class="l-list-position">'||h(l_user_pos)||'</span> '||
+                 '<span>('||h(l_user_dep)||')</span>');
+        end if;
+        append(p_buf, '</div>');
+      end;
+
+      -- Чи є підпис (історія)
+      l_have_sign := has_any_signature(l_signature_id);
+
+      if l_have_sign = 'Y' then
+        -- показуємо історію підпису (останній підпис)
+        declare
+          rc sys_refcursor;
+          l_sdate  varchar2(10);
+          l_stime  varchar2(5);
+          l_by     varchar2(255);
+          l_dep    varchar2(255);
+          l_note   varchar2(4000);
+          l_status number;
+        begin
+          rc := sign_history_rc(l_signature_id);
+          fetch rc into l_sdate, l_stime, l_by, l_dep, l_note, l_status;
+          close rc;
+
+          -- дата/час
+          append(p_buf, '<div class="c-cart-date-time">');
+          append(p_buf, '<span class="confirm-sign-attributes_date">'||h(l_sdate)||'<br />'||h(l_stime)||'</span>');
+          append(p_buf, '</div>');
+
+          -- ПІБ/посада/цех (посаду тут можна додатково тягнути з окремого словника, якщо потрібно)
+          append(p_buf, '<div class="c-cart-pib">');
+          if l_by is not null then
+            append(p_buf, '<span class="confirm-sign-attributes_by">'||h(l_by)||'</span>');
+          end if;
+          if l_dep is not null then
+            append(p_buf, '<span class="confirm-sign-attributes_posada">'||h(l_dep)||'</span>');
+          end if;
+          append(p_buf, '</div>');
+
+          -- Коментар
+          append(p_buf, '<div class="c-cart-signer-comment">'||h(l_note)||'</div>');
+
+          -- Статус
+          if l_status = 11 then
+            append(p_buf, '<div class="c-cart-signer-mark c-cart-signer-mark__canceled">Анульовано</div>');
+          else
+            append(p_buf, '<div class="c-cart-signer-mark c-cart-signer-mark_success">'||h(p_substage_after_text)||'</div>');
+          end if;
+        end;
+
+      else
+        -- Немає підпису → показуємо або кнопку, або статус «Розглядає/Очікує»
+        append(p_buf, '<div class="c-cart-date-time"></div>');
+        append(p_buf, '<div class="c-cart-pib"></div>');
+        append(p_buf, '<div class="c-cart-signer-comment"></div>');
+
+        append(p_buf, '<div class="c-cart-signer-mark">');
+
+        declare
+          l_role_ok boolean;
+        begin
+          l_role_ok := has_role(
+            p_list_position_id   => l_list_position_id,
+            p_list_department_id => l_list_department_id,
+            p_list_unit_id       => l_list_unit_id,
+            p_list_tab_no        => l_list_tab_no,
+            p_ctx_position_id    => p_ctx_position_id,
+            p_ctx_department_id  => p_ctx_department_id,
+            p_ctx_tabno          => p_ctx_tabno,
+            p_substitution_mode  => p_substitution_mode,
+            p_new_roles          => p_new_roles,
+            p_app_id             => p_app_id,
+            p_app_user           => p_app_user
+          );
+
+          if l_role_ok and l_count_cb = 0 then
+            append(p_buf,
+              '<button id="signature-btn" data-signature-id="'||l_signature_id||'" class="confirm-signature-button">'||
+              h(p_substage_btn_text)||'</button>');
+            l_count_cb := l_count_cb + 1;
+          elsif l_role_ok and l_count_cb > 0 then
+            append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+          elsif (not l_role_ok) and l_count_cb = 0 then
+            append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+            l_count_cb := l_count_cb + 1;
+          else
+            append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+          end if;
+        end;
+
+        append(p_buf, '</div>'); -- .c-cart-signer-mark
+      end if;
+
+      append(p_buf, '</div>'); -- .confirm-cart-item
+
+      -- ПІДЗАВДАННЯ (під блоком)
+      if l_subtask_content is not null then
+        append(p_buf,
+          '<span class="tsk-to-do"><span class="sbtsk-ttl">До виконання:</span> '||
+          '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span></span>');
+      end if;
+
+      append(p_buf, '</div>'); -- .confirm-cart-item_wrapper
+    end loop;
+
+    append(p_buf, '</div>'); -- .confirm-cart-item_substg
+  exception
+    when others then
+      append(p_buf, '<div class="confirm-cart-error">Помилка підетапу '||h(sqlerrm)||'</div>');
+  end;
+
+  ------------------------------------------------------------------------------
+  -- ГОЛОВНИЙ РЕНДЕРЕР
+  ------------------------------------------------------------------------------
+
+  function render(
+    p_app_id             in number,
+    p_page_list_id       in number,
+    p_substitution_mode  in number,
+    p_cur_position_id    in number,
+    p_new_position_id    in number,
+    p_cur_tabno          in number,
+    p_new_tabno          in number,
+    p_cur_department_id  in number,
+    p_new_department_id  in number,
+    p_new_roles          in varchar2,
+    p_app_user           in varchar2,
+    p_p5_status_id       in number,
+    p_stage_for_subtask  in number
+  ) return clob
+  is
+    l_buf                 clob;
+    rc_stg                sys_refcursor;
+    rc_sub                sys_refcursor;
+    -- етапи
+    l_stage_id            number;
+    l_stage_no            number;
+    l_stage_title         varchar2(255);
+    -- підетапи
+    l_sub_id              number;
+    l_sub_no              number;
+    l_sub_title           varchar2(255);
+    l_btn_text            varchar2(100);
+    l_after_text          varchar2(100);
+    -- контекст
+    l_ctx_position_id     number;
+    l_ctx_tabno           number;
+    l_ctx_department_id   number;
+  begin
+    dbms_lob.createtemporary(l_buf, true);
+
+    -- контейнер + хедер
+    append(l_buf, '<div class="confirm-cart-container">');
+    append(l_buf, '<div class="confirm-cart-error"></div>');
+
+    append(l_buf,
+      '<div class="confirm-cart-item confirm-cart-title">
+        <div class="c-cart-signer">Виконавець</div>
+        <div class="c-cart-date-time">Дата і час</div>
+        <div class="c-cart-pib">ПІБ та посада</div>
+        <div class="c-cart-signer-comment">Коментар</div>
+        <div class="c-cart-signer-mark">Статус</div>
+      </div>');
+
+    -- контекст
+    resolve_context_ids(
+      p_substitution_mode => p_substitution_mode,
+      p_cur_position_id   => p_cur_position_id,
+      p_new_position_id   => p_new_position_id,
+      p_cur_tabno         => p_cur_tabno,
+      p_new_tabno         => p_new_tabno,
+      p_cur_department_id => p_cur_department_id,
+      p_new_department_id => p_new_department_id,
+      o_position_id       => l_ctx_position_id,
+      o_tabno             => l_ctx_tabno,
+      o_department_id     => l_ctx_department_id
+    );
+
+    -- етапи
+    rc_stg := stages(p_page_list_id);
+    loop
+      fetch rc_stg into l_stage_id, l_stage_no, l_stage_title;
+      exit when rc_stg%notfound;
+
+      append(l_buf,
+        '<div class="confirm-cart-item confirm-cart-item_stg">
+           <div class="c-cart-stage"><span class="c-cart_stg">Етап '||
+           l_stage_no||' - '||h(l_stage_title)||'</span></div>
+         </div>');
+
+      -- підетапи
+      rc_sub := substages(p_page_list_id, l_stage_id);
+      loop
+        fetch rc_sub into l_sub_id, l_sub_no, l_sub_title, l_btn_text, l_after_text;
+        exit when rc_sub%notfound;
+
+        -- Рядки підетапу з колекцій
+        if apex_collection.collection_exists('CONFIRM_CART_'||l_stage_id||'_'||l_sub_id) then
+          render_substage_rows(
+            p_buf                 => l_buf,
+            p_app_id              => p_app_id,
+            p_app_user            => p_app_user,
+            p_page_list_id        => p_page_list_id,
+            p_stage_id            => l_stage_id,
+            p_stage_no            => l_stage_no,
+            p_substage_id         => l_sub_id,
+            p_substage_title      => l_sub_title,
+            p_substage_btn_text   => l_btn_text,
+            p_substage_after_text => l_after_text,
+            p_ctx_position_id     => l_ctx_position_id,
+            p_ctx_department_id   => l_ctx_department_id,
+            p_ctx_tabno           => l_ctx_tabno,
+            p_substitution_mode   => p_substitution_mode,
+            p_new_roles           => p_new_roles,
+            p_stage_for_subtask   => p_stage_for_subtask
+          );
+        else
+          append(l_buf, '<div class="need-data-add-text">Дозаповніть поля</div>');
+        end if;
+
+      end loop;
+      close rc_sub;
+    end loop;
+    close rc_stg;
+
+    -- КНОПКА МОДЕРАТОРА (скасувати заявку), якщо не статус 11/14
+    if is_moderator(p_substitution_mode, p_new_roles, p_app_id, p_app_user) then
+      if nvl(p_p5_status_id, -999) not in (11,14) then
+        append(l_buf,
+          '<div class="buttons-bottom-cntr">'||
+          '<button type="button" data-source="" class="cancel-confirm-button">Скасувати заявку</button>'||
+          '</div>');
+      end if;
+    end if;
+
+    append(l_buf, '</div>'); -- /confirm-cart-container
+    return l_buf;
+
+  exception
+    when others then
+      return '<div class="confirm-cart-error">Помилка побудови картки: '||h(sqlerrm)||'</div>';
+  end render;
+
+end confirm_cart_pkg;
+/
+```
+
+---
+
+# 3) ВИКЛИК У PL/SQL Dynamic Content (у вашому регіоні)
+
+```plsql
+declare
+  l_html clob;
+begin
+  l_html := confirm_cart_pkg.render(
+    p_app_id             => :APP_ID,
+    p_page_list_id       => :P0_PAGE_LIST_ID,            -- або ваш item
+    p_substitution_mode  => :PO_SUBSTITUTION_MODE,
+    p_cur_position_id    => :PO_CUR_USER_POSITION,
+    p_new_position_id    => :PO_NEW_POSITION_ID,
+    p_cur_tabno          => :PO_CUR_USER_TABNO,
+    p_new_tabno          => :PO_NEW_USER_ID,
+    p_cur_department_id  => :PO_CUR_USER_DEPARTMENT,
+    p_new_department_id  => :PO_NEW_DEPARTMENT_ID,
+    p_new_roles          => :PO_NEW_ROLES,
+    p_app_user           => :APP_USER,
+    p_p5_status_id       => :P5_STATUS_ID,               -- для «Скасувати заявку»
+    p_stage_for_subtask  => 4                            -- де показувати підзавдання
+  );
+  htp.p(l_html);
+end;
+```
+
+---
+
+## Примітки/тонкі місця (вже враховано в коді)
+
+* **APEX\_COLLECTIONS**: ім’я колекції прийнято як `CONFIRM_CART_<stage_id>_<substage_id>`, порядок — `c006`. За потреби підправте.
+* **Вставка HTML**: усі дані з БД проходять через `apex_escape.html`.
+* **Ролі**: у `has_role(...)` повністю зібрана логіка комбінацій (посада/відділ/unit/таб№) + підтримка заміщення/ACL.
+* **Табельний**: якщо задано лише TAB\_NO — тягнемо ПІБ/посаду/відділ через `fetch_executor_by_tabno`.
+* **Підзавдання**: підтягування з `TASK_SUBTASKS`/`TASK_TEMPLATE_SUBTASKS` залежно від `task_mode` і номера етапу (за замовчуванням `4`).
+* **Історія підпису**: показує останній запис; при потребі можна виводити весь список.
+* **Модератор**: роль `R_4`; кнопка не показується для статусів `11, 14`.
+* **Продуктивність**: мінімум `htp.p`, збір у CLOB; зменшено кількість запитів у глибоких циклах.
+
+Якщо хочеш — можу додати кешування результатів (наприклад, по `signright_id`) у PL/SQL асоціативних масивах, або рознести великі SELECT’и на в’юхи для ще чистішого коду.

@@ -1,0 +1,315 @@
+Коротко: коли PL/SQL Dynamic Content «розлазиться», винесіть усе «мʼясо» в пакет у БД і залиште в регіоні лише 3‑5 рядків виклику. Далі — як це зробити акуратно, щоб і ліміт символів не болів, і код став читабельним.
+
+# Що саме винести і як організувати
+
+1. **Один публічний рендерер + дрібні приватні хелпери**
+   Створіть пакет, де є одна публічна функція `render(...) return clob`, а всередині — невеликі приватні процедури/функції:
+
+* `get_stages(...)` → cursor/collection з етапами
+* `get_substages(stage_id, ...)` → підетапи
+* `fetch_cart_rows(substage_id, ...)` → записи/виконавці
+* `has_role(...) return boolean` → уся ваша логіка перевірок (посада/відділ/unit/таб№) в одному місці
+* `fetch_sign_history(signright_id, ...)` → історія підпису
+* `render_row(...)` → збирання HTML для одного рядка
+* невеликі утиліти: `html(...)` (escape/unwrap), `append(...)` (апенди до буфера) тощо.
+
+2. **Пишемо в CLOB, а не тисячами `htp.p`**
+   Використайте `apex_string.t_text_vc_arr2` + `apex_string.join_clob` або `apex_string.builder`:
+
+* швидше
+* менше «швів»
+* легко повертати одним шматком
+
+3. **У регіоні APEX — мінімум коду**
+   У PL/SQL Dynamic Content залиште буквально:
+
+```plsql
+declare
+  l_html clob;
+begin
+  l_html := confirm_cart_pkg.render(
+      p_app_id               => :APP_ID,
+      p_page_list_id         => :P0_PAGE_LIST_ID,
+      p_substitution_mode    => :PO_SUBSTITUTION_MODE,
+      p_cur_position_id      => :PO_CUR_USER_POSITION,
+      p_new_position_id      => :PO_NEW_POSITION_ID,
+      p_cur_tabno            => :PO_CUR_USER_TABNO,
+      p_new_tabno            => :PO_NEW_USER_ID,
+      p_cur_department_id    => :PO_CUR_USER_DEPARTMENT,
+      p_new_department_id    => :PO_NEW_DEPARTMENT_ID,
+      p_new_roles            => :PO_NEW_ROLES,
+      p_app_user             => :APP_USER
+  );
+  htp.p(l_html);
+end;
+```
+
+> Усе інше — в пакеті. Ліміти APEX більше не турбують.
+
+---
+
+# Шаблон пакета (спрощений каркас)
+
+## SPEC
+
+```plsql
+create or replace package confirm_cart_pkg as
+  type t_stage is record (
+    id              number,
+    stage_no        number,
+    title           varchar2(255)
+  );
+  type t_substage is record (
+    id              number,
+    stage_no        number,
+    title           varchar2(255),
+    btn_text        varchar2(100),
+    after_text      varchar2(100)
+  );
+
+  function render(
+    p_app_id             in number,
+    p_page_list_id       in number,
+    p_substitution_mode  in number,
+    p_cur_position_id    in number,
+    p_new_position_id    in number,
+    p_cur_tabno          in number,
+    p_new_tabno          in number,
+    p_cur_department_id  in number,
+    p_new_department_id  in number,
+    p_new_roles          in varchar2,
+    p_app_user           in varchar2
+  ) return clob;
+end confirm_cart_pkg;
+/
+```
+
+## BODY (ключові ідеї)
+
+```plsql
+create or replace package body confirm_cart_pkg as
+
+  -- Універсальний апендер у CLOB
+  procedure append(p_buf in out nocopy clob, p_txt in varchar2) is
+  begin
+    dbms_lob.writeappend(p_buf, length(p_txt), p_txt);
+  end;
+
+  -- Безпечний вивід (де потрібно)
+  function h(p_txt in varchar2) return varchar2 is
+  begin
+    return apex_escape.html(p_txt);
+  end;
+
+  -- Обгортка перевірки ролі (ваша велика логіка зведена в один IF)
+  function has_role(
+    p_list_position_id   in number,
+    p_list_department_id in number,
+    p_list_unit_id       in number,
+    p_list_tab_no        in number,
+    p_ctx_position_id    in number,
+    p_ctx_department_id  in number,
+    p_ctx_tabno          in number,
+    p_substitution_mode  in number,
+    p_new_roles          in varchar2
+  ) return boolean
+  is
+    l_is_position   boolean := false;
+    l_is_department boolean := false;
+    l_is_unit       boolean := false;
+    l_is_tabno      boolean := false;
+  begin
+    -- 1) Посада
+    if p_list_position_id is not null then
+      l_is_position := (p_list_position_id = p_ctx_position_id);
+    else
+      l_is_position := true; -- якщо не задано, не обмежуємо
+    end if;
+
+    -- 2) Відділ
+    if p_list_department_id is not null then
+      l_is_department := (p_list_department_id = p_ctx_department_id);
+    else
+      l_is_department := true;
+    end if;
+
+    -- 3) Unit (через ACL або new_roles)
+    if p_list_unit_id is not null then
+      l_is_unit :=
+        case
+          when p_substitution_mode = 1 and instr(p_new_roles, 'U_'||p_list_unit_id) > 0 then true
+          when p_substitution_mode = 0 and apex_acl.has_user_role(apex_application.g_flow_id, v('APP_USER'), 'U_'||p_list_unit_id) then true
+          else false
+        end;
+    else
+      l_is_unit := true;
+    end if;
+
+    -- 4) Табельний
+    if p_list_tab_no is not null then
+      l_is_tabno := (p_list_tab_no = p_ctx_tabno);
+    else
+      l_is_tabno := true;
+    end if;
+
+    return (l_is_position and l_is_department and l_is_unit and l_is_tabno);
+  end;
+
+  -- Отримання етапів
+  function stages(p_page_list_id in number) return sys_refcursor is
+    rc sys_refcursor;
+  begin
+    open rc for
+      select t.id, t.stage, t.title
+        from tasktracker.dict_app_confirm_list@to_tasktracker10 t
+       where t.page_list_id = p_page_list_id
+         and t.parent_stage_id is null
+       order by t.stage;
+    return rc;
+  end;
+
+  -- Підетапи
+  function substages(p_page_list_id in number, p_stage_id in number) return sys_refcursor is
+    rc sys_refcursor;
+  begin
+    open rc for
+      select sbt.id, sbt.stage, sbt.title, sbt.text_button, sbt.text_post_sing
+        from tasktracker.dict_app_confirm_list@to_tasktracker10 sbt
+       where sbt.page_list_id = p_page_list_id
+         and sbt.parent_stage_id = p_stage_id
+       order by sbt.stage;
+    return rc;
+  end;
+
+  -- Приклади вибірок для картки/історії винесіть у окремі функції/процедури,
+  -- які повертають або ref cursor, або одразу HTML-фрагмент.
+
+  function render(
+    p_app_id             in number,
+    p_page_list_id       in number,
+    p_substitution_mode  in number,
+    p_cur_position_id    in number,
+    p_new_position_id    in number,
+    p_cur_tabno          in number,
+    p_new_tabno          in number,
+    p_cur_department_id  in number,
+    p_new_department_id  in number,
+    p_new_roles          in varchar2,
+    p_app_user           in varchar2
+  ) return clob
+  is
+    l_buf           clob;
+    rc_stage        sys_refcursor;
+    rc_sub          sys_refcursor;
+    -- локальні змінні для fetch
+    l_stage_id      number;
+    l_stage_no      number;
+    l_stage_title   varchar2(255);
+    l_sub_id        number;
+    l_sub_no        number;
+    l_sub_title     varchar2(255);
+    l_btn_text      varchar2(100);
+    l_after_text    varchar2(100);
+  begin
+    dbms_lob.createtemporary(l_buf, true);
+
+    append(l_buf, '<div class="confirm-cart-container">');
+    append(l_buf, '<div class="confirm-cart-error"></div>');
+    append(l_buf, '<div class="confirm-cart-item confirm-cart-title">
+      <div class="c-cart-signer">Виконавець</div>
+      <div class="c-cart-date-time">Дата і час</div>
+      <div class="c-cart-pib">ПІБ та посада</div>
+      <div class="c-cart-signer-comment">Коментар</div>
+      <div class="c-cart-signer-mark">Статус</div>
+    </div>');
+
+    rc_stage := stages(p_page_list_id);
+    loop
+      fetch rc_stage into l_stage_id, l_stage_no, l_stage_title;
+      exit when rc_stage%notfound;
+
+      append(l_buf,
+        '<div class="confirm-cart-item confirm-cart-item_stg">
+           <div class="c-cart-stage"><span class="c-cart_stg">Етап '||
+           l_stage_no||' - '||h(l_stage_title)||'</span></div>
+         </div>');
+
+      rc_sub := substages(p_page_list_id, l_stage_id);
+      loop
+        fetch rc_sub into l_sub_id, l_sub_no, l_sub_title, l_btn_text, l_after_text;
+        exit when rc_sub%notfound;
+
+        append(l_buf,
+          '<div class="confirm-cart-item confirm-cart-item_substg">
+             <div class="c-cart-stage"><span class="c-cart_substg">'||
+             h(l_sub_title)||'</span></div>');
+
+        -- ↓↓↓ ТУТ викличте ваші дрібні рендерери, які вже роблять всю важку роботу
+        --    наприклад: render_substage_rows(l_buf, l_stage_id, l_sub_id, ... весь потрібний контекст ...);
+
+        append(l_buf, '</div>'); -- close substage
+      end loop;
+      close rc_sub;
+    end loop;
+    close rc_stage;
+
+    -- Кнопка модератора (ваша наявна логіка теж виноситься в окрему ф-ю, а тут лише виклик)
+    -- if is_moderator(...) then append(l_buf, '<div class="buttons-bottom-cntr">...</div>'); end if;
+
+    append(l_buf, '</div>'); -- container
+    return l_buf;
+  exception
+    when others then
+      -- необовʼязково, але зручно мати охайне повідомлення (і лог у вашу таблицю)
+      return '<div class="confirm-cart-error">Помилка побудови картки: '||
+             h(sqlerrm)||'</div>';
+  end render;
+
+end confirm_cart_pkg;
+/
+```
+
+> Ідея: усю громіздку «вилівку» HTML із вашого прикладу переносите в маленькі функції типу `render_substage_rows(...)`, `render_sign_history(...)`. Вони приймають **мінімум** параметрів (ідентифікатори та «контекст» користувача) і повертають готовий HTML (рядок/фрагмент), який ви `append`‑ите в загальний буфер.
+
+---
+
+# Поради по чистці коду, щоб не плодити помилки
+
+* **%TYPE / %ROWTYPE.** Замість `VARCHAR2(255)` для полів з БД — використовуйте `table.col%type`. Це зменшить ризики типових помилок.
+* **Одне джерело правди для ролей.** Вся громіздка логіка `IF l_list_position_id ... AND ...` має бути *в одному місці* — у функції `has_role(...)`.
+* **Escape HTML.** У кожному місці, де вставляєте дані з БД в HTML, обгорніть `apex_escape.html(...)`.
+* **Іменування.** Жодних пробілів/тире в ідентифікаторах: замініть на `_`.
+* **Дублі змінних.** У вашому фрагменті є повтори: `l_is_role`, `l_substage_btn_text`, `l_source` — лишіть один варіант.
+* **Курсори.** Для зовнішніх БД‑лінків (через `@TO_TASKTRACKER10`) краще рівно один-два запити на «великий шматок» замість багатьох дрібних у глибоких циклах — або кешуйте у тимчасові колекції/таблиці.
+* **Усуньте `htp.p` у циклах.** Це уповільнює і «зашумлює» код. Збирайте в CLOB.
+
+---
+
+# Альтернативи, якщо хочеться ще компактніше
+
+* **Classic Report / Interactive Report з шаблоном:**
+  Побудуйте SQL, що повертає рядки «елементів картки», а верстку задайте в шаблоні звіту. Багато умов — через `case when` у SQL + підшаблони.
+  У важких місцях використовуйте **піплайнові ф‑ції** (table function), що повертають набір «рядків‑фрагментів» — і далі звіт.
+
+* **Server → JSON → Client render:**
+  Згенеруйте JSON (через `APEX_JSON`) з усією структурою, а HTML зберіть на клієнті (Template Component / Mustache / ванільний JS). Динамічний контент стає легким: з сервера один `apex.server.process` → JSON → шаблон.
+
+* **Materialized/View/Inline View:**
+  Частину логіки погодження (joinʼи, статуси) підготуйте у view. На сервері тоді менше коду, а в пакеті — лише рендер.
+
+---
+
+# Що робити прямо зараз (чек‑лист)
+
+1. Створіть `confirm_cart_pkg` за каркасом вище.
+2. Перенесіть у нього:
+
+   * SQL для етапів/підетапів
+   * блочок з історією підписів
+   * увесь шмат логіки `is_role` → в одну функцію
+   * рендер рядка (HTML) → окрема функція `render_row(...)`
+3. У регіоні залиште 3–5 рядків із викликом `confirm_cart_pkg.render(...)`.
+4. Перевірте помилки ідентифікаторів (де зараз `l_list position id`, `l_dep_ unit` тощо — виправити на `l_list_position_id`, `l_dep_unit`).
+5. Де вставляєте дані в HTML — загорнути в `apex_escape.html`.
+
+Якщо хочеш — можу швидко перетворити конкретні фрагменти з твого коду на вміст `render_substage_rows(...)` і `has_role(...)` під твою схему (TaskTracker/ACL), щоб ти просто вставив у пакет.

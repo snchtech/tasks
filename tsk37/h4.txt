@@ -1,0 +1,117 @@
+Ось готовий фрагмент, який робить саме те, що ти описав: для **поточного підетапу** шукає **наступний** підетап у межах того ж етапу (за полем `STAGE`), перевіряє, чи є **хоч одна** відмітка в `SIGNATUREHISTORY` для будь-якого `SIGNATURERIGHTS` цього **наступного** підетапу і, відповідно, **ховає** або **показує** кнопку.
+
+> Використовує існуючі змінні з твого коду: `l_stage_id`, `l_substage_id`, `l_current_substage`, `l_page_list_id`, `l_source_id`.
+
+```plsql
+declare
+  l_next_substage_id number;
+  l_has_next_hist    number := 0; -- 1 = є хоч одна відмітка в наступному підетапі, 0 = немає
+begin
+  -- 1) Знайти НАСТУПНИЙ підетап (у цьому ж етапі) за порядком STAGE
+  begin
+    select x.id
+      into l_next_substage_id
+      from (
+             select sbt.id, sbt.stage
+               from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 sbt
+              where sbt.page_list_id    = l_page_list_id
+                and sbt.parent_stage_id = l_stage_id
+                and sbt.stage           > l_current_substage
+              order by sbt.stage
+           ) x
+     where rownum = 1;
+  exception
+    when no_data_found then
+      l_next_substage_id := null; -- поточний підетап останній у своєму етапі
+  end;
+
+  -- 2) Якщо наступний підетап існує — перевірити, чи є хоч одна відмітка для нього
+  if l_next_substage_id is not null then
+    begin
+      select /*+ FIRST_ROWS(1) */ 1
+        into l_has_next_hist
+        from TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+       where h.signright_id in (
+               select sr.id
+                 from TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+                where sr.task_id  = l_source_id
+                  and sr.stages_id = l_next_substage_id
+             )
+         and rownum = 1; -- достатньо знайти хоч один запис
+    exception
+      when no_data_found then
+        l_has_next_hist := 0;
+    end;
+  else
+    -- немає наступного підетапу -> за новою логікою кнопку показуємо
+    l_has_next_hist := 0;
+  end if;
+
+  -- 3) Рендер: якщо в наступному підетапі вже є підпис(и) — кнопку не показуємо
+  if l_has_next_hist = 1 then
+    htp.p('<span class="stage-closed"></span>');
+  else
+    htp.p(
+      '<button data-current-stage="'||l_stage_id||
+      '" data-current-substage="'||l_substage_id||
+      '" class="add-confirm-person">+</button>'
+    );
+  end if;
+end;
+```
+
+### Якщо хочеш зробити це одним SQL (без проміжних `BEGIN..EXCEPTION`)
+
+Ось компактна версія: «знайди `id` наступного підетапу» → «перевір, чи існує хоч одна відмітка», усе в одному запиті; далі рендер за результатом.
+
+```plsql
+declare
+  l_has_next_hist number;
+begin
+  select count(*)  -- буде 0 або 1 (через rownum=1)
+    into l_has_next_hist
+    from (
+      select 1
+        from TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+       where h.signright_id in (
+               select sr.id
+                 from TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+                where sr.task_id = l_source_id
+                  and sr.stages_id = (
+                        select id
+                          from (
+                            select sbt.id
+                              from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 sbt
+                             where sbt.page_list_id    = l_page_list_id
+                               and sbt.parent_stage_id = l_stage_id
+                               and sbt.stage           > l_current_substage
+                             order by sbt.stage
+                          )
+                         where rownum = 1
+                  )
+             )
+         and rownum = 1
+    );
+
+  if l_has_next_hist > 0 then
+    htp.p('<span class="stage-closed"></span>');
+  else
+    htp.p(
+      '<button data-current-stage="'||l_stage_id||
+      '" data-current-substage="'||l_substage_id||
+      '" class="add-confirm-person">+</button>'
+    );
+  end if;
+end;
+```
+
+### Нюанси/примітки
+
+* Перевірка робиться по **всіх** `SIGNATURERIGHTS` наступного підетапу: достатньо **хоч одного** запису в `SIGNATUREHISTORY`, щоб **сховати** кнопку.
+* Для останнього підетапу (немає «наступного») за твоєю новою логікою — **кнопку показуємо** (бо немає що перевіряти «попередньо підписано»). Якщо хочеш іншу поведінку — у блоці `else` постав свою умову (наприклад, перевірка «закривальний» підетап).
+* Індекси, що допоможуть швидкості:
+
+  * `SIGNATURERIGHTS(task_id, stages_id)`
+  * `SIGNATUREHISTORY(signright_id)`
+  * `DICT_APP_CONFIRM_LIST(page_list_id, parent_stage_id, stage)`
+* Якщо інколи враховуєш тільки «валідні» підписи (не статус 11 «анульовано»), додай `and h.new_status_id <> 11` у перевірку.

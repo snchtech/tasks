@@ -1,0 +1,227 @@
+Коротко: так, “заблокувати” секцію створення/заповнення колекції — це правильний шлях, і він знімає гонки, через які прилітає `PK constraint violation`. Але робити `SELECT ... FOR UPDATE` по `APEX_COLLECTIONS` ненадійно (коли колекція ще порожня — рядків для блокування нема). Найпростіше і стабільно — взяти **сеансовий DBMS\_LOCK** на ім’я колекції + перейти на **`APEX_COLLECTION.CREATE_OR_TRUNCATE_COLLECTION`** замість `EXISTS/DELETE/CREATE`.
+
+Нижче — повністю адаптований твій код з:
+
+* **атомарним** `CREATE_OR_TRUNCATE_COLLECTION`,
+* **сейф-локом** через `DBMS_LOCK` (на рівні поточного APEX-сеансу і колекції),
+* виправленими описками в іменах полів/колекцій.
+
+> Якщо в середовищі нема права на `DBMS_LOCK` — дивись “План B” в кінці.
+
+---
+
+## Варіант A (рекомендовано): `DBMS_LOCK` + `CREATE_OR_TRUNCATE_COLLECTION`
+
+```plsql
+declare
+  -- обраний нейм колекції під режим
+  l_coll_name     varchar2(64);
+  -- DBMS_LOCK
+  l_lockhandle    varchar2(128);
+  l_status        integer;
+
+  -- хелпер: взяти ексклюзивний лок у межах поточного APEX-сеансу
+  procedure lock_collection(p_coll_name in varchar2) is
+    l_lockname varchar2(200);
+  begin
+    -- робимо ключ унікальним на сеанс і колекцію
+    l_lockname := 'APXCOLL_'||v('APP_ID')||'_'||v('APP_SESSION')||'_'||p_coll_name;
+    dbms_lock.allocate_unique(lockname => l_lockname, lockhandle => l_lockhandle);
+
+    -- X_MODE (ексклюзив), timeout (сек), реліз по COMMIT (не треба явно release)
+    l_status := dbms_lock.request(
+                  lockhandle        => l_lockhandle,
+                  lockmode          => dbms_lock.x_mode,
+                  timeout           => 10,
+                  release_on_commit => true);
+
+    -- 0 = OK, 4 = already own
+    if l_status not in (0,4) then
+      raise_application_error(-20001,
+        'Не вдалося отримати блокування для колекції '||p_coll_name||' (status='||l_status||')');
+    end if;
+  end;
+
+begin
+  -- визначаємо колекцію
+  if :P6_TASK_MODE = 0 and :P6_TASK_TYPE = 2 then
+    l_coll_name := 'TASK_SUBTASKS_COLLECTION';
+  elsif :P6_TASK_MODE = 1 and :P6_TASK_TYPE = 2 then
+    l_coll_name := 'TASK_TEMPLATE_SUBTASKS_COLLECTION';
+  else
+    return; -- інші режими не чіпаємо
+  end if;
+
+  -- 1) беремо лок
+  lock_collection(l_coll_name);
+
+  -- 2) атомарно створюємо/очищаємо колекцію
+  apex_collection.create_or_truncate_collection(l_coll_name);
+
+  -- 3) заповнюємо колекцію даними
+  if l_coll_name = 'TASK_SUBTASKS_COLLECTION' then
+
+    if :P6_TASK_ID is not null then
+      for r in (
+        select
+          t.task_id,
+          t.subtask_content,
+          t.planning_date_end,
+          t.parent_id,
+          t.subtask_order,
+          t.status_id,
+          t.id as subtask_id
+        from TaskTracker.TASK_SUBTASKS@TO_TASKTRACKER10 t
+        where t.task_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001            => r.task_id,
+          p_c002            => r.subtask_content,
+          p_d001            => r.planning_date_end,
+          p_c003            => r.parent_id,
+          p_c004            => r.subtask_order,
+          p_c005            => r.status_id,
+          p_d002            => sysdate,
+          p_d003            => null,
+          p_c006            => :PO_CUR_USER_TABNO,  -- !! уважно: латинська 'c', не кирилична
+          p_c007            => null,
+          p_c009            => r.subtask_id,        -- збережемо ID підзавдання
+          p_n001            => 0                    -- task_mode = 0
+        );
+      end loop;
+    end if;
+
+  else -- 'TASK_TEMPLATE_SUBTASKS_COLLECTION'
+
+    if :P6_TASK_ID is not null then
+      for r in (
+        select
+          t.template_id,
+          t.subtask_content,
+          t.parent_id,
+          t.subtask_order,
+          t.status_id,
+          t.id         as subtask_id,
+          t.term_days
+        from TaskTracker.TASK_TEMPLATE_SUBTASKS@TO_TASKTRACKER10 t
+        where t.template_id = :P6_TASK_ID
+      ) loop
+        apex_collection.add_member(
+          p_collection_name => l_coll_name,
+          p_c001            => r.template_id,
+          p_c002            => r.subtask_content,
+          p_d001            => null,
+          p_c003            => r.parent_id,
+          p_c004            => r.subtask_order,
+          p_c005            => r.status_id,
+          p_d002            => sysdate,
+          p_d003            => null,
+          p_c006            => :PO_CUR_USER_TABNO,
+          p_c007            => null,
+          p_c009            => r.subtask_id, -- збережемо ID шаблон-підзавдання
+          p_n001            => 1,            -- task_mode = 1
+          p_n002            => r.term_days
+        );
+      end loop;
+    end if;
+
+  end if;
+
+  -- 4) НІЯКИХ явних COMMIT тут не робимо.
+  --    Лок зніметься автоматично на загальному коміті запиту (release_on_commit => TRUE).
+exception
+  when others then
+    -- красиве повідомлення в APEX
+    apex_error.add_error(
+      p_message          => 'Помилка завантаження колекції: '||sqlerrm,
+      p_display_location => apex_error.c_inline_in_notification
+    );
+    raise;
+end;
+```
+
+### Чому це працює краще
+
+* `DBMS_LOCK` блокує **критичну секцію** в межах **одного APEX-сеансу** і **цілієї колекції** — другий запит почекає до 10 сек (можеш змінити), а не увірветься посередині заповнення.
+* `CREATE_OR_TRUNCATE_COLLECTION` **атомарно** (і швидше) замінює `EXISTS/DELETE/CREATE`.
+* При закритті модалки під час завантаження — **другий запуск не зламає** перший, просто отримає таймаут або виконається після завершення.
+
+---
+
+## Плюс 3 організаційні поради (дуже важливі)
+
+1. **Увімкнути захист від мультикліку/дубль-сабмітів**
+
+   * На кнопці/DA → “**Prevent Duplicate Submissions**” / “**Wait for Result** = Yes\*\*”.
+   * У JS при `apex.server.process(...)` — блокуй UI на час запиту (disable button / show spinner).
+
+2. **Для модалки** — не дозволяй закривати її, поки йде запит
+
+   * В DA, що викликає процес: property **Wait for Result = Yes**.
+   * Або JS-флаг `window.gBusy = true/false` і перевірка на події `apexafterclosedialog`.
+
+3. **Уніфікуй імена**
+
+   * `TASK_SUBTASKS_COLLECTION` (без описок на кшталт `COLLECTTON`)
+   * Слідкуй за латинською `c` в `p_c006` (у тебе була кирилична `с`, це непомітна, але критична помилка).
+
+---
+
+## План B (якщо `DBMS_LOCK` недоступний)
+
+Зроби **свою легку таблицю-замок** і лочись `SELECT ... FOR UPDATE` по рядку цієї таблиці (бо він завжди є).
+
+```sql
+create table app_coll_lock (
+  app_session   number      not null,
+  coll_name     varchar2(64) not null,
+  constraint app_coll_lock_uk unique(app_session, coll_name)
+);
+```
+
+Процес:
+
+```plsql
+declare
+  l_coll_name   varchar2(64);
+  l_app_sess    number := v('APP_SESSION');
+begin
+  l_coll_name := case
+    when :P6_TASK_MODE = 0 and :P6_TASK_TYPE = 2 then 'TASK_SUBTASKS_COLLECTION'
+    when :P6_TASK_MODE = 1 and :P6_TASK_TYPE = 2 then 'TASK_TEMPLATE_SUBTASKS_COLLECTION'
+  end;
+
+  -- ensure row exists
+  begin
+    insert into app_coll_lock(app_session, coll_name)
+    values (l_app_sess, l_coll_name);
+  exception when dup_val_on_index then null; end;
+
+  -- lock the row for this session+collection
+  select 1
+    into  /* dummy */ l_app_sess
+    from app_coll_lock
+   where app_session = l_app_sess
+     and coll_name   = l_coll_name
+   for update wait 10;
+
+  -- critical section
+  apex_collection.create_or_truncate_collection(l_coll_name);
+  -- ... add_member() як у Варіанті A ...
+
+  -- commit наприкінці запиту звільнить блокування
+end;
+```
+
+Це **надійніше**, ніж намагатися лочити `apex_collections`, де може не бути рядків.
+
+---
+
+## Чому у тебе виникав `PK violation`
+
+Через **гонки**: два паралельні запити одночасно створюють/заповнюють одну і ту ж колекцію в межах одного сеансу → `SEQ_ID`/внутрішні ключі колекції можуть накластися. Лок вирішує це.
+
+---
+
+Якщо хочеш — підкажу, як додати “перевірку зайнятості” на фронті (JS), щоб юзер взагалі не міг закрити/тиснути кнопки, поки триває завантаження колекції. Це ще більше знизить ризики.

@@ -1,0 +1,105 @@
+Коротка відповідь: якщо ти береш **ROWNUM = 1** з підзапиту, відсортованого за `STAGE` з умовою `STAGE > l_current_substage`, то завжди отримаєш **мінімальний** `STAGE`, який більший за поточний — тобто «наступний за порядком серед наявних». Він не «перескочить через один», якщо існує найближчий. Якщо ж нумерація має прогалини (2 → 5, немає 3,4), то «наступним» вважатиметься 5 — це коректно для логіки «наступний існуючий».
+
+Щоб зробити це надійно та однозначно, використовуй один із трьох безпечних шаблонів.
+
+## Варіант 1 (мінімум із кореляцією — найпрозоріший)
+
+```plsql
+declare
+  l_next_substage_id number;
+begin
+  select s.id
+    into l_next_substage_id
+    from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 s
+   where s.page_list_id    = l_page_list_id
+     and s.parent_stage_id = l_stage_id
+     and s.stage = (
+           select min(s2.stage)
+             from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 s2
+            where s2.page_list_id    = l_page_list_id
+              and s2.parent_stage_id = l_stage_id
+              and s2.stage           > l_current_substage
+         )
+     and rownum = 1; -- на випадок дублю stage
+exception
+  when no_data_found then
+    l_next_substage_id := null;
+end;
+```
+
+## Варіант 2 (ROW\_NUMBER по зростанню stage)
+
+```plsql
+declare
+  l_next_substage_id number;
+begin
+  select id
+    into l_next_substage_id
+    from (
+      select sbt.id,
+             row_number() over(order by sbt.stage, sbt.id) rn
+        from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 sbt
+       where sbt.page_list_id    = l_page_list_id
+         and sbt.parent_stage_id = l_stage_id
+         and sbt.stage           > l_current_substage
+    )
+   where rn = 1;
+exception
+  when no_data_found then
+    l_next_substage_id := null;
+end;
+```
+
+## Варіант 3 (твій запит, але правильно обгорнутий підзапитом з ROWNUM=1)
+
+```plsql
+declare
+  l_next_substage_id number;
+begin
+  select id
+    into l_next_substage_id
+    from (
+      select sbt.id
+        from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 sbt
+       where sbt.page_list_id    = l_page_list_id
+         and sbt.parent_stage_id = l_stage_id
+         and sbt.stage           > l_current_substage
+       order by sbt.stage, sbt.id
+    )
+   where rownum = 1;
+exception
+  when no_data_found then
+    l_next_substage_id := null;
+end;
+```
+
+### Якщо тобі потрібно саме «строго наступний = `l_current_substage + 1`»
+
+Тоді перевіряй спершу його наявність; лише якщо немає — вирішуй, що вважати «наступним» або що робити далі:
+
+```plsql
+declare
+  l_next_exact_id number;
+begin
+  select s.id
+    into l_next_exact_id
+    from TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 s
+   where s.page_list_id    = l_page_list_id
+     and s.parent_stage_id = l_stage_id
+     and s.stage           = l_current_substage + 1;
+
+  -- знайдено строго наступний → використовуй l_next_exact_id
+exception
+  when no_data_found then
+    -- немає «+1»: або вважай етап останнім, або переходь на «мінімальний більший» (будь-який з 1–3 варіантів вище)
+    l_next_exact_id := null;
+end;
+```
+
+### Індекси (для швидкості)
+
+* `DICT_APP_CONFIRM_LIST(page_list_id, parent_stage_id, stage)`
+* `SIGNATURERIGHTS(task_id, stages_id)`
+* `SIGNATUREHISTORY(signright_id)`
+
+Підсумок: з підзапитом і `rownum = 1`/`row_number() = 1` ти завжди береш найближчий наступний підетап. «Через один» не станеться, якщо ближчий існує; при прогалинах буде обраний **найменший із доступних**. Якщо потрібен саме `current+1`, перевіряй його окремо.
