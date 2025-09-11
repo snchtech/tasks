@@ -1,0 +1,105 @@
+DECLARE
+  l_code      VARCHAR2(400) := :P10_CODE;
+  l_user_id   USERS.USER_ID%TYPE;
+  l_method    VARCHAR2(10);
+  l_exists    NUMBER;
+  l_ts        VARCHAR2(16);
+  l_ip        VARCHAR2(45)  := util_net.get_client_ip; -- з попередньої відповіді
+  l_ua        VARCHAR2(255) := SUBSTR(owa_util.get_cgi_env('HTTP_USER_AGENT'),1,255);
+
+  l_firstname USERS.USER_FIRSTNAME%TYPE;
+  l_lastname  USERS.USER_LASTNAME%TYPE;
+  l_depart    USERS.USER_DEPART%TYPE;
+  l_position  USERS.USER_POSITION%TYPE;
+BEGIN
+  apex_json.open_object;
+
+  IF l_code IS NULL THEN
+    apex_json.write('ok', false);
+    apex_json.write('message', 'Введіть код або піднесіть мітку.');
+    apex_json.close_object;
+    RETURN;
+  END IF;
+
+  -- Пошук: NFC має пріоритет
+  BEGIN
+    WITH indata AS (
+      SELECT l_code AS code, norm_nfc(l_code) AS code_nfc FROM dual
+    )
+    SELECT user_id, method
+      INTO l_user_id, l_method
+      FROM (
+        SELECT n.user_id, 'NFC' AS method, 1 AS ord
+          FROM user_nfc n
+          JOIN indata d ON n.nfc_id = d.code_nfc
+        UNION ALL
+        SELECT u.user_id, 'MANUAL' AS method, 2 AS ord
+          FROM users u
+          JOIN indata d
+            ON REGEXP_LIKE(d.code,'^\d+$') AND u.user_id = TO_NUMBER(d.code)
+      )
+      ORDER BY ord
+      FETCH FIRST 1 ROW ONLY;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      l_user_id := NULL;
+  END;
+
+  IF l_user_id IS NULL THEN
+    -- Лог невдачі
+    INSERT INTO request_log(
+      user_id, device_ip, request_action, request_date,
+      session_id, user_agent, request_source, result_status, auth_method, error_message
+    ) VALUES (
+      NULL, l_ip, 'CHECK', SYSTIMESTAMP,
+      v('APP_SESSION'), l_ua, 'FORM', 'FAIL', NULL, 'User not found'
+    );
+
+    apex_json.write('ok', false);
+    apex_json.write('message', 'Користувача не знайдено.');
+    apex_json.close_object;
+    RETURN;
+  END IF;
+
+  -- Дані користувача
+  SELECT u.user_firstname, u.user_lastname, u.user_depart, u.user_position
+    INTO l_firstname, l_lastname, l_depart, l_position
+    FROM users u
+   WHERE u.user_id = l_user_id;
+
+  -- Фіксуємо успіх
+  INSERT INTO request_log(
+    user_id, device_ip, request_action, request_date,
+    session_id, user_agent, request_source, result_status, auth_method
+  ) VALUES (
+    l_user_id, l_ip, 'CHECK', SYSTIMESTAMP,
+    v('APP_SESSION'), l_ua, 'FORM', 'SUCCESS', l_method
+  );
+
+  SELECT to_char(SYSTIMESTAMP AT LOCAL TIME ZONE, 'dd.mm.yyyy hh24:mi')
+    INTO l_ts FROM dual;
+
+  -- Відповідь
+  apex_json.write('ok', true);
+  apex_json.write('ts', l_ts);
+  apex_json.write('firstname', l_firstname);
+  apex_json.write('lastname',  l_lastname);
+  apex_json.write('depart',    l_depart);
+  apex_json.write('position',  l_position);
+  apex_json.write('authMethod', l_method);
+
+  apex_json.close_object;
+EXCEPTION
+  WHEN OTHERS THEN
+    INSERT INTO request_log(
+      user_id, device_ip, request_action, request_date,
+      session_id, user_agent, request_source, result_status, error_code, error_message
+    ) VALUES (
+      NULL, l_ip, 'CHECK', SYSTIMESTAMP,
+      v('APP_SESSION'), l_ua, 'FORM', 'FAIL', SQLCODE, SUBSTR(SQLERRM,1,4000)
+    );
+    apex_json.open_object;
+    apex_json.write('ok', false);
+    apex_json.write('message', 'Системна помилка. Спробуйте ще раз.');
+    apex_json.close_object;
+END;
