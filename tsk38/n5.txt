@@ -1,0 +1,76 @@
+Так, ви правильно мислите 👍. У цьому місці, де у вас `ELSE` для виводу стандартного елемента списку, можна вставити додаткову перевірку для `l_shift_id`.
+
+Зараз у вас блок такий:
+
+```plsql
+ELSE
+   HTP.P('<li data-cl-order="' || l_order_counter || *" data-sq-ord="' || l_list_id || '"-class="confirm-list-li">');
+   HTP.P('< span class="number"></span>' || 
+         '<span class="pos-info"><span class="l-list-position">' || l_list_position || '</span>' || l_dep_unit || '< /span>');
+   HTP.P('<span class="confirm-list-buttons"> ... </span>');
+   HTP.P('</li>');
+END IF;
+```
+
+---
+
+### 🔹 Розширений варіант з обробкою `l_shift_id`
+
+```plsql
+ELSE
+   DECLARE
+      v_shift_name SHIFTS.SHIFT_CODE%TYPE;
+   BEGIN
+      -- Перевірка: якщо немає pos/dep/unit, але є shift_id
+      IF l_list_position IS NULL 
+         AND l_list_department IS NULL 
+         AND l_list_unit IS NULL 
+         AND l_sg_history_id IS NULL   -- новий підписант, не зафіксований в історії
+         AND l_list_shift_id IS NOT NULL THEN
+
+         BEGIN
+            SELECT s.SHIFT_CODE || CASE WHEN s.SHIFT_NAME IS NOT NULL THEN ' - ' || s.SHIFT_NAME ELSE '' END
+              INTO v_shift_name
+              FROM SHIFTS s
+             WHERE s.SHIFT_ID = l_list_shift_id;
+         EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+               v_shift_name := 'SHIFT - Невідома зміна';
+         END;
+
+         -- Формуємо li для зміни
+         HTP.P('<li data-cl-order="' || l_order_counter || '" data-sq-ord="' || l_list_id || '" class="confirm-list-li">');
+         HTP.P('<span class="number"></span>' || 
+               '<span class="pos-info"><span class="l-list-position">SHIFT - ' || v_shift_name || '</span></span>');
+         HTP.P('<span class="confirm-list-buttons">' ||
+               '<button class="confirm-list-button-up"></button>' ||
+               '<button class="confirm-list-button-down"></button>' ||
+               '<button data-list-id="' || l_list_id || '" data-step="' || l_substage_id || '" ' ||
+               'data-coll-name="ADD_PERMIT_' || l_stage_id || '_' || l_substage_id || '" class="confirm-list-remove-button"></button>' ||
+               '</span>');
+         HTP.P('</li>');
+
+      ELSE
+         -- стандартний варіант як у вас був
+         HTP.P('<li data-cl-order="' || l_order_counter || '" data-sq-ord="' || l_list_id || '" class="confirm-list-li">');
+         HTP.P('<span class="number"></span>' || 
+               '<span class="pos-info"><span class="l-list-position">' || l_list_position || '</span>' || l_dep_unit || '</span>');
+         HTP.P('<span class="confirm-list-buttons"> ... </span>');
+         HTP.P('</li>');
+      END IF;
+   END;
+END IF;
+```
+
+---
+
+### 🔹 Що робить цей блок
+
+* Якщо у записі відсутні **pos/dep/unit**, але присутній **`l_list_shift_id`** → робиться `SELECT` з таблиці `SHIFTS` і виводиться `SHIFT - Назва`.
+* Якщо умова не виконується → працює стандартний вивід, як був.
+
+---
+
+👉 Вам потрібно лише переконатися, що `l_list_shift_id` дійсно входить у `FETCH confirm_list` (наприклад, через `c020` або іншу колонку колекції).
+
+Хочете, я покажу приклад SQL для вашої колекції `ADD_PERMIT_…`, де додати ще й `c020` як `l_list_shift_id`?

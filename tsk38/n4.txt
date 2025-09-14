@@ -1,0 +1,57 @@
+Чудово 👌, тоді для **`shift_id`** треба зробити **дзеркальний блок**, як у вас для `tab_no`.
+
+Тобто:
+
+* умова `ELSIF` ловить випадок, коли `position_id`, `department_id`, `unit_id`, `tab_no` = `NULL`, але `shift_id` заповнено;
+* далі перевірка: якщо `l_list_shift_id = l_current_user_shift_id`, тоді користувач має право (аналог `l_is_tabno`).
+
+---
+
+### 🔹 Приклад коду (аналог tab\_no)
+
+```plsql
+ELSIF l_list_position_id IS NULL 
+  AND l_list_department_id IS NULL 
+  AND l_list_unit_id IS NULL 
+  AND l_list_tab_no IS NULL 
+  AND l_list_shift_id IS NOT NULL THEN   -- група 3: SHIFT
+
+   -- Перевірка доступу по зміні
+   IF l_list_shift_id = l_current_user_shift_id THEN
+      l_is_shift := true;
+   ELSE
+      l_is_shift := false;
+   END IF;
+
+   l_is_role := l_is_shift;
+
+   IF l_is_role AND l_count_cb = 0 THEN
+      HTP.P('<button id="signature-btn" data-signature-id="'|| l_signature_id || '" class="confirm-signature-button">' 
+             || l_substage_btn_text || '</button>');
+      l_count_cb := l_count_cb + 1;
+
+   ELSIF l_is_role AND l_count_cb > 0 THEN
+      HTP.P('<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+
+   ELSIF NOT l_is_role AND l_count_cb = 0 THEN
+      HTP.P('<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+      l_count_cb := l_count_cb + 1;
+
+   ELSIF NOT l_is_role AND l_count_cb > 0 THEN
+      HTP.P('<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+   END IF;
+END IF;
+```
+
+---
+
+### 🔹 Що потрібно підготувати
+
+1. У вас має бути змінна `l_current_user_shift_id` (за аналогією з `l_current_user_tabno_gl`).
+
+   * Це значення можна визначити на глобальній сторінці або в логіні користувача (яку зміну він представляє).
+2. В `APEX_COLLECTION` має бути колонка, де зберігається `shift_id` (наприклад `c015`), яку ви мапите у `l_list_shift_id`.
+
+---
+
+👉 Хочете, я покажу, як правильно додати ініціалізацію `l_current_user_shift_id` на початку вашого коду (там, де у вас `l_current_user_tabno_gl`, `l_current_user_position_gl`, `l_current_user_department_g1`)?

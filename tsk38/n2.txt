@@ -1,0 +1,98 @@
+Добре 👍, давайте розкладемо крок за кроком, як це зробити в APEX.
+
+---
+
+## 🔹 1. Створюємо **Select List** для вибору зміни
+
+У вашому регіоні додаєте **Item** (наприклад `P2_SHIFT_SELECT`) з типом **Select List**.
+
+**SQL Query для LOV** (List of Values):
+
+```sql
+SELECT SHIFT_CODE AS display_value, SHIFT_ID AS return_value
+FROM SHIFTS
+WHERE IS_ACTIVE = 'Y'
+ORDER BY SHIFT_CODE
+```
+
+* `display_value` → буде відображатися літера (A, B, C).
+* `return_value` → у таблицю вставлятиметься `SHIFT_ID`.
+
+---
+
+## 🔹 2. Кнопка "Додати"
+
+Для кнопки робимо **Process** (тип PL/SQL Code) після Submit.
+
+Ваш оновлений код з урахуванням `SHIFT_ID` буде таким:
+
+```plsql
+BEGIN
+  -- Вставка для Group1
+  IF :P2_GROUP1_CHECK = 'Y' THEN
+    INSERT INTO SIGNATURERIGHTS (
+      TASK_ID,
+      USER_ID,
+      POSITION_ID,
+      DEPARTMENT_ID,
+      UNIT_ID,
+      SHIFT_ID,        -- 🔹 додано нове поле
+      STAGE_ID,
+      CREATE_DATE
+    ) VALUES (
+      :P2_TASK_ID,
+      :APP_USER,       -- або інший user_id
+      :P2_POSITION,
+      :P2_DEPARTMENT,
+      :P2_UNIT,
+      :P2_SHIFT_SELECT,  -- 🔹 тут shift_id із select list
+      1,
+      SYSDATE
+    );
+  END IF;
+
+  -- Вставка для Group2
+  IF :P2_GROUP2_CHECK = 'Y' THEN
+    INSERT INTO SIGNATURERIGHTS (
+      TASK_ID,
+      USER_ID,
+      SHIFT_ID,        -- 🔹 shift_id також можна передати
+      STAGE_ID,
+      CREATE_DATE
+    ) VALUES (
+      :P2_TASK_ID,
+      :P2_NAME,        -- тут user_id
+      :P2_SHIFT_SELECT,
+      1,
+      SYSDATE
+    );
+  END IF;
+
+  -- Вставка для Group3 (коли shift головний параметр)
+  IF :P2_GROUP3_CHECK = 'Y' THEN
+    INSERT INTO SIGNATURERIGHTS (
+      TASK_ID,
+      SHIFT_ID,        -- 🔹 shift_id головний
+      STAGE_ID,
+      CREATE_DATE
+    ) VALUES (
+      :P2_TASK_ID,
+      :P2_SHIFT_SELECT,
+      1,
+      SYSDATE
+    );
+  END IF;
+END;
+```
+
+---
+
+## 🔹 3. Ключові моменти
+
+* У всіх вставках додаємо `SHIFT_ID`, який заповнюється значенням із `:P2_SHIFT_SELECT`.
+* Якщо у вас логіка різна по групах (в одному випадку потрібні `USER_ID`, в іншому лише `SHIFT_ID`), ви вже це врахували умовами `IF`.
+* Рекомендую на колонку `SHIFT_ID` у таблиці `SIGNATURERIGHTS` поставити **foreign key** на `SHIFTS(SHIFT_ID)`, щоб уникнути "сміття".
+
+---
+
+👉 Хочете, я зразу підготую SQL View, яке буде з’єднувати `SIGNATURERIGHTS` з `SHIFTS`, щоб у звіті показувалася не `SHIFT_ID`, а літера `SHIFT_CODE`?

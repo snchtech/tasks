@@ -1,0 +1,73 @@
+Добре 👍 давай зробимо по кроках.
+
+У тебе зараз **стара таблиця** `DEVICES` з усіма даними, і ти хочеш рознести їх у дві **нові таблиці**:
+
+* `PP_LIST` – узагальнена інформація про "pp" (id, name, short\_name, type)
+* `PP_POINTS` – конкретні "points" (id, point\_id, pp\_id, name, inout).
+
+---
+
+### 1. Наповнення **PP\_LIST**
+
+Тут беремо унікальні `pp_id` із DEVICES, а також поля `NAME`, `DEVICE_NAME`, `pp_type`.
+
+```sql
+INSERT INTO pp_list (id, pp_id, name, short_name, pp_type)
+SELECT DISTINCT
+       pp_id AS id,         -- або можна взяти SEQUENCE
+       pp_id,
+       name,                -- узагальнене ім'я
+       device_name,         -- коротка назва
+       pp_type
+FROM devices;
+```
+
+> ⚠️ Якщо `pp_id` у `DEVICES` повторюється – `DISTINCT` потрібен, щоб уникнути дублікатів.
+> Якщо в тебе є `sequence`, то краще `id` генерувати від неї, а `pp_id` брати з DEVICES.
+
+---
+
+### 2. Наповнення **PP\_POINTS**
+
+Тут кожен запис із DEVICES відповідає point.
+
+```sql
+INSERT INTO pp_points (id, point_id, pp_id, point_name, inout)
+SELECT id,         -- можна або залишити старий, або sequence
+       point_id,
+       pp_id,
+       device_name AS point_name,
+       inout
+FROM devices;
+```
+
+---
+
+### 3. Варіант із **sequence** (рекомендований)
+
+Якщо `id` у нових таблицях має бути унікальним та незалежним від старих `id`, тоді краще використовувати `sequence`:
+
+```sql
+-- Для PP_LIST
+INSERT INTO pp_list (id, pp_id, name, short_name, pp_type)
+SELECT pp_list_seq.NEXTVAL,
+       d.pp_id,
+       d.name,
+       d.device_name,
+       d.pp_type
+FROM (SELECT DISTINCT pp_id, name, device_name, pp_type FROM devices) d;
+
+-- Для PP_POINTS
+INSERT INTO pp_points (id, point_id, pp_id, point_name, inout)
+SELECT pp_points_seq.NEXTVAL,
+       d.point_id,
+       d.pp_id,
+       d.device_name,
+       d.inout
+FROM devices d;
+```
+
+---
+
+👉 Запитання:
+Ти хочеш, щоб у нових таблицях `id` **співпадали** з `DEVICES.id` (простіше переносити), чи краще згенерувати нові `id` через `sequence`?
