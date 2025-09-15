@@ -1,0 +1,121 @@
+Добре 👍 зробимо фінальний варіант із **лог-таблицею**.
+Тоді у вас будуть:
+
+* основні дані в `prt_prot` і `prt_n`;
+* історія виконання job у `prt_transfer_log`.
+
+---
+
+### 🔹 1. Лог-таблиця
+
+```sql
+CREATE TABLE prt_transfer_log (
+    id         NUMBER PRIMARY KEY,
+    job_date   DATE,
+    prot_id    NUMBER,
+    row_count  NUMBER,
+    status     VARCHAR2(20),
+    error_msg  VARCHAR2(4000)
+);
+```
+
+⚠️ Тут треба sequence (бо це чисто технічна таблиця):
+
+```sql
+CREATE SEQUENCE prt_transfer_log_seq START WITH 1 INCREMENT BY 1;
+```
+
+---
+
+### 🔹 2. Процедура з обробкою помилок
+
+```sql
+CREATE OR REPLACE PROCEDURE job_transfer_data IS
+    v_count NUMBER;
+    v_id    prt_prot.id%TYPE;
+BEGIN
+    -- 1. Рахуємо кількість записів за попередній день
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 2. Вставляємо у prt_prot (id генерує тригер)
+    INSERT INTO prt_prot (full_file_name, file_name, result, creator, create_date)
+    VALUES ('text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE)
+    RETURNING id INTO v_id;
+
+    -- 3. Вставляємо у prt_n
+    INSERT INTO prt_n (prt_prot_id, user_id, data_time, oznaka, creator, create_date, f_id)
+    SELECT v_id,
+           t.user_id,
+           r.request_date,
+           r.action_type_id,
+           'PP',
+           SYSDATE,
+           kp.id
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 4. Лог успішного виконання
+    INSERT INTO prt_transfer_log (id, job_date, prot_id, row_count, status)
+    VALUES (prt_transfer_log_seq.NEXTVAL, SYSDATE, v_id, v_count, 'SUCCESS');
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- Лог з помилкою
+        INSERT INTO prt_transfer_log (id, job_date, prot_id, row_count, status, error_msg)
+        VALUES (prt_transfer_log_seq.NEXTVAL,
+                SYSDATE,
+                v_id,
+                v_count,
+                'FAILED',
+                SUBSTR(SQLERRM, 1, 4000));
+        ROLLBACK; -- якщо треба зберегти хоча б запис у log, можна COMMIT перед ROLLBACK
+        RAISE;
+END;
+/
+```
+
+---
+
+### 🔹 3. Планування job (через DBMS\_JOB для Oracle 10g)
+
+```sql
+DECLARE
+   v_job NUMBER;
+BEGIN
+   DBMS_JOB.SUBMIT (
+      job       => v_job,
+      what      => 'BEGIN job_transfer_data; END;',
+      next_date => TRUNC(SYSDATE+1) + 2/24, -- завтра о 02:00
+      interval  => 'TRUNC(SYSDATE+1) + 2/24'
+   );
+   COMMIT;
+END;
+/
+```
+
+---
+
+✅ Результат:
+
+* У `prt_prot` і `prt_n` дані пишуться, як задумано.
+* У `prt_transfer_log` завжди буде запис:
+
+  * `SUCCESS` з кількістю рядків, якщо все відпрацювало;
+  * `FAILED` із повідомленням про помилку, якщо щось пішло не так.
+
+---
+
+Хочете, я ще підкажу варіант, як **зберегти log навіть при ROLLBACK** (щоб у будь-якому разі запис із помилкою лишався)?

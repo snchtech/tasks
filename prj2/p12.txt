@@ -1,0 +1,95 @@
+Так, у PL/SQL (Oracle 10g теж) можна і треба обробляти `EXCEPTION`.
+Це якраз стандартний механізм, щоб:
+
+* перехопити помилку під час виконання (наприклад, якщо не вставилися дані в `prt_n`);
+* записати інформацію в лог (або оновити статус у `prt_prot`);
+* вирішити, чи робити `ROLLBACK` чи залишати хоча б частину даних.
+
+---
+
+### 🔹 Приклад із `prt_prot.transfer_status`
+
+```sql
+CREATE OR REPLACE PROCEDURE job_transfer_data IS
+    v_count NUMBER;
+    v_id    prt_prot.id%TYPE;
+BEGIN
+    -- рахуємо кількість
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- вставка в prt_prot зі статусом IN_PROGRESS
+    INSERT INTO prt_prot (full_file_name, file_name, result, creator, create_date, transfer_status)
+    VALUES ('text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE,
+            'IN_PROGRESS')
+    RETURNING id INTO v_id;
+
+    -- вставка в prt_n
+    INSERT INTO prt_n (prt_prot_id, user_id, data_time, oznaka, creator, create_date, f_id)
+    SELECT v_id,
+           t.user_id,
+           r.request_date,
+           r.action_type_id,
+           'PP',
+           SYSDATE,
+           kp.id
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- все ок → ставимо DONE
+    UPDATE prt_prot SET transfer_status = 'DONE' WHERE id = v_id;
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- якщо помилка → пишемо статус FAILED
+        UPDATE prt_prot 
+        SET transfer_status = 'FAILED',
+            result = NVL(result, '') || ' | ERROR: ' || SQLERRM
+        WHERE id = v_id;
+
+        ROLLBACK; -- або COMMIT, якщо хочете лишити часткові дані
+        RAISE;    -- пробросимо помилку далі, щоб job у логах теж було видно
+END;
+/
+```
+
+---
+
+### 🔹 Приклад із лог-таблицею
+
+```sql
+EXCEPTION
+    WHEN OTHERS THEN
+        INSERT INTO prt_transfer_log (id, job_date, prot_id, row_count, status, error_msg)
+        VALUES (prt_transfer_log_seq.NEXTVAL,
+                SYSDATE,
+                v_id,
+                v_count,
+                'FAILED',
+                SUBSTR(SQLERRM,1,4000));
+        ROLLBACK;
+END;
+```
+
+---
+
+✅ Таким чином ви завжди будете знати:
+
+* `DONE` — дані перенесені;
+* `FAILED` — щось пішло не так (у полі `result` або лог-таблиці є текст помилки).
+
+---
+
+Хочете, я зроблю фінальну версію **процедури з обома механізмами одночасно**: і `transfer_status` у `prt_prot`, і `prt_transfer_log` для історії?

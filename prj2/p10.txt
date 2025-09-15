@@ -1,0 +1,85 @@
+Добре 👍
+Якщо у таблиці `prt_prot` **id генерується автоматично тригером** (наприклад, `BEFORE INSERT` бере значення з sequence), то доступу до sequence напряму вам не треба. У такому випадку можна зробити ось так:
+
+---
+
+### Варіант з тригером (без виклику `NEXTVAL`)
+
+```sql
+CREATE OR REPLACE PROCEDURE job_transfer_data IS
+    v_count NUMBER;
+    v_id    prt_prot.id%TYPE; -- id з prt_prot
+BEGIN
+    -- 1. Рахуємо кількість записів за вчора
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r 
+           ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp 
+           ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 2. Вставляємо у prt_prot і зберігаємо id
+    INSERT INTO prt_prot (full_file_name, file_name, result, creator, create_date)
+    VALUES ('text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE)
+    RETURNING id INTO v_id; -- тут спрацює тригер і ми отримаємо id
+
+    -- 3. Вставляємо всі рядки у prt_n
+    INSERT INTO prt_n (prt_prot_id, user_id, data_time, oznaka, creator, create_date, f_id)
+    SELECT v_id,
+           t.user_id,
+           r.request_date,
+           r.action_type_id,
+           'PP',
+           SYSDATE,
+           kp.id
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r 
+           ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp 
+           ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    COMMIT;
+END;
+/
+```
+
+---
+
+### Запуск як JOB (Oracle 10g)
+
+У 10g ще часто використовували **DBMS\_JOB** (DBMS\_SCHEDULER вже є, але старі інсталяції часто працюють через DBMS\_JOB).
+Варіант із `DBMS_JOB`:
+
+```sql
+DECLARE
+   v_job NUMBER;
+BEGIN
+   DBMS_JOB.SUBMIT (
+      job       => v_job,
+      what      => 'BEGIN job_transfer_data; END;',
+      next_date => TRUNC(SYSDATE+1) + 2/24, -- завтра о 02:00
+      interval  => 'TRUNC(SYSDATE+1) + 2/24' -- щодня о 02:00
+   );
+   COMMIT;
+END;
+/
+```
+
+---
+
+✅ У цьому варіанті:
+
+* `id` генерується **тригером** → `RETURNING id INTO v_id` працює.
+* Доступ до `sequence` не потрібен.
+* Використано `DBMS_JOB` (сумісний із 10g), але за бажання можна залишити `DBMS_SCHEDULER`.
+
+---
+
+Хочете, я покажу приклад **тригера для prt\_prot**, щоб упевнитись, що `RETURNING INTO` спрацює коректно у вас?

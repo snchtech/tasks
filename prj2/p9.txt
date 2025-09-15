@@ -1,0 +1,92 @@
+Зрозумів 👍.
+У вас Oracle 10g, і ви хочете організувати **job**, який:
+
+1. Рахує кількість записів за попередній день.
+2. Вставляє запис у `prt_prot` із кількістю.
+3. Запам’ятовує `id` цього запису.
+4. Вставляє деталі у `prt_n`, використовуючи цей `prt_prot_id`.
+
+### Важливі моменти для Oracle 10g:
+
+* У 10g **є підтримка `RETURNING INTO`** (починаючи з 8i). Тобто можна одразу отримати `id` з інсерта в `prt_prot`.
+* Якщо в `prt_prot.id` використовується **trigger + sequence**, то `RETURNING INTO` прекрасно відпрацює.
+* Якщо ID генерується іншим чином (наприклад, з пакету), тоді треба уточнити, але для стандартного sequence + trigger буде ок.
+
+---
+
+### Приклад реалізації через процедуру
+
+```sql
+CREATE OR REPLACE PROCEDURE job_transfer_data IS
+    v_count        NUMBER;
+    v_id           prt_prot.id%TYPE; -- id з prt_prot
+BEGIN
+    -- 1. Рахуємо кількість записів за вчора
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r 
+           ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp 
+           ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 2. Вставляємо у prt_prot і зберігаємо id
+    INSERT INTO prt_prot (id, full_file_name, file_name, result, creator, create_date)
+    VALUES (prt_prot_seq.NEXTVAL, -- якщо id генерується sequence'ом
+            'text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE)
+    RETURNING id INTO v_id; -- отримаємо id вставленого запису
+
+    -- 3. Вставляємо всі рядки у prt_n
+    INSERT INTO prt_n (prt_prot_id, user_id, data_time, oznaka, creator, create_date, f_id)
+    SELECT v_id,
+           t.user_id,
+           r.request_date,
+           r.action_type_id,
+           'PP',
+           SYSDATE,
+           kp.id
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r 
+           ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp 
+           ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    COMMIT;
+END;
+/
+```
+
+---
+
+### Створення JOB
+
+```sql
+BEGIN
+    DBMS_SCHEDULER.create_job (
+        job_name        => 'JOB_TRANSFER_DATA',
+        job_type        => 'STORED_PROCEDURE',
+        job_action      => 'job_transfer_data',
+        start_date      => SYSTIMESTAMP,
+        repeat_interval => 'FREQ=DAILY;BYHOUR=2;BYMINUTE=0;BYSECOND=0', -- кожен день о 02:00
+        enabled         => TRUE
+    );
+END;
+/
+```
+
+---
+
+✅ Таким чином:
+
+* `RETURNING INTO` у 10g працює.
+* Використання `prt_prot_seq.NEXTVAL` потрібно тільки якщо ви маєте доступ до sequence. Якщо `id` виставляється тригером автоматично — `RETURNING id INTO v_id` теж спрацює.
+
+---
+
+Хочете, я зроблю ще варіант **без sequence**, тільки через `trigger` (автоінкремент ID), щоб точно не залежати від доступу до `NEXTVAL`?
