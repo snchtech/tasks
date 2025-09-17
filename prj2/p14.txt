@@ -1,0 +1,109 @@
+Чудово 👌, тоді треба трохи переписати п.2 у вашій процедурі.
+Якщо ви хочете **самі генерувати `id` з `seq_prt_prot`** (а не покладатися на тригер), то схема така:
+
+---
+
+### 🔹 Оновлений код (фрагмент п.2)
+
+```sql
+DECLARE
+    v_count NUMBER;
+    v_id    prt_prot.id%TYPE;
+BEGIN
+    -- 1. Рахуємо кількість записів за попередній день
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 2. Генеруємо id з sequence
+    SELECT seq_prt_prot.NEXTVAL INTO v_id FROM dual;
+
+    -- 2a. Вставка у prt_prot з уже готовим id
+    INSERT INTO prt_prot (id, full_file_name, file_name, result, creator, create_date)
+    VALUES (v_id,
+            'text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE);
+```
+
+---
+
+### 🔹 Повна процедура з логом
+
+```sql
+CREATE OR REPLACE PROCEDURE job_transfer_data IS
+    v_count NUMBER;
+    v_id    prt_prot.id%TYPE;
+BEGIN
+    -- 1. Рахуємо кількість записів за попередній день
+    SELECT COUNT(*)
+    INTO v_count
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 2. Отримуємо id з sequence
+    SELECT seq_prt_prot.NEXTVAL INTO v_id FROM dual;
+
+    -- 2a. Вставляємо у prt_prot
+    INSERT INTO prt_prot (id, full_file_name, file_name, result, creator, create_date)
+    VALUES (v_id,
+            'text1',
+            'text.sql',
+            TO_CHAR(SYSDATE,'dd.mm.yyyy hh24:mi:ss') || ' + Додано: ' || v_count,
+            'PP',
+            SYSDATE);
+
+    -- 3. Вставляємо у prt_n
+    INSERT INTO prt_n (prt_prot_id, user_id, data_time, oznaka, creator, create_date, f_id)
+    SELECT v_id,
+           t.user_id,
+           r.request_date,
+           r.action_type_id,
+           'PP',
+           SYSDATE,
+           kp.id
+    FROM USER_SESSIONS t
+    LEFT JOIN request_log r ON r.user_session_row_id = t.id
+    LEFT JOIN pp.pp_points kp ON kp.id = r.id_pp_point
+    WHERE TRUNC(r.request_date) = TRUNC(SYSDATE - 1);
+
+    -- 4. Лог успішного виконання
+    INSERT INTO prt_transfer_log (id, job_date, prot_id, row_count, status)
+    VALUES (prt_transfer_log_seq.NEXTVAL, SYSDATE, v_id, v_count, 'SUCCESS');
+
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- Лог з помилкою
+        INSERT INTO prt_transfer_log (id, job_date, prot_id, row_count, status, error_msg)
+        VALUES (prt_transfer_log_seq.NEXTVAL,
+                SYSDATE,
+                v_id,
+                v_count,
+                'FAILED',
+                SUBSTR(SQLERRM, 1, 4000));
+        ROLLBACK; -- можна COMMIT перед цим, якщо треба зберегти log
+        RAISE;
+END;
+/
+```
+
+---
+
+👉 Таким чином:
+
+* ID ви **генеруєте самі** через `seq_prt_prot.NEXTVAL`.
+* Цей `v_id` використовується і для `prt_prot`, і для `prt_n`, і для логування.
+* `RETURNING INTO` вже не потрібен.
+
+---
+
+Хочете, я ще покажу варіант, як правильно зберегти **запис у лог навіть у випадку `ROLLBACK`** (через автономну транзакцію)?
