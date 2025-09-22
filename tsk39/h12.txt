@@ -1,0 +1,108 @@
+О, дуже правильний підхід 👌 — лог має фіксувати не тільки сам факт входу, але й **контекст**, у якому працював користувач (свій чи в режимі заміщення).
+
+---
+
+## 📌 Пропонована структура `SHIFT_PERSONAL_LOGGER`
+
+Додаємо нові колонки:
+
+```sql
+ALTER TABLE SHIFT_PERSONAL_LOGGER ADD (
+    IS_SUBSTITUTION    CHAR(1) DEFAULT 'N' CHECK (IS_SUBSTITUTION IN ('Y','N')),
+    CHIEF_TAB_NO       NUMBER,      -- табельний номер керівника
+    CHIEF_POSITION_ID  NUMBER       -- посада керівника
+);
+```
+
+---
+
+## 📌 Логіка заповнення
+
+### 🔹 1. Коли користувач заходить без заміщення (`P0_SUBSTITUTION = 0`)
+
+* `IS_SUBSTITUTION = 'N'`
+* `CHIEF_TAB_NO = NULL`
+* `CHIEF_POSITION_ID = NULL`
+
+### 🔹 2. Коли користувач заходить у режимі заміщення (`P0_SUBSTITUTION = 1`)
+
+* `IS_SUBSTITUTION = 'Y'`
+* `CHIEF_TAB_NO = :P0_CUR_USER_TABNO`   (тобто табельний номер керівника, якого заміщають)
+* `CHIEF_POSITION_ID = :P0_CUR_USER_POSITION`
+
+А у звичайні поля (`TAB_NO`, `POSITION_ID`) пишемо дані користувача, який реально зайшов.
+
+---
+
+## 📌 Приклад PL/SQL процесу вставки (спрощений)
+
+```plsql
+DECLARE
+    v_shift_start DATE;
+    v_shift_end   DATE;
+BEGIN
+    -- Отримуємо інтервал зміни
+    IF :P0_SHIFT_NUMBER IS NOT NULL THEN
+        SELECT TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_START, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND)),
+               TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_END,   'HH24:MI:SS') AS INTERVAL DAY TO SECOND))
+        INTO v_shift_start, v_shift_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER;
+    ELSE
+        v_shift_start := :P0_SHIFT_START;
+        v_shift_end   := :P0_SHIFT_END;
+    END IF;
+
+    -- Вставка у лог
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        SHIFT_START,
+        SHIFT_END,
+        SOURCE_APP,
+        CREATED_BY,
+        IS_SUBSTITUTION,
+        CHIEF_TAB_NO,
+        CHIEF_POSITION_ID
+    ) VALUES (
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN :P0_NEW_TAB_NO ELSE :P0_CUR_USER_TABNO END,
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN :P0_NEW_DEPARTMENT_ID ELSE :P0_CUR_USER_DEPARTMENT END,
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN :P0_NEW_POSITION_ID ELSE :P0_CUR_USER_POSITION END,
+        :P0_SHIFT_SYMBOL,
+        :P0_SHIFT_NUMBER,
+        v_shift_start,
+        v_shift_end,
+        :APP_ID,
+        :APP_USER,
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN 'Y' ELSE 'N' END,
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN :P0_CUR_USER_TABNO END,
+        CASE WHEN :P0_SUBSTITUTION = 1 THEN :P0_CUR_USER_POSITION END
+    )
+    RETURNING SHIFT_SYMBOL_ID, SHIFT_NUMBER_ID, SHIFT_START, SHIFT_END
+    INTO :P0_SHIFT_SYMBOL, :P0_SHIFT_NUMBER, :P0_SHIFT_START, :P0_SHIFT_END;
+END;
+```
+
+---
+
+## 📌 Приклад використання в звіті
+
+У вашому журналі завдань можна показати:
+
+* Якщо `IS_SUBSTITUTION = 'N'` → *"Користувач працював під собою"*.
+* Якщо `IS_SUBSTITUTION = 'Y'` → *"Користувач працював у режимі заміщення керівника (TabNo = 12345, Посада = 2206)"*.
+
+---
+
+✅ Таким чином:
+
+* Ви завжди знаєте, хто фізично зайшов (`TAB_NO`, `POSITION_ID`).
+* І чи це був **його власний захід**, чи **заміщення керівника** (`IS_SUBSTITUTION + CHIEF_*`).
+
+---
+
+Хочете, я підготую ще **SQL-запит для звіту**, де буде колона `"Режим роботи"` із автоматичним текстом `"Під собою"` або `"Заміщення керівника (ПІБ, посада)"`?

@@ -1,0 +1,59 @@
+Окей 👍
+В Oracle APEX зробити **Select List із SHIFT\_SYMBOL** для підрозділу користувача дуже просто.
+Треба написати SQL-LOV, яке:
+
+1. Бере символи змін (`SHIFT_SYMBOL`).
+2. Обмежує їх через таблицю співвідношення `DEPARTMENT_SHIFT_SYMBOL`.
+3. Фільтрує по `DEPARTMENT_ID` користувача (який можна брати з глобального item, напр. `:P0_DEPARTMENT_ID`).
+
+---
+
+## 📌 Приклад LOV (SQL Query)
+
+```sql
+SELECT ss.SYMBOL_NAME AS display_value,
+       ss.SYMBOL_ID   AS return_value
+  FROM SHIFT_SYMBOL ss
+  JOIN DEPARTMENT_SHIFT_SYMBOL dss 
+    ON dss.SYMBOL_ID = ss.SYMBOL_ID
+ WHERE dss.DEPARTMENT_ID = :P0_DEPARTMENT_ID
+   AND ss.IS_ACTIVE = 'Y'
+   AND dss.IS_ACTIVE = 'Y'
+ ORDER BY ss.SYMBOL_CODE
+```
+
+---
+
+## 📌 Налаштування Select List
+
+* **Type**: Select List.
+* **LOV Type**: SQL Query (як вище).
+* **Display Value**: `SYMBOL_NAME` (наприклад: "Ранкова", "Денна").
+* **Return Value**: `SYMBOL_ID`.
+
+---
+
+## 📌 Опціонально
+
+Якщо ви хочете показати і код, і назву (наприклад `A – Ранкова`):
+
+```sql
+SELECT ss.SYMBOL_CODE || ' – ' || ss.SYMBOL_NAME AS display_value,
+       ss.SYMBOL_ID AS return_value
+  FROM SHIFT_SYMBOL ss
+  JOIN DEPARTMENT_SHIFT_SYMBOL dss 
+    ON dss.SYMBOL_ID = ss.SYMBOL_ID
+ WHERE dss.DEPARTMENT_ID = :P0_DEPARTMENT_ID
+   AND ss.IS_ACTIVE = 'Y'
+   AND dss.IS_ACTIVE = 'Y'
+ ORDER BY ss.SYMBOL_CODE
+```
+
+---
+
+✅ Результат:
+У блоці вибору виконавців ваш користувач побачить тільки ті символи змін, які дозволені саме його підрозділу.
+
+---
+
+Хочете, я одразу дам аналогічний приклад і для **SHIFT\_NUMBER** (тобто список номерів змін з часами, напр. `1 (06:00-13:00)`)?

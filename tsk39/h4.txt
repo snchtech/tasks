@@ -1,0 +1,107 @@
+Чудово 👍
+У вашому випадку найзручніше зробити це у **PL/SQL процесі в APEX** (або у **тригері** на таблиці, якщо треба глобально).
+Я покажу варіант процесу для APEX, бо він дає вам контроль і простіше відлагоджується.
+
+---
+
+## 📌 Приклад PL/SQL процесу (на APEX-сторінці)
+
+```plsql
+DECLARE
+    v_time_start DATE := SYSDATE;
+    v_time_end   DATE;
+BEGIN
+    -- Якщо вказаний shift_number_id → беремо години з довідника
+    IF :P0_SHIFT_NUMBER_ID IS NOT NULL THEN
+        SELECT 
+            -- TIME_START можна теж підтягнути з довідника, але частіше це SYSDATE
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_START, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND)),
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_END, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND))
+        INTO v_time_start, v_time_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID = :P0_DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER_ID;
+
+    ELSE
+        -- Якщо користувач сам ввів час
+        v_time_start := :P0_TIME_START;
+        v_time_end   := :P0_TIME_END;
+    END IF;
+
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    ) VALUES (
+        :P0_TAB_NO,
+        :P0_DEPARTMENT_ID,
+        :P0_POSITION_ID,
+        :P0_SHIFT_SYMBOL_ID,
+        :P0_SHIFT_NUMBER_ID,
+        v_time_start,
+        v_time_end,
+        :APP_ID,
+        :APP_USER
+    );
+END;
+```
+
+---
+
+## 📌 Пояснення логіки
+
+1. Якщо користувач вибрав **`SHIFT_NUMBER_ID`** →
+
+   * ми підтягуємо `TIME_START` і `TIME_END` із таблиці `DEPARTMENT_SHIFT_NUMBER` для його департаменту та зміни.
+   * щоб годину "накласти" на сьогоднішню дату, можна використовувати комбінацію `TRUNC(SYSDATE) + TO_CHAR(TIME_START,'HH24:MI:SS')`.
+2. Якщо `SHIFT_NUMBER_ID` = NULL →
+
+   * використовуються ручні `P0_TIME_START` та `P0_TIME_END`.
+3. Далі робиться **INSERT** у `SHIFT_PERSONAL_LOGGER`.
+
+---
+
+## 📌 Альтернатива — ТРИГЕР на таблиці
+
+Якщо хочете, щоб це працювало **завжди**, незалежно від APEX чи іншого застосунку:
+
+```plsql
+CREATE OR REPLACE TRIGGER trg_shift_logger_bi
+BEFORE INSERT ON SHIFT_PERSONAL_LOGGER
+FOR EACH ROW
+DECLARE
+    v_time_start DATE;
+    v_time_end   DATE;
+BEGIN
+    IF :NEW.SHIFT_NUMBER_ID IS NOT NULL THEN
+        SELECT 
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_START, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND)),
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_END, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND))
+        INTO v_time_start, v_time_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID = :NEW.DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :NEW.SHIFT_NUMBER_ID;
+
+        :NEW.TIME_START := v_time_start;
+        :NEW.TIME_END   := v_time_end;
+    END IF;
+END;
+/
+```
+
+---
+
+🔹 **Рекомендація:**
+
+* Якщо це лише для APEX-форми → робіть через **Process** (гнучкіше).
+* Якщо для багатьох застосунків → робіть через **тригер**.
+
+---
+
+Хочете, я доповню прикладом **SQL-запиту**, як потім перевіряти при вході в додаток, чи користувач уже "на зміні" (тобто форма йому не повинна показуватися)?

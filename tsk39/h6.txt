@@ -1,0 +1,89 @@
+Добре 🙌 Давайте складу повний **PL/SQL процес Insert** для вашої форми вибору зміни.
+
+---
+
+## 📌 Логіка процесу
+
+1. Якщо користувач вибрав **`SHIFT_NUMBER_ID`** →
+
+   * беремо `TIME_START = SYSDATE`
+   * `TIME_END` підтягуємо з довідника `DEPARTMENT_SHIFT_NUMBER` (для конкретного департаменту та номера зміни).
+2. Якщо користувач **не вибрав `SHIFT_NUMBER_ID`**, але ввів **`TIME_START` та `TIME_END` вручну** →
+
+   * записуємо ці значення напряму.
+3. Дані заносяться в `SHIFT_PERSONAL_LOGGER`.
+4. Після вставки заповнюємо глобальні item-и `P0_SHIFT_SYMBOL, P0_SHIFT_NUMBER, P0_SHIFT_START, P0_SHIFT_END`.
+
+---
+
+## 📌 Приклад процесу (Server-side Code, APEX)
+
+```plsql
+DECLARE
+    v_time_start   DATE := SYSDATE;
+    v_time_end     DATE;
+BEGIN
+    -- Якщо вказано SHIFT_NUMBER_ID → беремо години з довідника
+    IF :P0_SHIFT_NUMBER IS NOT NULL THEN
+        SELECT 
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_START, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND)),
+            TRUNC(SYSDATE, 'DD') + (CAST(TO_CHAR(TIME_END,   'HH24:MI:SS') AS INTERVAL DAY TO SECOND))
+        INTO v_time_start, v_time_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER;
+
+    ELSE
+        -- Якщо користувач вводить час вручну
+        v_time_start := :P0_SHIFT_START;
+        v_time_end   := :P0_SHIFT_END;
+    END IF;
+
+    -- Вставка у таблицю логування
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    ) VALUES (
+        :P0_TAB_NO,
+        :P0_DEPARTMENT_ID,
+        :P0_POSITION_ID,
+        :P0_SHIFT_SYMBOL,
+        :P0_SHIFT_NUMBER,
+        v_time_start,
+        v_time_end,
+        :APP_ID,
+        :APP_USER
+    )
+    RETURNING SHIFT_SYMBOL_ID, SHIFT_NUMBER_ID, TIME_START, TIME_END
+    INTO :P0_SHIFT_SYMBOL, :P0_SHIFT_NUMBER, :P0_SHIFT_START, :P0_SHIFT_END;
+
+END;
+```
+
+---
+
+## 📌 Коментарі
+
+* `RETURNING … INTO …` відразу наповнює глобальні item-и.
+* Якщо треба жорстко контролювати, щоб користувач або вибирав **номер зміни**, або **час вручну**, можна додати перевірку:
+
+```plsql
+IF :P0_SHIFT_NUMBER IS NULL AND (:P0_SHIFT_START IS NULL OR :P0_SHIFT_END IS NULL) THEN
+    RAISE_APPLICATION_ERROR(-20001, 'Виберіть номер зміни або вкажіть час вручну');
+END IF;
+```
+
+---
+
+✅ Тепер користувач один раз заповнить форму → дані збережуться в `SHIFT_PERSONAL_LOGGER` → глобальні item-и оновляться → при наступному вході форма більше не показується, поки не пройде `TIME_END`.
+
+---
+
+Хочете, я ще підготую **SQL перевірку на вході** (в `Before Header` або `Before Page Load`), щоб відразу редиректити користувача на головну, якщо у нього вже є активний запис у `SHIFT_PERSONAL_LOGGER`?

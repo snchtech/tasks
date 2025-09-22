@@ -1,0 +1,89 @@
+Чудово 👍
+У APEX є стандартний механізм для цього – **Dynamic Action → After Dialog Closed**.
+Опишу покроково, як зробити для вашого `P0_SHIFT_INFO`.
+
+---
+
+## 🔹 1. На Global Page створіть Dynamic Action
+
+* **Event**: `Dialog Closed`.
+* **Selection Type**: Item(s).
+* **Item**: `P0_SHIFT_INFO` (або можна просто `Page`).
+
+---
+
+## 🔹 2. Умова виконання (optional)
+
+Щоб відслідковувати саме вашу модальну сторінку (наприклад, з ID = 50):
+
+* **When Condition** → JavaScript Expression:
+
+  ```js
+  this.data.dialogPageId == 50
+  ```
+
+---
+
+## 🔹 3. Додайте Action → Execute PL/SQL Code
+
+Код той самий, що ми писали для формування тексту:
+
+```plsql
+DECLARE
+    v_info VARCHAR2(200);
+BEGIN
+    IF :P0_SHIFT_SYMBOL IS NOT NULL AND :P0_SHIFT_NUMBER IS NOT NULL THEN
+        SELECT 'Зміна ' || ss.SYMBOL_CODE || 
+               ' - №' || sn.SHIFT_NUMBER_ID || 
+               ' (' || TO_CHAR(dsn.TIME_START, 'HH24:MI') || ' - ' || TO_CHAR(dsn.TIME_END, 'HH24:MI') || ')'
+        INTO v_info
+        FROM SHIFT_SYMBOL ss
+        JOIN SHIFT_NUMBER sn ON sn.SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER
+        JOIN DEPARTMENT_SHIFT_NUMBER dsn 
+          ON dsn.SHIFT_NUMBER_ID = sn.SHIFT_NUMBER_ID
+         AND dsn.DEPARTMENT_ID = :P0_DEPARTMENT_ID
+        WHERE ss.SYMBOL_ID = :P0_SHIFT_SYMBOL;
+        
+        :P0_SHIFT_INFO := v_info;
+    ELSE
+        :P0_SHIFT_INFO := 'Зміну не задано';
+    END IF;
+END;
+```
+
+👉 У полі **Items to Return** вкажіть: `P0_SHIFT_INFO`.
+
+---
+
+## 🔹 4. Додайте Action → Refresh
+
+* **Selection Type**: Item(s).
+* **Item**: `P0_SHIFT_INFO`.
+
+---
+
+## 🔹 5. Як це працює
+
+1. Користувач відкрив модальне вікно і вибрав зміну.
+2. При збереженні → модальне закривається.
+3. `Dialog Closed` спрацьовує.
+4. PL/SQL оновлює глобальні item-и.
+5. `P0_SHIFT_INFO` рефрешиться й показує оновлений текст.
+
+---
+
+✅ Результат: після закриття діалогу користувач відразу бачить у глобальному полі `P0_SHIFT_INFO` оновлене значення:
+
+```
+Зміна А – №1 (06:00 - 13:00)
+```
+
+або, якщо він нічого не вибрав →
+
+```
+Зміну не задано
+```
+
+---
+
+Хочете, я ще зроблю варіант з **JavaScript-only refresh** (тобто без повторного PL/SQL-запиту, а з використанням значень, які повернулись із `RETURNING INTO` у ваш процес Insert)?
