@@ -1,0 +1,87 @@
+О, так буде ще правильніше ✅ — замість `Text type = time` використати **Date Picker (Datetime Picker)** з форматом дати й часу.
+
+APEX `Date Picker` у режимі **HTML5 Default** дійсно повертає значення у форматі ISO-8601, наприклад:
+
+```
+2020-04-15T11:02:00.000000Z
+```
+
+👉 Це звичайний текст, але Oracle легко конвертує його у `DATE` через `TO_TIMESTAMP_TZ`.
+
+---
+
+## 🔹 Переписаний блок коду
+
+```plsql
+DECLARE
+    v_shift_start DATE;
+    v_shift_end   DATE;
+BEGIN
+    IF :P1_SHIFT_NUMBER IS NOT NULL THEN
+        -- 🔹 Якщо вибрано номер зміни → беремо час із довідника
+        SELECT TRUNC(SYSDATE) + (TIME_START - TRUNC(TIME_START)),
+               CASE 
+                   WHEN TIME_END < TIME_START 
+                   THEN TRUNC(SYSDATE+1) + (TIME_END - TRUNC(TIME_END))
+                   ELSE TRUNC(SYSDATE)   + (TIME_END - TRUNC(TIME_END))
+               END
+        INTO v_shift_start, v_shift_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :P1_SHIFT_NUMBER;
+
+    ELSE
+        -- 🔹 Якщо користувач вказав час вручну (Date Picker → ISO-8601)
+        v_shift_start := CAST(
+                           TO_TIMESTAMP_TZ(:P1_SHIFT_START, 'YYYY-MM-DD"T"HH24:MI:SS.FF6TZR')
+                           AS DATE
+                         );
+
+        v_shift_end   := CAST(
+                           TO_TIMESTAMP_TZ(:P1_SHIFT_END, 'YYYY-MM-DD"T"HH24:MI:SS.FF6TZR')
+                           AS DATE
+                         );
+    END IF;
+
+    -- приклад вставки у лог
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    ) VALUES (
+        :P0_CUR_USER_TABNO,
+        :P0_CUR_USER_DEPARTMENT,
+        :P0_CUR_USER_POSITION,
+        :P1_SHIFT_SYMBOL,
+        :P1_SHIFT_NUMBER,
+        v_shift_start,
+        v_shift_end,
+        :APP_ID,
+        :APP_USER
+    );
+END;
+```
+
+---
+
+## 🔹 Що змінилось
+
+* Використав `TO_TIMESTAMP_TZ(..., 'YYYY-MM-DD"T"HH24:MI:SS.FF6TZR')` → щоб парсити ISO-8601 з `Z` (UTC).
+* Потім `CAST(... AS DATE)` → перетворює `TIMESTAMP WITH TIME ZONE` у простий `DATE`.
+
+---
+
+✅ Таким чином:
+
+* Якщо вибираєте номер зміни → працює стара логіка з довідником.
+* Якщо вводите час вручну через Date Picker (навіть наступний день) → воно конвертується коректно у `DATE` і зберігається в лог.
+
+---
+
+Хочете, я ще додам у цей блок перевірку, що `v_shift_end > v_shift_start`, інакше показати повідомлення `raise_application_error`?

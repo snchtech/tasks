@@ -1,0 +1,71 @@
+Класне уточнення 👌 — це можна зробити у **Dynamic Action → Dialog Closed** (після того, як користувач закрив модальне вікно вибору зміни).
+
+---
+
+## 🔹 Кроки
+
+### 1. Створюємо Dynamic Action → Event = *Dialog Closed* (на Home Page / Global Page)
+
+* Condition (JS Expression):
+
+  ```js
+  this.data.dialogPageId == 6   // якщо ваша модалка — сторінка 6
+  ```
+
+---
+
+### 2. Перша Action → Execute PL/SQL Code
+
+Витягуємо дані зміни з таблиці (або з session state):
+
+```plsql
+DECLARE
+    v_info VARCHAR2(200);
+BEGIN
+    IF :P0_SHIFT_SYMBOL IS NOT NULL AND :P0_SHIFT_NUMBER IS NOT NULL THEN
+        SELECT 'Зміна ' || ss.SYMBOL_CODE || 
+               ' - №' || sn.SHIFT_NUMBER_ID || 
+               ' (' || TO_CHAR(dsn.TIME_START, 'HH24:MI') || ' - ' || TO_CHAR(dsn.TIME_END, 'HH24:MI') || ')'
+        INTO v_info
+        FROM SHIFT_SYMBOL ss
+        JOIN SHIFT_NUMBER sn ON sn.SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER
+        JOIN DEPARTMENT_SHIFT_NUMBER dsn 
+          ON dsn.SHIFT_NUMBER_ID = sn.SHIFT_NUMBER_ID
+         AND dsn.DEPARTMENT_ID = :P0_DEPARTMENT_ID
+        WHERE ss.SYMBOL_ID = :P0_SHIFT_SYMBOL;
+
+        :P0_SHIFT_INFO := v_info;
+    END IF;
+END;
+```
+
+👉 Items to Return: `P0_SHIFT_INFO`.
+
+---
+
+### 3. Друга Action → Execute JavaScript Code
+
+Прибираємо червону рамку і повідомлення:
+
+```js
+$("#P0_SHIFT_INFO").removeClass("shift-required");
+$("#shift-warning").remove();   // видаляє текстове повідомлення
+```
+
+---
+
+## 🔹 Поведінка
+
+1. Якщо користувач закрив модалку **без вибору** — на Home Page залишається рамка і повідомлення.
+2. Якщо користувач закрив модалку **після вибору зміни**:
+
+   * виконується PL/SQL → оновлює `P0_SHIFT_INFO`;
+   * JS прибирає червону рамку та повідомлення.
+
+---
+
+✅ Результат: все інтерактивно — попередження є, доки користувач не вибере зміну, і зникає одразу після вибору.
+
+---
+
+Хочете, я покажу приклад з використанням **`$s()`** (APEX JavaScript API) для прямої установки нового значення `P0_SHIFT_INFO` без додаткового PL/SQL-запиту?

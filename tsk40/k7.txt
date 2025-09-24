@@ -1,0 +1,65 @@
+Добре 👍, ось готовий фрагмент, який завжди повертає `DATE` у `v_shift_start` та `v_shift_end` — незалежно від того, користувач вибрав **номер зміни** чи ввів час вручну:
+
+```plsql
+DECLARE
+    v_shift_start DATE;
+    v_shift_end   DATE;
+BEGIN
+    IF :P1_SHIFT_NUMBER IS NOT NULL THEN
+        -- 🔹 Якщо вибрано номер зміни → беремо час із довідника
+        SELECT TRUNC(SYSDATE) + (TIME_START - TRUNC(TIME_START)),
+               CASE 
+                   WHEN TIME_END < TIME_START 
+                   THEN TRUNC(SYSDATE+1) + (TIME_END - TRUNC(TIME_END))
+                   ELSE TRUNC(SYSDATE)   + (TIME_END - TRUNC(TIME_END))
+               END
+        INTO v_shift_start, v_shift_end
+        FROM DEPARTMENT_SHIFT_NUMBER
+        WHERE DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+          AND SHIFT_NUMBER_ID = :P1_SHIFT_NUMBER;
+
+    ELSE
+        -- 🔹 Якщо користувач вказав час вручну (формат hh24:mi)
+        v_shift_start := TRUNC(SYSDATE) 
+                         + (TO_DATE(:P1_SHIFT_START, 'HH24:MI') - TRUNC(TO_DATE(:P1_SHIFT_START, 'HH24:MI')));
+
+        v_shift_end   := TRUNC(SYSDATE) 
+                         + (TO_DATE(:P1_SHIFT_END, 'HH24:MI') - TRUNC(TO_DATE(:P1_SHIFT_END, 'HH24:MI')));
+    END IF;
+
+    -- приклад вставки у лог
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    ) VALUES (
+        :P0_CUR_USER_TABNO,
+        :P0_CUR_USER_DEPARTMENT,
+        :P0_CUR_USER_POSITION,
+        :P1_SHIFT_SYMBOL,
+        :P1_SHIFT_NUMBER,
+        v_shift_start,
+        v_shift_end,
+        :APP_ID,
+        :APP_USER
+    );
+END;
+```
+
+---
+
+## 🔹 Що тут важливо
+
+1. **Якщо вибрано номер зміни** → часи беруться з довідника `DEPARTMENT_SHIFT_NUMBER`, і враховується кейс, коли зміна переходить через північ.
+2. **Якщо час введено вручну** → часи конвертуються у формат `DATE` поточного дня.
+3. На виході завжди маємо готові `DATE` → їх можна прямо вставляти у `SHIFT_PERSONAL_LOGGER`.
+
+---
+
+Хочете, я ще підкажу, як перевіряти у цьому коді, що `P1_SHIFT_START < P1_SHIFT_END`, інакше показувати користувачу помилку (наприклад, коли він випадково вибрав "23:00 – 08:00")?

@@ -1,0 +1,59 @@
+Ага, тут проблема у цій частині:
+
+```sql
+CAST(TO_CHAR(TIME_START, 'HH24:MI:SS') AS INTERVAL DAY TO SECOND)
+```
+
+👉 `TO_CHAR` повертає текст, а `CAST` в Oracle не вміє напряму кастити строку у `INTERVAL`.
+Через це й отримуєте помилку **"not a valid interval"**.
+
+---
+
+## 🔹 Правильний варіант
+
+У вас у таблиці `DEPARTMENT_SHIFT_NUMBER.TIME_START` і `TIME_END` (як я зрозумів) зберігається тільки **час** (тип `DATE` чи `TIMESTAMP`, де дата може бути 01.01.1900).
+Щоб отримати "сьогоднішню дату + час", треба зробити так:
+
+```sql
+SELECT TRUNC(SYSDATE) + (TIME_START - TRUNC(TIME_START)),
+       TRUNC(SYSDATE) + (TIME_END   - TRUNC(TIME_END))
+INTO   v_shift_start, v_shift_end
+FROM   DEPARTMENT_SHIFT_NUMBER
+WHERE  DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+  AND  SHIFT_NUMBER_ID = :P1_SHIFT_NUMBER;
+```
+
+---
+
+## 🔹 Чому це працює
+
+* `TIME_START - TRUNC(TIME_START)` → залишає тільки часову частину (наприклад, `06:00:00`).
+* `TRUNC(SYSDATE)` → сьогоднішня дата о 00:00:00.
+* Додаючи одне до іншого → отримуємо "сьогодні о 06:00".
+
+---
+
+## 🔹 Якщо `TIME_END` може переходити через північ
+
+Наприклад, зміна 23:00 – 07:00. Тоді треба додати перевірку:
+
+```sql
+SELECT TRUNC(SYSDATE) + (TIME_START - TRUNC(TIME_START)),
+       CASE 
+           WHEN TIME_END < TIME_START 
+           THEN TRUNC(SYSDATE+1) + (TIME_END - TRUNC(TIME_END))
+           ELSE TRUNC(SYSDATE)   + (TIME_END - TRUNC(TIME_END))
+       END
+INTO   v_shift_start, v_shift_end
+FROM   DEPARTMENT_SHIFT_NUMBER
+WHERE  DEPARTMENT_ID   = :P0_DEPARTMENT_ID
+  AND  SHIFT_NUMBER_ID = :P1_SHIFT_NUMBER;
+```
+
+---
+
+✅ Таким чином ви отримаєте завжди правильні `v_shift_start` і `v_shift_end` для поточної доби.
+
+---
+
+Хочете, я одразу дам готову функцію `GET_SHIFT_INTERVAL(p_department_id, p_shift_number_id)` яка повертатиме `SHIFT_START` і `SHIFT_END` — щоб не дублювати цей код у кількох місцях?
