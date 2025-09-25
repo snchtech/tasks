@@ -1,0 +1,57 @@
+О, тепер картина повна 👌. У вас зараз умова працює тільки для сценарію `SHIFT_SYMBOL + SHIFT_NUMBER`.
+Треба додати ще один блок для сценарію `SHIFT_SYMBOL + TIME_START/TIME_END`.
+
+---
+
+### 🔹 Оновлений PL/SQL блок
+
+```plsql
+DECLARE
+    v_info VARCHAR2(200);
+BEGIN
+    -- Сценарій 1: вибрано символ + номер зміни
+    IF :P0_SHIFT_SYMBOL IS NOT NULL AND :P0_SHIFT_NUMBER IS NOT NULL THEN
+        SELECT 'Зміна ' || ss.SYMBOL_CODE || 
+               ' - №' || sn.SHIFT_NUMBER_ID || 
+               ' (' || TO_CHAR(dsn.TIME_START, 'HH24:MI') || ' - ' || TO_CHAR(dsn.TIME_END, 'HH24:MI') || ')'
+        INTO v_info
+        FROM SHIFT_SYMBOL ss
+        JOIN SHIFT_NUMBER sn ON sn.SHIFT_NUMBER_ID = :P0_SHIFT_NUMBER
+        JOIN DEPARTMENT_SHIFT_NUMBER dsn 
+          ON dsn.SHIFT_NUMBER_ID = sn.SHIFT_NUMBER_ID
+         AND dsn.DEPARTMENT_ID = :P0_DEPARTMENT_ID
+        WHERE ss.SYMBOL_ID = :P0_SHIFT_SYMBOL;
+
+        :P0_SHIFT_INFO := v_info;
+
+    -- Сценарій 2: вибрано символ + власноручний час
+    ELSIF :P0_SHIFT_SYMBOL IS NOT NULL 
+       AND :P0_SHIFT_START IS NOT NULL 
+       AND :P0_SHIFT_END   IS NOT NULL THEN
+        SELECT 'Зміна ' || ss.SYMBOL_CODE || 
+               ' ( ' || TO_CHAR(:P0_SHIFT_START, 'DD.MM.YYYY HH24:MI') ||
+               ' - '  || TO_CHAR(:P0_SHIFT_END,   'DD.MM.YYYY HH24:MI') || ' )'
+        INTO v_info
+        FROM SHIFT_SYMBOL ss
+        WHERE ss.SYMBOL_ID = :P0_SHIFT_SYMBOL;
+
+        :P0_SHIFT_INFO := v_info;
+
+    -- Якщо нічого не вибрано
+    ELSE
+        :P0_SHIFT_INFO := 'Зміну не задано';
+    END IF;
+END;
+```
+
+---
+
+### 🔹 Як працює тепер
+
+* Якщо задано `SHIFT_SYMBOL + SHIFT_NUMBER` → показує стандартний формат з номером та годинами з `DEPARTMENT_SHIFT_NUMBER`.
+* Якщо задано `SHIFT_SYMBOL + TIME_START/TIME_END` → показує формат з введеними датами.
+* Якщо нічого не вибрано → `"Зміну не задано"`.
+
+---
+
+Хочете, я ще зроблю так, щоб у другому сценарії (`TIME_START/TIME_END`) виводився тільки час (без дати), якщо дати однакові? Тоді буде більш «коротко» виглядати.
