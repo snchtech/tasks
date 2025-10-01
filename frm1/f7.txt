@@ -1,0 +1,211 @@
+Чудово 👍
+Давай я складу для тебе **повний концепт сторінки APEX** (ліва частина — форма, права — звіт з групами і тоталом).
+
+---
+
+# 🔹 1. **Форма (ліва частина, Sidebar region)**
+
+### Поля:
+
+1. **Company (Popup LOV з групами)**
+   SQL для LOV (з групами по `COMPANY_TYPE`):
+
+   ```sql
+   SELECT c.name              AS display_value,
+          c.id                AS return_value,
+          ct.name             AS group_label,
+          ct.id               AS group_order
+   FROM   company c
+   JOIN   company_type ct ON ct.id = c.company_type_id
+   WHERE  c.date_end IS NULL
+     AND  ct.date_end IS NULL
+   ORDER BY ct.id, c.name
+   ```
+
+   👉 `group_label` = назва групи (Company_type.name).
+   👉 порядок груп контролюється `ORDER BY ct.id`.
+
+---
+
+2. **Unit (Select LOV)**
+
+   ```sql
+   SELECT u.name AS display_value,
+          u.id   AS return_value
+   FROM   units u
+   WHERE  u.date_end IS NULL
+   ORDER BY u.name
+   ```
+
+---
+
+3. **Work type (Popup LOV, фільтр по департаменту)**
+   (де `:P0_DEPARTMENT_ID` = поточний департамент зберігається у глобальному item)
+
+   ```sql
+   SELECT wt.name AS display_value,
+          wt.id   AS return_value
+   FROM   work_type wt
+   WHERE  wt.department_id = :P0_DEPARTMENT_ID
+     AND  wt.date_end IS NULL
+   ORDER BY wt.name
+   ```
+
+---
+
+4. **Work type text (Textarea)**
+   — для ручного вводу.
+
+   👉 Ці два поля (`WORK_TYPE_ID`, `WORK_TYPE_TEXT`) краще винести в один регіон з CSS-оформленням:
+
+   ```css
+   .work-type-block {
+     background: #f4f9f4;      /* світлий зелено-сірий фон */
+     border: 1px solid #bcd9bc;
+     border-radius: 8px;
+     padding: 10px;
+     margin-top: 8px;
+   }
+   ```
+
+---
+
+5. **People count (Number item)**
+   Validation: `>=1`.
+
+---
+
+6. **Button "Додати"**
+   Процес PL/SQL для запису в `EXTERNAL_PERSONAL`:
+
+   ```plsql
+   BEGIN
+       INSERT INTO external_personal (
+           department_id,
+           unit_id,
+           work_type_id,
+           work_type_text,
+           people_count,
+           company_id,
+           date_create,
+           creator,
+           date_end
+       ) VALUES (
+           :P0_DEPARTMENT_ID,
+           :P1_UNIT_ID,
+           :P1_WORK_TYPE_ID,
+           :P1_WORK_TYPE_TEXT,
+           :P1_PEOPLE_COUNT,
+           :P1_COMPANY_ID,
+           SYSDATE,
+           :APP_USER,
+           NULL
+       );
+   END;
+   ```
+
+   👉 Після цього — **Dynamic Action → Refresh** для IR (праворуч).
+
+---
+
+# 🔹 2. **IR Report (права частина)**
+
+### SQL для IR:
+
+```sql
+SELECT ct.name        AS company_type_name,
+       c.name         AS company_name,
+       NVL(wt.name, ep.work_type_text) AS work_type_name,
+       u.name         AS unit_name,
+       ep.people_count,
+       ep.date_create,
+       ep.creator
+FROM   external_personal ep
+JOIN   company c       ON c.id = ep.company_id
+JOIN   company_type ct ON ct.id = c.company_type_id
+LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+LEFT JOIN units u      ON u.id = ep.unit_id
+WHERE  ep.date_end IS NULL
+ORDER BY ct.id, c.name;
+```
+
+---
+
+### Групування в IR
+
+* У властивостях Interactive Report:
+
+  * **Group By** = `COMPANY_TYPE_NAME`.
+  * Заголовки груп = `COMPANY_TYPE.NAME`.
+
+---
+
+### Підсумковий рядок "Total" (зелений)
+
+APEX дозволяє **Aggregate → SUM** для колонки `PEOPLE_COUNT`.
+Але щоб було **окремим рядком `Total`**, можна зробити UNION:
+
+```sql
+SELECT ct.name        AS company_type_name,
+       c.name         AS company_name,
+       NVL(wt.name, ep.work_type_text) AS work_type_name,
+       u.name         AS unit_name,
+       ep.people_count,
+       ep.date_create,
+       ep.creator,
+       0 AS is_total
+FROM   external_personal ep
+JOIN   company c       ON c.id = ep.company_id
+JOIN   company_type ct ON ct.id = c.company_type_id
+LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+LEFT JOIN units u      ON u.id = ep.unit_id
+WHERE  ep.date_end IS NULL
+
+UNION ALL
+
+SELECT ct.name        AS company_type_name,
+       'Total'        AS company_name,
+       NULL           AS work_type_name,
+       NULL           AS unit_name,
+       SUM(ep.people_count) AS people_count,
+       NULL           AS date_create,
+       NULL           AS creator,
+       1 AS is_total
+FROM   external_personal ep
+JOIN   company c       ON c.id = ep.company_id
+JOIN   company_type ct ON ct.id = c.company_type_id
+WHERE  ep.date_end IS NULL
+GROUP BY ct.name;
+```
+
+---
+
+### Відображення "Total" зеленим
+
+* У IR додати **Highlight**:
+
+  * Condition: `IS_TOTAL = 1`.
+  * Background color: `#d4edda` (зелений).
+
+---
+
+# 🔹 3. Макет сторінки
+
+```
+--------------------------------------------------------
+| Sidebar (зліва)             |  IR Report (справа)   |
+|------------------------------|-----------------------|
+| Company (LOV групами)        |  Group: Company_type  |
+| Unit (select)                |   - Company name      |
+|------------------------------|   - Work type name    |
+| [ WorkType select + text ]   |   - People count      |
+| (фон сірий)                  |   - Date create       |
+|------------------------------|   - Creator           |
+| People_count (number)        |                       |
+| [Button Додати]              |                       |
+--------------------------------------------------------
+```
+
+---
+
+Хочеш, я складу готовий **SQL View** для звіту (з об’єднанням Total), щоб тобі було зручно одразу підключити до IR?

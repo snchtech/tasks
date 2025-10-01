@@ -1,0 +1,101 @@
+Супер 👍
+Тоді підготуємо готове **SQL View** для твого звіту. Це дозволить в APEX підключити IR напряму до цього View, і все буде працювати з групами та рядком **Total**.
+
+---
+
+## 🔹 SQL View
+
+```sql
+CREATE OR REPLACE VIEW v_external_personal_report AS
+WITH base_data AS (
+    SELECT ct.id          AS company_type_id,
+           ct.name        AS company_type_name,
+           c.id           AS company_id,
+           c.name         AS company_name,
+           NVL(wt.name, ep.work_type_text) AS work_type_name,
+           u.id           AS unit_id,
+           u.name         AS unit_name,
+           ep.people_count,
+           ep.date_create,
+           ep.creator,
+           0 AS is_total
+    FROM   external_personal ep
+    JOIN   company c       ON c.id = ep.company_id
+    JOIN   company_type ct ON ct.id = c.company_type_id
+    LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+    LEFT JOIN units u      ON u.id = ep.unit_id
+    WHERE  ep.date_end IS NULL
+),
+totals AS (
+    SELECT ct.id          AS company_type_id,
+           ct.name        AS company_type_name,
+           NULL           AS company_id,
+           'Total'        AS company_name,
+           NULL           AS work_type_name,
+           NULL           AS unit_id,
+           NULL           AS unit_name,
+           SUM(ep.people_count) AS people_count,
+           NULL           AS date_create,
+           NULL           AS creator,
+           1 AS is_total
+    FROM   external_personal ep
+    JOIN   company c       ON c.id = ep.company_id
+    JOIN   company_type ct ON ct.id = c.company_type_id
+    WHERE  ep.date_end IS NULL
+    GROUP BY ct.id, ct.name
+)
+SELECT * FROM base_data
+UNION ALL
+SELECT * FROM totals;
+```
+
+---
+
+## 🔹 Що робить цей View
+
+* **`base_data`** → усі звичайні записи.
+* **`totals`** → додає один рядок `Total` для кожної групи `COMPANY_TYPE`.
+* Поле `IS_TOTAL`:
+
+  * `0` → звичайний рядок;
+  * `1` → підсумковий рядок (для highlight у APEX).
+
+---
+
+## 🔹 Підключення в APEX
+
+1. Створюєш **Interactive Report** на основі `v_external_personal_report`.
+2. У властивостях → **Group By** → `COMPANY_TYPE_NAME`.
+3. Додаєш **Highlight**:
+
+   * Condition: `IS_TOTAL = 1`
+   * Background: зелений (`#d4edda`).
+4. Ховаєш колонку `IS_TOTAL` від користувачів.
+
+---
+
+## 🔹 Приклад результату
+
+```
+COMPANY_TYPE_NAME: Державні компанії
+------------------------------------------------------------
+Company name     | Work type       | Unit     | People | ...
+------------------------------------------------------------
+Укрзалізниця     | Монтаж          | Київ     |   12   | ...
+Укрпошта         | Ремонт          | Львів    |    8   | ...
+Total            |                 |          |   20   |
+
+COMPANY_TYPE_NAME: Приватні компанії
+------------------------------------------------------------
+Company name     | Work type       | Unit     | People | ...
+------------------------------------------------------------
+SoftServe        | IT-підтримка    | Львів    |   15   | ...
+Нова пошта       | Логістика       | Київ     |   10   | ...
+Total            |                 |          |   25   |
+```
+
+---
+
+📌 Таким чином, ти одразу отримуєш згрупований звіт з підсумками і зеленим рядком **Total**.
+
+Хочеш, я ще напишу CSS для IR, щоб рядок `Total` був більш виділений (жирний шрифт + зелений фон)?

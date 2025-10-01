@@ -1,0 +1,159 @@
+Добре 👍
+Давай по кроках спроєктуємо **форму для заповнення таблиці `EXTERNAL_PERSONAL`** в Oracle APEX, враховуючи твої умови.
+
+---
+
+## 🔹 1. Поплов list із таблиці COMPANY (групування по COMPANY_TYPE)
+
+Тут найзручніше використати **LOV з групами**.
+У APEX це робиться SQL-запитом із `COMPANY_TYPE.NAME` як груповим заголовком.
+
+```sql
+SELECT c.name AS display_value,
+       c.id   AS return_value,
+       ct.name AS group_label,
+       ct.id   AS group_order
+FROM   company c
+JOIN   company_type ct ON ct.id = c.company_type_id
+WHERE  c.date_end IS NULL
+ORDER BY ct.id, c.name
+```
+
+👉 Пояснення:
+
+* `group_label` → в APEX LOV показує **заголовки груп**.
+* `group_order` → можна додати у `ORDER BY`, щоб контролювати порядок груп.
+* `c.name` → назва компанії у випадаючому списку.
+
+У властивостях LOV:
+
+* **Display Extra Values** = No
+* **Display Null Value** = Yes (для "— виберіть компанію —").
+* **Display Group** = Yes (тоді заголовки `COMPANY_TYPE` будуть видимі).
+
+---
+
+## 🔹 2. Select item UNIT (таблиця `UNITS`)
+
+Простий LOV:
+
+```sql
+SELECT name AS display_value,
+       id   AS return_value
+FROM   units
+WHERE  date_end IS NULL
+ORDER BY name
+```
+
+---
+
+## 🔹 3. Poplov list WORK_TYPE (фільтр по department_id)
+
+Тут треба використати **сесійний контекст** або item зберігання поточного `DEPARTMENT_ID`.
+Припустимо, що це `:P0_DEPARTMENT_ID`.
+
+```sql
+SELECT name AS display_value,
+       id   AS return_value
+FROM   work_type
+WHERE  department_id = :P0_DEPARTMENT_ID
+  AND  date_end IS NULL
+ORDER BY name
+```
+
+---
+
+## 🔹 4. Textarea + Select у спільному регіоні (фон для виділення)
+
+У формі створюємо регіон **"Work Type (варіант)"**.
+Всередині:
+
+* `P1_WORK_TYPE_ID` (select LOV з таблиці `WORK_TYPE`).
+* `P1_WORK_TYPE_TEXT` (textarea).
+
+👉 Для стилізації:
+У властивостях регіону → **CSS Classes** = `work-type-block`.
+
+Додати CSS у сторінку:
+
+```css
+.work-type-block {
+  background-color: #f5f5f5;   /* світло-сірий фон */
+  border: 1px solid #ccc;
+  padding: 10px;
+  border-radius: 8px;
+  margin-bottom: 15px;
+}
+```
+
+---
+
+## 🔹 5. Number item PEOPLE_COUNT
+
+Item: `P1_PEOPLE_COUNT`
+Validation: must be `>= 1`.
+
+---
+
+## 🔹 6. Кнопка "Додати в звіт"
+
+Кнопка: **"Додати"** (`CREATE`).
+Process: **PL/SQL insert**:
+
+```plsql
+INSERT INTO external_personal (
+    department_id,
+    unit_id,
+    work_type_id,
+    work_type_text,
+    people_count,
+    company_id,
+    date_create,
+    creator,
+    date_end
+)
+VALUES (
+    :P0_DEPARTMENT_ID,
+    :P1_UNIT_ID,
+    :P1_WORK_TYPE_ID,
+    :P1_WORK_TYPE_TEXT,
+    :P1_PEOPLE_COUNT,
+    :P1_COMPANY_ID,
+    SYSDATE,
+    :APP_USER,
+    NULL
+);
+```
+
+👉 Після цього:
+
+* **Refresh IR Report** (right pane).
+* Очистити поля (`Clear Items`).
+
+---
+
+## 🔹 7. Макет сторінки
+
+```
+--------------------------------------------------------
+| Sidebar (зліва)             |  IR Report (справа)   |
+|------------------------------|-----------------------|
+| [Company poplov list]        |                       |
+| [Unit select]                |                       |
+|------------------------------|                       |
+|   [ WorkType select ]        |                       |
+|   [ WorkType textarea ]      |                       |
+|   (фон-сіра панель)          |                       |
+|------------------------------|                       |
+| [Number count_people]        |                       |
+| [Button Додати]              |                       |
+--------------------------------------------------------
+```
+
+---
+
+📌 Таким чином у тебе буде **форма зліва** (Sidebar region, Fixed to Left), а **Interactive Report справа**.
+
+---
+
+Хочеш, я одразу підготую SQL для **LOV-запитів з групами (company_type)** і приклад **APEX region layout (Sidebar + Report)** у готовому вигляді для експорту?
