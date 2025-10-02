@@ -1,0 +1,110 @@
+To achieve this behavior in Oracle APEX — enabling the **Save** button only when a valid combination of inputs is entered on a **modal page** — you can use **dynamic actions** and some simple logic. Here’s a step-by-step guide to implement this.
+
+---
+
+### ✅ **Goal Recap**
+
+You want the **Save** button to be:
+
+* **Disabled by default**, and
+* **Enabled only when** either of the following input combinations are entered:
+
+  * `Symbol` **AND** `Shift Number`, **OR**
+  * `Symbol` **AND** (`Shift Start` **AND** `Shift End`)
+
+---
+
+## 🛠 Step-by-Step Solution
+
+### 1. **Identify the Item Names**
+
+Let’s assume your item names are:
+
+| Label        | Item Name (example) |
+| ------------ | ------------------- |
+| Symbol       | `P10_SYMBOL`        |
+| Shift Number | `P10_SHIFT_NUMBER`  |
+| Shift Start  | `P10_SHIFT_START`   |
+| Shift End    | `P10_SHIFT_END`     |
+| Save Button  | `P10_SAVE`          |
+
+### 2. **Disable the Save Button by Default**
+
+1. Go to the Save button (`P10_SAVE`) in your page designer.
+2. Under **"Behavior"**, set:
+
+   * **Disabled** = **Yes**
+
+This ensures the button is disabled when the modal opens.
+
+---
+
+### 3. **Create a Dynamic Action to Enable the Save Button**
+
+Create a dynamic action on any of the relevant items to check the logic.
+
+#### 🔸 A. Dynamic Action Settings
+
+* **Name**: `Check Save Button Enable`
+* **Event**: `Change`
+* **Selection Type**: `Item(s)`
+* **Items**: `P10_SYMBOL`, `P10_SHIFT_NUMBER`, `P10_SHIFT_START`, `P10_SHIFT_END`
+
+> (You can also choose `Event = Key Release` if you want more instant response while typing)
+
+#### 🔸 B. True Action: JavaScript Code
+
+1. Add a **True Action** of type **Execute JavaScript Code**.
+2. Code to use:
+
+```javascript
+var symbol = $v('P10_SYMBOL').trim();
+var shiftNumber = $v('P10_SHIFT_NUMBER').trim();
+var shiftStart = $v('P10_SHIFT_START').trim();
+var shiftEnd = $v('P10_SHIFT_END').trim();
+
+var enableSave = false;
+
+// Condition 1: Symbol AND Shift Number
+if (symbol && shiftNumber) {
+    enableSave = true;
+}
+
+// Condition 2: Symbol AND Shift Start AND Shift End
+if (symbol && shiftStart && shiftEnd) {
+    enableSave = true;
+}
+
+apex.item('P10_SAVE').setDisabled(!enableSave);
+```
+
+This script checks the two conditions and enables the save button accordingly.
+
+---
+
+### ✅ **Alternative: Use PL/SQL in Dynamic Action (Not Recommended Here)**
+
+You could also use a PL/SQL function in a True Action, but it's not needed here because JavaScript is immediate and works well for front-end validations like this.
+
+---
+
+### 🔁 Bonus: Trigger the Check on Page Load
+
+To cover cases where values are pre-filled (like defaults or session state), create **another dynamic action**:
+
+* **Event**: `Page Load`
+* **True Action**: Same JavaScript as above.
+
+---
+
+## ✅ Result
+
+Now, your **Save** button will:
+
+* Be disabled when modal opens,
+* Automatically enable when user inputs either:
+
+  * `Symbol + Shift Number`, or
+  * `Symbol + Shift Start + Shift End`
+
+Let me know if your item names differ or if you want this to work using conditions in PL/SQL instead.
