@@ -1,0 +1,113 @@
+Добре 👍, давайте зробимо це акуратно й універсально:
+
+---
+
+## 🔹 Логіка сторінки 10 (форма зміни)
+
+1. Маємо **Item**: `P10_SHIFT_LOGGER_ID`.
+
+   * Якщо він `NULL` → форма в режимі **створення** (Insert).
+   * Якщо не `NULL` → форма в режимі **редагування** (Update).
+
+2. На сторінці дві кнопки:
+
+   * `CREATE_BTN` – видима тільки якщо `P10_SHIFT_LOGGER_ID IS NULL`.
+   * `UPDATE_BTN` – видима тільки якщо `P10_SHIFT_LOGGER_ID IS NOT NULL`.
+
+3. Два окремих **Process** (після Submit):
+
+   * **Process Create** (Insert).
+   * **Process Update** (Update by ID).
+
+---
+
+## 🔹 1. Умовна видимість кнопок
+
+Для `CREATE_BTN` → Server-side condition:
+
+```plsql
+:P10_SHIFT_LOGGER_ID IS NULL
+```
+
+Для `UPDATE_BTN` → Server-side condition:
+
+```plsql
+:P10_SHIFT_LOGGER_ID IS NOT NULL
+```
+
+---
+
+## 🔹 2. Процес створення (Insert)
+
+```plsql
+DECLARE
+    v_new_id SHIFT_PERSONAL_LOGGER.ID%TYPE;
+BEGIN
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    ) VALUES (
+        :P0_CUR_USER_TABNO,
+        :P0_CUR_USER_DEPARTMENT,
+        :P0_CUR_USER_POSITION,
+        :P10_SHIFT_SYMBOL,
+        :P10_SHIFT_NUMBER,
+        :P10_SHIFT_START,
+        :P10_SHIFT_END,
+        :APP_ID,
+        :APP_USER
+    )
+    RETURNING ID INTO v_new_id;
+
+    :P10_SHIFT_LOGGER_ID := v_new_id;
+END;
+```
+
+---
+
+## 🔹 3. Процес оновлення (Update)
+
+```plsql
+BEGIN
+    UPDATE SHIFT_PERSONAL_LOGGER
+       SET SHIFT_SYMBOL_ID = :P10_SHIFT_SYMBOL,
+           SHIFT_NUMBER_ID = :P10_SHIFT_NUMBER,
+           TIME_START      = :P10_SHIFT_START,
+           TIME_END        = :P10_SHIFT_END,
+           UPDATED_BY      = :APP_USER,
+           UPDATED_AT      = SYSDATE
+     WHERE ID = :P10_SHIFT_LOGGER_ID;
+     
+    -- якщо запис не знайдено, можна підняти помилку
+    IF SQL%ROWCOUNT = 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Запис для оновлення не знайдено.');
+    END IF;
+END;
+```
+
+---
+
+## 🔹 4. Куди повертатися після збереження
+
+Після успішного Insert/Update можна:
+
+* **Закрити модальне вікно** і
+* **оновити Global Items** (`P0_SHIFT_SYMBOL`, `P0_SHIFT_NUMBER`, `P0_SHIFT_START`, `P0_SHIFT_END`, `P0_SHIFT_LOGGER_ID`) через DA → Set Value.
+
+---
+
+Таким чином:
+
+* При відкритті сторінки без `ID` → показується кнопка **Створити**, виконується Insert.
+* При відкритті сторінки з `ID` → показується кнопка **Оновити**, виконується Update по цьому ID.
+
+---
+
+Хочете, я підготую для вас ще **Dynamic Action на Close Dialog**, який після створення/оновлення буде одразу підставляти вибрані значення в глобальні item `P0_SHIFT_*`?

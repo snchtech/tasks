@@ -1,0 +1,109 @@
+О, це дуже слушна думка 👍
+Ви хочете завести ще один **службовий item `P0_SHIFT_LOGGER_ID`**, який зберігатиме первинний ключ (`ID`) з таблиці `SHIFT_PERSONAL_LOGGER`. Тоді:
+
+* при створенні запису → відразу зберігаєте `ID` в item;
+* при завантаженні сторінки → підтягуєте `ID` разом з рештою даних;
+* при кліку на `P0_SHIFT_INFO` → відкриваєте форму в режимі **update** (а не insert), передаючи цей `ID`.
+
+---
+
+### 🔹 Як зробити по кроках
+
+#### 1. Додаємо глобальний item
+
+На **Global Page (0)** створіть прихований item:
+
+* `P0_SHIFT_LOGGER_ID` (Hidden, Protected).
+
+---
+
+#### 2. При створенні запису в логгер
+
+У процесі вставки (`INSERT INTO SHIFT_PERSONAL_LOGGER`) використовуйте `RETURNING INTO`:
+
+```plsql
+DECLARE
+    v_new_id SHIFT_PERSONAL_LOGGER.ID%TYPE;
+BEGIN
+    INSERT INTO SHIFT_PERSONAL_LOGGER (
+        TAB_NO,
+        DEPARTMENT_ID,
+        POSITION_ID,
+        SHIFT_SYMBOL_ID,
+        SHIFT_NUMBER_ID,
+        TIME_START,
+        TIME_END,
+        SOURCE_APP,
+        CREATED_BY
+    )
+    VALUES (
+        :P0_CUR_USER_TABNO,
+        :P0_CUR_USER_DEPARTMENT,
+        :P0_CUR_USER_POSITION,
+        :P1_SHIFT_SYMBOL,
+        :P1_SHIFT_NUMBER,
+        :P1_SHIFT_START,
+        :P1_SHIFT_END,
+        :APP_ID,
+        :APP_USER
+    )
+    RETURNING ID INTO v_new_id;
+
+    -- зберігаємо у глобальний item
+    :P0_SHIFT_LOGGER_ID := v_new_id;
+END;
+```
+
+---
+
+#### 3. При завантаженні сесії (Page Load Global)
+
+У коді, де ви вибираєте активну зміну для користувача, допишіть:
+
+```plsql
+SELECT l.ID,
+       l.SHIFT_SYMBOL_ID,
+       l.SHIFT_NUMBER_ID,
+       l.TIME_START,
+       l.TIME_END
+INTO   :P0_SHIFT_LOGGER_ID,
+       :P0_SHIFT_SYMBOL,
+       :P0_SHIFT_NUMBER,
+       :P0_SHIFT_START,
+       :P0_SHIFT_END
+FROM SHIFT_PERSONAL_LOGGER l
+WHERE l.TAB_NO = :APP_USER_TABNO
+  AND l.IS_ACTIVE = 'Y'
+  AND SYSDATE BETWEEN l.TIME_START AND l.TIME_END
+ORDER BY l.TIME_START DESC
+FETCH FIRST 1 ROWS ONLY;
+```
+
+---
+
+#### 4. При кліку на `P0_SHIFT_INFO`
+
+* Додаєте **DA → Click** на `P0_SHIFT_INFO`.
+* True Action: **Redirect to Page in Modal Dialog**.
+* Передаєте параметр:
+
+  * `P10_SHIFT_LOGGER_ID = &P0_SHIFT_LOGGER_ID.`
+
+---
+
+#### 5. На сторінці 10 (форма вибору/редагування зміни)
+
+* Якщо `P10_SHIFT_LOGGER_ID` **переданий** → робите **Automatic Row Fetch (DML)** для таблиці `SHIFT_PERSONAL_LOGGER`.
+* Якщо порожній → форма відкривається у режимі створення нового запису.
+
+---
+
+### 🔹 Переваги цього підходу
+
+* Весь час працюєте з реальним ID, не треба шукати по TAB_NO і датах.
+* Оновлення запису (наприклад, якщо користувач хоче виправити час) робиться напряму через PK.
+* Спрощується логіка: `INSERT` при пустому ID, `UPDATE` при існуючому ID.
+
+---
+
+Хочете, я зразу підготую шаблон **DML процесів** для сторінки 10, щоб можна було без ручного PL/SQL робити `INSERT/UPDATE` в `SHIFT_PERSONAL_LOGGER`?
