@@ -1,0 +1,182 @@
+Чудово 👌
+Ти описуєш **аналітичну сторінку звітів**, яка дозволить гнучко фільтрувати дані за датою й підрозділами, а перший звіт — показуватиме агреговану інформацію по компаніях, згруповану за типами компаній.
+
+---
+
+## 🔹 Концепт сторінки звітів (Reports Page)
+
+### **Елементи управління (фільтри):**
+
+1. **Date picker:**
+
+   * Item: `P_REPORT_DATE`
+   * Default value: `SYSDATE`
+   * Використовується у фільтрації `external_personal.date_create`.
+
+2. **Checkbox Group (Departments):**
+
+   * Item: `P_REPORT_DEPARTMENTS`
+   * LOV SQL (показує лише ті департаменти, які мають записи на вибрану дату):
+
+     ```sql
+     SELECT DISTINCT d.name AS display_value,
+                     d.id   AS return_value
+     FROM   external_personal ep
+     JOIN   departments d ON d.id = ep.department_id
+     WHERE  TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+       AND  ep.date_end IS NULL
+     ORDER BY d.name
+     ```
+   * **Default type:** All selected by default.
+     (У властивостях item → Default → SQL Query → `SELECT id FROM departments WHERE ...`).
+   * **Dynamic Action:**
+     On Change → Refresh all 3 reports.
+
+---
+
+## 🔹 Перший звіт: "Кількість персоналу по виконавцях"
+
+### **SQL для Interactive Report або Classic Report:**
+
+```sql
+SELECT 
+    ct.name AS company_type_name,      -- Групування за типом компанії
+    c.name  AS company_name,           -- Назва виконавця (компанії)
+    SUM(ep.people_count) AS total_people
+FROM 
+    external_personal ep
+JOIN 
+    company c ON c.id = ep.company_id
+JOIN 
+    company_type ct ON ct.id = c.company_type_id
+WHERE 
+    TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+    AND ep.department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+    )
+    AND ep.date_end IS NULL
+GROUP BY 
+    ct.name, c.name
+ORDER BY 
+    ct.name, c.name;
+```
+
+---
+
+### **Опис логіки:**
+
+* Використовується `:P_REPORT_DATE` → дата, за яку показуємо інформацію.
+* Checkbox group `:P_REPORT_DEPARTMENTS` → список департаментів, вибраних користувачем.
+
+  * `apex_string.split` розбиває значення `1:2:3` у список для фільтрації.
+* Дані групуються двома рівнями:
+
+  1. `COMPANY_TYPE_NAME` → рівень групи у звіті.
+  2. `COMPANY_NAME` → рівень виконавця (компанії).
+
+---
+
+### **Результат у звіті (приклад):**
+
+```
+COMPANY_TYPE: Державні компанії
+---------------------------------------
+Виконавець         | К-сть персоналу
+---------------------------------------
+Укрзалізниця       |  34
+Укрпошта           |  22
+---------------------------------------
+Total              |  56
+
+COMPANY_TYPE: Приватні компанії
+---------------------------------------
+SoftServe          |  15
+Нова пошта         |  12
+---------------------------------------
+Total              |  27
+```
+
+---
+
+## 🔹 Реалізація у APEX
+
+### **1️⃣ Region: “Фільтри” (нагорі сторінки)**
+
+* Додай:
+
+  * `P_REPORT_DATE` (Date Picker)
+  * `P_REPORT_DEPARTMENTS` (Checkbox Group)
+* Dynamic Action:
+
+  * On Change → Refresh regions:
+
+    * Report_1
+    * Report_2
+    * Report_3
+
+---
+
+### **2️⃣ Region: “Звіт 1 — Виконавці” (Interactive Report / Classic Report)**
+
+* Source Type: SQL Query (вище).
+* Group by: `COMPANY_TYPE_NAME`.
+* Highlight або форматування Total — за потреби через `ROLLUP` або окремий рядок.
+
+---
+
+### **3️⃣ Оформлення**
+
+#### Приклад для `ROLLUP`, якщо хочеш додати “Total” у самому SQL:
+
+```sql
+SELECT 
+    ct.name AS company_type_name,
+    CASE WHEN GROUPING(c.name) = 1 THEN 'Total' ELSE c.name END AS company_name,
+    SUM(ep.people_count) AS total_people
+FROM 
+    external_personal ep
+JOIN 
+    company c ON c.id = ep.company_id
+JOIN 
+    company_type ct ON ct.id = c.company_type_id
+WHERE 
+    TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+    AND ep.department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+    )
+    AND ep.date_end IS NULL
+GROUP BY 
+    ROLLUP(ct.name, c.name)
+ORDER BY 
+    ct.name, c.name;
+```
+
+👉 Перевага `ROLLUP`: створює автоматичний рядок `Total` для кожної групи компаній без UNION.
+
+---
+
+### **4️⃣ CSS для Total (як у попередньому звіті):**
+
+```css
+.a-IRR-table tr td:has(span:contains("Total")) {
+  background-color: #d4edda !important;
+  font-weight: bold;
+  color: #155724 !important;
+}
+```
+
+---
+
+## 🔹 Коротко про динаміку
+
+| Елемент                | Призначення                    | Дія при зміні              |
+| ---------------------- | ------------------------------ | -------------------------- |
+| `P_REPORT_DATE`        | Вибір дати                     | Refresh усіх звітів        |
+| `P_REPORT_DEPARTMENTS` | Вибір підрозділів              | Refresh усіх звітів        |
+| Звіт 1                 | Загальні підсумки по компаніях | Залежить від обох фільтрів |
+
+---
+
+Хочеш, щоб я підготував повну структуру сторінки (з трьома звітами), включно з другим і третім — наприклад, щоб другий показував деталізацію по підрозділах, а третій — по типах робіт у компаніях?
