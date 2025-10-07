@@ -1,0 +1,136 @@
+Чудово 👍
+Ось повна, акуратно оформлена версія SQL-запиту **через `UNION ALL`**, яка створює звіт *«Сумарно по підрозділах»* з явним рядком **«Всього»** для кожного підрозділу.
+Такий підхід надає тобі повний контроль над виглядом і кольором рядків у APEX (через `IS_TOTAL`).
+
+---
+
+## 🔹 SQL-запит (для IR або Classic Report)
+
+```sql
+WITH base_data AS (
+    SELECT 
+        u.id            AS unit_id,
+        u.name          AS unit_name,
+        ct.id           AS company_type_id,
+        ct.name         AS company_type_name,
+        c.id            AS company_id,
+        c.name          AS company_name,
+        SUM(ep.people_count) AS total_people,
+        0 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+        JOIN units u         ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+        AND ep.date_end IS NULL
+    GROUP BY 
+        u.id, u.name, ct.id, ct.name, c.id, c.name
+),
+totals AS (
+    SELECT 
+        u.id            AS unit_id,
+        u.name          AS unit_name,
+        NULL             AS company_type_id,
+        NULL             AS company_type_name,
+        NULL             AS company_id,
+        'Всього'         AS company_name,
+        SUM(ep.people_count) AS total_people,
+        1 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        JOIN units u   ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+        AND ep.date_end IS NULL
+    GROUP BY 
+        u.id, u.name
+)
+SELECT * FROM base_data
+UNION ALL
+SELECT * FROM totals
+ORDER BY unit_name, is_total, company_type_name, company_name;
+```
+
+---
+
+## 🔹 Що робить цей запит
+
+* `base_data` — звичайні рядки (по компаніях усередині підрозділів).
+* `totals` — підсумкові рядки з `"Всього"` для кожного `unit_name`.
+* `IS_TOTAL`:
+
+  * `0` — звичайний запис,
+  * `1` — підсумковий рядок (для форматування у звіті).
+
+---
+
+## 🔹 Як підключити в APEX
+
+### 1️⃣ Створи **Region → Interactive Report (або Classic Report)**
+
+SQL Source = запит вище.
+
+### 2️⃣ У звіті відображай колонки:
+
+| Виконавець (company_name) | Підрозділ (unit_name) | К-сть персоналу (total_people) |
+
+### 3️⃣ Додай **Highlight Rule**:
+
+* **Condition:** `IS_TOTAL = 1`
+* **Style:**
+
+  ```css
+  background-color: #d4edda !important;
+  color: #155724 !important;
+  font-weight: bold;
+  border-top: 2px solid #b7e4c7;
+  ```
+
+---
+
+## 🔹 Результат у звіті
+
+```
+Підрозділ: Київський офіс
+----------------------------------------------
+Виконавець        | Підрозділ       | К-сть персоналу
+----------------------------------------------
+Укрпошта          | Київський офіс  |  12
+Укрзалізниця      | Київський офіс  |   8
+Нова пошта        | Київський офіс  |  10
+SoftServe         | Київський офіс  |   5
+----------------------------------------------
+Всього            | Київський офіс  |  35  ✅ зелений рядок
+
+Підрозділ: Львівський офіс
+----------------------------------------------
+Укрпошта          | Львівський офіс |   9
+Укрзалізниця      | Львівський офіс |   6
+Нова пошта        | Львівський офіс |   7
+SoftServe         | Львівський офіс |   4
+----------------------------------------------
+Всього            | Львівський офіс |  26  ✅ зелений рядок
+```
+
+---
+
+## 🔹 Додаткові покращення (опційно)
+
+* **Групування в IR**: можна додати `GROUP BY unit_name`.
+* **Фільтри**: при зміні `P_REPORT_DATE` або `P_REPORT_DEPARTMENTS` → `Dynamic Action → Refresh Report`.
+* **Валідація**: якщо `P_REPORT_DEPARTMENTS` порожній → показати повідомлення ("Виберіть хоча б один підрозділ").
+
+---
+
+Хочеш, я одразу підготую **третій звіт** — деталізацію по типах робіт (щоб бачити, скільки персоналу зайнято в кожному типі робіт по компаніях)?
