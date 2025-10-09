@@ -1,0 +1,115 @@
+Чудове запитання 👍
+Ви мислите дуже правильно — тепер, коли ви переходите від `USER_NFC` до універсальної `USER_TAG`, запит для пошуку користувача теж треба зробити універсальним і масштабованим (щоб працював і з NFC, і з RFID, і надалі з іншими типами).
+
+Нижче — покрокове пояснення і фінальний SQL-запит.
+
+---
+
+## 🔹 1. Передумови
+
+У нас тепер є таблиці:
+
+```sql
+USER_TAG(USER_ID, TAG_TYPE_ID, TAG_CODE)
+TAG_TYPE_LU(ID, CODE)       -- наприклад 'NFC', 'RFID'
+AUTH_METHOD_LU(ID, CODE)    -- наприклад 'MANUAL', 'TAG'
+```
+
+І є вхідні дані (наприклад, тимчасова таблиця `INDATA`):
+
+```sql
+INDATA (CODE, TAG_TYPE)  -- може мати TAG_TYPE = 'NFC' або 'RFID' або NULL
+```
+
+---
+
+## 🔹 2. Нова логіка пошуку
+
+1. Якщо `TAG_TYPE` = 'NFC' або 'RFID' → шукаємо в `USER_TAG` по `TAG_TYPE_LU.CODE`.
+2. Якщо `TAG_TYPE` відсутній → перевіряємо, чи `CODE` — це числове значення (ідентифікатор користувача).
+3. Якщо є кілька збігів, пріоритет: **NFC > RFID > MANUAL**.
+
+---
+
+## 🔹 3. Оновлений запит
+
+```sql
+SELECT user_id, method
+FROM (
+  -- 1. NFC
+  SELECT ut.user_id, 'NFC' AS method, 1 AS ord
+    FROM user_tag ut
+    JOIN tag_type_lu tt ON ut.tag_type_id = tt.id
+    JOIN indata d ON tt.code = 'NFC' AND ut.tag_code = d.code
+
+  UNION ALL
+
+  -- 2. RFID
+  SELECT ut.user_id, 'RFID' AS method, 2 AS ord
+    FROM user_tag ut
+    JOIN tag_type_lu tt ON ut.tag_type_id = tt.id
+    JOIN indata d ON tt.code = 'RFID' AND ut.tag_code = d.code
+
+  UNION ALL
+
+  -- 3. MANUAL (якщо код — це число)
+  SELECT u.user_id, 'MANUAL' AS method, 3 AS ord
+    FROM users u
+    JOIN indata d
+      ON REGEXP_LIKE(d.code, '^\d+$')
+     AND u.user_id = TO_NUMBER(d.code)
+)
+ORDER BY ord
+FETCH FIRST 1 ROW ONLY;
+```
+
+---
+
+## 🔹 4. Як це працює
+
+| Пріоритет | Метод  | Умова пошуку                                     |
+| --------- | ------ | ------------------------------------------------ |
+| 1         | NFC    | Збіг у `USER_TAG` для `TAG_TYPE='NFC'`           |
+| 2         | RFID   | Збіг у `USER_TAG` для `TAG_TYPE='RFID'`          |
+| 3         | MANUAL | Якщо введено числовий код, що дорівнює `USER_ID` |
+
+> Таким чином, навіть якщо NFC- і RFID-мітки мають однаковий код, Oracle точно розрізнить їх за `TAG_TYPE_ID`.
+
+---
+
+## 🔹 5. Універсальніший варіант (на випадок додавання BLE, QR і т.д.)
+
+Якщо тип мітки приходить у вхідних даних (`indata.tag_type`), можна зробити компактніше:
+
+```sql
+SELECT user_id, method
+FROM (
+  -- 1. Універсальний пошук по мітках
+  SELECT ut.user_id, tt.code AS method, 1 AS ord
+    FROM user_tag ut
+    JOIN tag_type_lu tt ON ut.tag_type_id = tt.id
+    JOIN indata d
+      ON ut.tag_code = d.code
+     AND (d.tag_type IS NULL OR tt.code = d.tag_type)
+
+  UNION ALL
+
+  -- 2. MANUAL
+  SELECT u.user_id, 'MANUAL' AS method, 2 AS ord
+    FROM users u
+    JOIN indata d
+      ON REGEXP_LIKE(d.code, '^\d+$')
+     AND u.user_id = TO_NUMBER(d.code)
+)
+ORDER BY ord
+FETCH FIRST 1 ROW ONLY;
+```
+
+✅ підтримує будь-які типи міток із `TAG_TYPE_LU`
+✅ можна легко додати BLE або QR без зміни SQL
+✅ NFC і RFID мають різні `TAG_TYPE_ID`, тому колізій не буде
+
+---
+
+Хочете, я покажу варіант **PL/SQL-функції `get_user_by_tag(p_code, p_tag_type)`**, яка реалізує цю логіку й повертає `USER_ID` + `METHOD` як запис?
+s

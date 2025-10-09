@@ -1,0 +1,53 @@
+Дуже просто ✅ — достатньо **додати умову у WHERE-блок** вашого SQL-запиту.
+Ось оновлений варіант:
+
+```sql
+SELECT 
+    t.id,
+    t.user_id,
+    u.user_name,
+    u.department_name,
+    tt.code AS tag_type_name,
+    t.tag_code,
+    t.created_at
+FROM user_tag t
+JOIN users u 
+    ON u.user_id = t.user_id
+JOIN tag_type_lu tt 
+    ON tt.id = t.tag_type_id
+WHERE t.date_end IS NULL
+  AND u.department_id = 11   -- ✅ вибірка користувачів конкретного цеху
+ORDER BY t.created_at DESC;
+```
+
+---
+
+## 🔹 Якщо ви хочете зробити цю умову динамічною
+
+Тобто, щоб можна було **фільтрувати за цехом (department)** з елемента сторінки (наприклад, `PXX_DEPARTMENT_ID`):
+
+```sql
+WHERE t.date_end IS NULL
+  AND ( :PXX_DEPARTMENT_ID IS NULL OR u.department_id = :PXX_DEPARTMENT_ID )
+ORDER BY t.created_at DESC;
+```
+
+Тоді:
+
+* створіть на сторінці **Select List** `PXX_DEPARTMENT_ID`
+  (LOV: `SELECT department_name d, department_id r FROM departments ORDER BY department_name`)
+* додайте **Dynamic Action**:
+
+  * **Event:** Change
+  * **Action:** Refresh Region (IR region)
+
+Це дозволить змінювати цех і миттєво оновлювати звіт без перезавантаження сторінки.
+
+---
+
+🔹 Отже, залежно від задачі:
+
+* Якщо потрібно **фіксовано** показати лише цех №11 → додаємо `AND u.department_id = 11`
+* Якщо потрібно **динамічно** фільтрувати → використовуємо `:PXX_DEPARTMENT_ID` і Refresh Region
+
+Хочете, я покажу, як саме створити фільтр-select для цехів із автопідстановкою у ваш IR?

@@ -1,0 +1,213 @@
+Супер 👍
+Ви сформулювали абсолютно чітке ТЗ для сторінки адміністрування зв’язків **користувач ↔ мітка** (NFC / RFID).
+Далі — детальний покроковий гайд для реалізації в Oracle APEX:
+
+---
+
+## 🔹 1. Основна сторінка: `User Tag Management`
+
+**Тип сторінки:** Standard
+**Region 1:** `User Tag List` (Interactive Report)
+**Source (SQL Query):**
+
+```sql
+SELECT 
+    t.id,
+    t.user_id,
+    u.user_name,
+    u.department_name,
+    tt.code AS tag_type_name,
+    t.tag_code,
+    t.created_at
+FROM user_tag t
+JOIN users u ON u.user_id = t.user_id
+JOIN tag_type_lu tt ON tt.id = t.tag_type_id
+WHERE t.date_end IS NULL
+ORDER BY t.created_at DESC;
+```
+
+---
+
+## 🔹 2. Налаштування колонок IR
+
+| Колонка         | Тип    | Примітка                    |
+| --------------- | ------ | --------------------------- |
+| ID              | Hidden | Потрібна для дій            |
+| USER_ID         | Hidden | Може бути прихована         |
+| USER_NAME       | Text   | Відображення                |
+| DEPARTMENT_NAME | Text   | Відображення                |
+| TAG_CODE        | Text   | Відображення                |
+| TAG_TYPE_NAME   | Text   | Відображення                |
+| CREATED_AT      | Date   | Формат `DD.MM.YYYY HH24:MI` |
+
+---
+
+## 🔹 3. Додати колонку з іконкою “Видалити зв’язок”
+
+1. У звіті додайте **Link Column** (тип: *Link*).
+2. У полі **Link Text** вставте:
+
+   ```html
+   <span class="fa fa-trash-o" title="Видалити" style="color:red;cursor:pointer;"></span>
+   ```
+3. **Target:**
+   None (ми будемо обробляти через Dynamic Action).
+4. Додайте **Static ID** для IR, наприклад `ir_user_tag`.
+
+---
+
+## 🔹 4. Dynamic Action для видалення зв’язку
+
+### Подія:
+
+* **Event:** Click
+* **Selection Type:** jQuery Selector
+* **jQuery Selector:** `#ir_user_tag span.fa-trash-o`
+
+### True Action 1: Confirm
+
+* **Action:** Confirm
+* **Message:**
+
+  ```
+  Ви впевнені, що хочете деактивувати цей зв’язок користувача з міткою?
+  ```
+* **Button Label:** Так
+* **Cancel Label:** Ні
+
+### True Action 2: Execute Server-side Code
+
+* **Action:** Execute PL/SQL Code
+* **PL/SQL Code:**
+
+  ```plsql
+  DECLARE
+      v_id NUMBER := APEX_IG.GET_SELECTED_ROWS(:APP_REGION_ID).id;
+  BEGIN
+      UPDATE user_tag
+         SET date_end = SYSDATE
+       WHERE id = v_id;
+
+      APEX_DEBUG.MESSAGE('User_tag deactivated, ID = ' || v_id);
+  END;
+  ```
+
+  ⚠️ Якщо IR не підтримує `GET_SELECTED_ROWS`, тоді простіше:
+
+  * створіть Hidden Item `PXX_ID` (де XX — номер сторінки)
+  * у JS (перед підтвердженням) отримайте `id` з рядка і передайте у `PXX_ID`.
+
+  **PL/SQL варіант із item:**
+
+  ```plsql
+  UPDATE user_tag
+     SET date_end = SYSDATE
+   WHERE id = :PXX_ID;
+  ```
+
+### True Action 3: Refresh Region
+
+* **Affected Elements:** Region → `User Tag List`
+
+---
+
+## 🔹 5. JavaScript для передачі ID при натисканні на іконку
+
+1. Додайте **Static ID** до IR → `ir_user_tag`
+2. У секції **Function and Global Variable Declaration** сторінки вставте:
+
+```js
+$(document).on("click", "#ir_user_tag span.fa-trash-o", function() {
+  const id = $(this).closest("tr").find("td[headers='ID']").text().trim();
+  $s("PXX_ID", id); // XX = номер вашої сторінки
+});
+```
+
+---
+
+## 🔹 6. Кнопка «Додати зв’язок»
+
+1. Створіть **Button** у регіоні `User Tag List`
+
+   * Label: **Додати зв’язок**
+   * Action: **Redirect to Page in Dialog**
+   * Target Page: Modal page `User Tag Add`
+   * Dialog Attributes:
+
+     * Modal
+     * Width: 500px
+   * **After dialog close:** Refresh region `User Tag List`
+
+---
+
+## 🔹 7. Modal Page `User Tag Add`
+
+### Items:
+
+| Item            | Type        | Source / LOV                                                  | Required |
+| --------------- | ----------- | ------------------------------------------------------------- | -------- |
+| PYY_USER_ID     | Popup LOV   | `SELECT user_name d, user_id r FROM users ORDER BY user_name` | ✅        |
+| PYY_TAG_CODE    | Text Field  | —                                                             | ✅        |
+| PYY_TAG_TYPE_ID | Select List | `SELECT code d, id r FROM tag_type_lu`                        | ✅        |
+
+---
+
+### Button:
+
+| Button             | Action      |
+| ------------------ | ----------- |
+| **Додати зв’язок** | Submit Page |
+
+---
+
+### Process (на Submit)
+
+**Process Point:** After Submit
+**Type:** PL/SQL Code
+**Code:**
+
+```plsql
+BEGIN
+  INSERT INTO user_tag (user_id, tag_type_id, tag_code, created_at)
+  VALUES (:PYY_USER_ID, :PYY_TAG_TYPE_ID, :PYY_TAG_CODE, SYSTIMESTAMP);
+
+  APEX_DEBUG.MESSAGE('User Tag Created: ' || :PYY_USER_ID || ' / ' || :PYY_TAG_CODE);
+  APEX_UTIL.SET_SESSION_STATE('PYY_SUCCESS', 1);
+END;
+```
+
+---
+
+### After Processing:
+
+* **Close Dialog**
+* **Refresh region** (через головну сторінку, якщо вказано)
+
+---
+
+### Dynamic Action on Dialog Close (Main Page)
+
+* Refresh Region: `User Tag List`
+
+---
+
+### Optional Success Message
+
+На головній сторінці → додайте Dynamic Action (Event: Dialog Closed):
+
+```plsql
+apex.message.showPageSuccess('Зв’язок користувач - мітка створено.');
+```
+
+---
+
+## 🔹 8. Підсумок UX
+
+✅ Користувач бачить список усіх активних зв’язків
+✅ Може додати новий зв’язок через модальне вікно
+✅ Може “деактивувати” (soft delete) — запис залишається в історії, але не показується
+✅ Повідомлення про успіх відображається у стандартному Apex-стилі
+
+---
+
+Хочете, я сформую повний SQL + PL/SQL + JS код (зі змінними `PXX_` / `PYY_` під конкретні номери сторінок), щоб ви могли одразу вставити його в APEX?
