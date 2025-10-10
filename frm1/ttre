@@ -1,0 +1,56 @@
+WITH base_data AS (
+    SELECT ct.id          AS company_type_id,
+           ct.name        AS company_type_name,
+           c.id           AS company_id,
+           c.name         AS company_name,
+           NVL(wt.name, ep.work_type_text) AS work_type_name,
+           u.id           AS unit_id,
+           u.name         AS unit_name,
+           ep.people_count,
+           ep.date_create,
+           ep.creator,
+           0 AS is_total
+    FROM external_personal ep
+    JOIN company c       ON c.id = ep.company_id
+    JOIN company_type ct ON ct.id = c.company_type_id
+    LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+    LEFT JOIN units u      ON u.id = ep.unit_id
+    WHERE ep.date_end IS NULL
+),
+
+-- ✅ Групування спочатку по компанії, потім по типу компанії
+totals AS (
+    SELECT 
+        ct.id AS company_type_id,
+        ct.name AS company_type_name,
+        NULL AS company_id,
+        'Total' AS company_name,
+        NULL AS work_type_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        SUM(pc.total_people) AS people_count,
+        NULL AS date_create,
+        NULL AS creator,
+        1 AS is_total
+    FROM (
+        -- Спочатку групуємо людей на рівні компаній
+        SELECT 
+            c.company_type_id,
+            ep.company_id,
+            SUM(ep.people_count) AS total_people
+        FROM external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        WHERE ep.date_end IS NULL
+        GROUP BY c.company_type_id, ep.company_id
+    ) pc
+    JOIN company_type ct ON ct.id = pc.company_type_id
+    GROUP BY ct.id, ct.name
+)
+
+SELECT * 
+FROM (
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY company_type_id, is_total, company_name;
