@@ -1,0 +1,10 @@
+function(config) {
+  config.attributes = config.attributes || {};
+  config.attributes.afterRefresh = function(grid) {
+    const header = grid.view$.find('.a-GV-header');
+    if (header.length) {
+      header.hide();
+    }
+  };
+  return config;
+}
