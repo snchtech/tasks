@@ -1,0 +1,186 @@
+Дуже класно, ми переходимо до **практичної реалізації CRUD-функцій** для твого основного звіту в Oracle APEX 👌
+Розберімо все по пунктах, включно з **оновленням історії змін**, **редагуванням**, і **видаленням через AJAX**.
+
+---
+
+## 🔹 1️⃣ Розширення таблиці `EXTERNAL_PERSONAL`
+
+Додай колонки для аудиту змін:
+
+```sql
+ALTER TABLE external_personal ADD (
+    date_update DATE,
+    updator     VARCHAR2(100)
+);
+```
+
+👉
+
+* `date_update` — коли востаннє змінено.
+* `updator` — хто зробив зміну (`:APP_USER`).
+
+> **Рекомендація:**
+> якщо ти плануєш відстежувати історію оновлень, краще одразу створити архівну таблицю `EXTERNAL_PERSONAL_HISTORY`.
+
+---
+
+## 🔹 2️⃣ Історія змін (аудитна таблиця)
+
+Створимо таблицю-журнал, щоб не втрачати старі дані:
+
+```sql
+CREATE TABLE external_personal_history AS
+SELECT 
+    ep.*, 
+    SYSDATE AS archive_date,
+    :APP_USER AS archive_user
+FROM external_personal ep
+WHERE 1=0;  -- тільки структура
+```
+
+Додай тригер, який автоматично копіюватиме старий рядок перед оновленням або видаленням:
+
+```sql
+CREATE OR REPLACE TRIGGER trg_ep_audit
+BEFORE UPDATE OR DELETE ON external_personal
+FOR EACH ROW
+BEGIN
+    INSERT INTO external_personal_history (
+        id, department_id, unit_id, work_type_id, work_type_text, 
+        people_count, company_id, date_create, creator, date_end,
+        date_update, updator, archive_date, archive_user
+    )
+    VALUES (
+        :OLD.id, :OLD.department_id, :OLD.unit_id, :OLD.work_type_id, :OLD.work_type_text,
+        :OLD.people_count, :OLD.company_id, :OLD.date_create, :OLD.creator, :OLD.date_end,
+        :OLD.date_update, :OLD.updator, SYSDATE, NVL(V('APP_USER'), USER)
+    );
+END;
+/
+```
+
+✅
+Тепер **кожне оновлення або видалення** залишає копію старого запису з часом і користувачем.
+
+---
+
+## 🔹 3️⃣ Додавання кнопки **Edit** у Interactive Report
+
+### Крок 1.
+
+У IR → **Attributes → Link** (або додай колонку з іконкою 🖉):
+
+```sql
+'<a href="f?p=&APP_ID.:20:&SESSION.::NO::P20_ID:' || id || 
+'" class="t-Button t-Button--small t-Button--edit"><span class="fa fa-edit"></span></a>' AS edit_link
+```
+
+> 🔹 Тут `20` — ID сторінки форми редагування.
+> Передаємо `P20_ID = external_personal.id`.
+
+---
+
+## 🔹 4️⃣ Сторінка редагування (Page 20)
+
+**Тип сторінки:** Form
+**Table:** `EXTERNAL_PERSONAL`
+
+### Елементи:
+
+* `P20_ID` (Hidden)
+* `P20_PEOPLE_COUNT` (Number field)
+
+### Process → “Update External Personal”:
+
+```plsql
+UPDATE external_personal
+   SET people_count = :P20_PEOPLE_COUNT,
+       date_update  = SYSDATE,
+       updator      = :APP_USER
+ WHERE id = :P20_ID;
+```
+
+✅
+Після виконання процесу:
+
+* Redirect → назад до сторінки зі звітом (наприклад, Page 10).
+* Refresh Interactive Report, щоб відобразити зміни.
+
+---
+
+## 🔹 5️⃣ Додавання кнопки **Delete** з AJAX Callback
+
+### Крок 1.
+
+У IR додай колонку-посилання для кнопки видалення:
+
+```sql
+'<a href="javascript:void(0)" 
+   class="t-Button t-Button--small t-Button--danger ep-delete" 
+   data-id="' || id || '">
+   <span class="fa fa-trash"></span></a>' AS delete_link
+```
+
+---
+
+### Крок 2.
+
+У **Page → JavaScript → Function and Global Variable Declaration** встав:
+
+```js
+function deleteExternalPersonal(recordId) {
+  apex.message.confirm("Ви впевнені, що хочете видалити цей запис?", function(okPressed) {
+    if (okPressed) {
+      apex.server.process("DELETE_EP", {
+        x01: recordId
+      }, {
+        success: function() {
+          apex.region("your_report_static_id").refresh();
+          apex.message.showPageSuccess("Запис успішно видалено");
+        },
+        error: function(err) {
+          console.error("Помилка видалення:", err);
+        }
+      });
+    }
+  });
+}
+
+$(document).on("click", ".ep-delete", function() {
+  const id = $(this).data("id");
+  deleteExternalPersonal(id);
+});
+```
+
+> 🔹 Заміни `"your_report_static_id"` на **Static ID** твого Interactive Report region.
+
+---
+
+### Крок 3.
+
+Створи **Ajax Callback process** із назвою `DELETE_EP`:
+
+```plsql
+BEGIN
+    DELETE FROM external_personal
+     WHERE id = TO_NUMBER(apex_application.g_x01);
+END;
+```
+
+✅
+Цей процес викликається через `apex.server.process()` і видаляє запис.
+
+---
+
+## 🔹 6️⃣ Резюме (все разом)
+
+| Дія            | Реалізація                    | Особливість                                         |
+| -------------- | ----------------------------- | --------------------------------------------------- |
+| ➕ Додавання    | Кнопка на формі (вже є)       | Записує creator, date_create                        |
+| ✏️ Редагування | Кнопка Edit → Form Page       | Оновлює people_count, date_update, updator          |
+| 🗑️ Видалення  | Кнопка Delete → AJAX Callback | Виконує DELETE + refresh IR                         |
+| 🧾 Історія     | Trigger `trg_ep_audit`        | Зберігає старі значення перед зміною або видаленням |
+
+---
+
+Хочеш, щоб я підготував шаблон сторінки **Page 20 (Edit form)** з базовими регіонами, елементами й процесом, щоб ти міг просто скопіювати в APEX?

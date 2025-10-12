@@ -1,0 +1,152 @@
+Чудово 👍
+Ти хочеш у **загальному звіті** (згрупованому по типах компаній) внизу отримати **додатковий рядок “Всього”**, який покаже **загальну кількість персоналу по всіх компаніях**.
+Також цей рядок повинен мати **спеціальний CSS-клас**, щоб виділити його зеленим кольором у Interactive Report (IR).
+
+---
+
+## 🔹 1️⃣ Оновлений SQL із рядком “Всього”
+
+```sql
+WITH base_data AS (
+    SELECT 
+        ct.name AS company_type_name,      -- Тип компанії
+        c.name  AS company_name,           -- Назва виконавця
+        SUM(ep.people_count) AS total_people,
+        0 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+        AND ep.date_end IS NULL
+    GROUP BY 
+        ct.name, c.name
+),
+total_row AS (
+    SELECT 
+        'Усього' AS company_type_name,
+        'Всього' AS company_name,
+        SUM(total_people) AS total_people,
+        1 AS is_total
+    FROM base_data
+)
+SELECT * 
+FROM (
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM total_row
+)
+ORDER BY is_total, company_type_name, company_name;
+```
+
+---
+
+## 🔹 2️⃣ Пояснення
+
+| Поле        | Значення                                          |
+| ----------- | ------------------------------------------------- |
+| `base_data` | основні агреговані записи по компаніях            |
+| `total_row` | один додатковий рядок з текстом `Всього`          |
+| `is_total`  | 0 — звичайний рядок, 1 — підсумковий (для стилів) |
+
+---
+
+## 🔹 3️⃣ Вигляд у звіті
+
+```
+COMPANY_TYPE_NAME        COMPANY_NAME      TOTAL_PEOPLE
+--------------------------------------------------------
+Державні компанії        Укрпошта          22
+Державні компанії        Укрзалізниця      34
+Приватні компанії        SoftServe         15
+Приватні компанії        Нова пошта        10
+--------------------------------------------------------
+Усього                   Всього            81  ✅ (зелений рядок)
+```
+
+---
+
+## 🔹 4️⃣ Виділення підсумкового рядка в APEX
+
+1. Додай **Highlight Rule** у Interactive Report:
+
+   * **Condition:** `IS_TOTAL = 1`
+   * **Style:**
+
+   ```css
+   background-color: #d4edda !important;
+   color: #155724 !important;
+   font-weight: bold;
+   border-top: 2px solid #b7e4c7;
+   ```
+
+---
+
+## 🔹 5️⃣ Або кастомно через CSS-клас
+
+### 🔧 SQL-варіант із власним класом (якщо використовуєш HTML-report):
+
+```sql
+SELECT 
+    ct.name AS company_type_name,
+    c.name  AS company_name,
+    SUM(ep.people_count) AS total_people,
+    0 AS is_total,
+    NULL AS row_class
+FROM external_personal ep
+JOIN company c ON c.id = ep.company_id
+JOIN company_type ct ON ct.id = c.company_type_id
+WHERE TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+  AND ep.department_id IN (
+      SELECT TO_NUMBER(column_value)
+      FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+  )
+  AND ep.date_end IS NULL
+GROUP BY ct.name, c.name
+
+UNION ALL
+
+SELECT 
+    'Усього' AS company_type_name,
+    'Всього' AS company_name,
+    SUM(ep.people_count) AS total_people,
+    1 AS is_total,
+    'row-total' AS row_class
+FROM external_personal ep
+WHERE TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+  AND ep.department_id IN (
+      SELECT TO_NUMBER(column_value)
+      FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+  )
+  AND ep.date_end IS NULL;
+```
+
+👉 Тоді у **Report Attributes → Advanced → Custom Attributes** можна прописати:
+`class="#ROW_CLASS#"`
+
+---
+
+## 🔹 6️⃣ CSS для класу `.row-total`
+
+```css
+.row-total td {
+  background-color: #d4edda !important;
+  color: #155724 !important;
+  font-weight: bold;
+  border-top: 2px solid #b7e4c7;
+}
+```
+
+---
+
+✅ **Результат:**
+Тепер користувач бачить підсумковий рядок "Всього" внизу звіту, підсвічений зеленим кольором, і кількість персоналу з усіх компаній за вибрану дату та підрозділи.
+
+---
+
+Хочеш, щоб я показав, як зробити, щоб цей “Всього” **плавав унизу звіту при скролі** (тобто завжди був видимим, як footer)?

@@ -1,0 +1,148 @@
+Супер 💪
+Ось готовий **покроковий шаблон сторінки "Edit External Personal" (наприклад, Page 20)** — повністю сумісний з твоїм Interactive Report, з підтримкою аудиту (`date_update`, `updator`) і автоматичним поверненням на основну сторінку після оновлення.
+
+---
+
+## 🔹 🧱 Загальні параметри сторінки
+
+| Параметр         | Значення                       |
+| ---------------- | ------------------------------ |
+| **Page Type**    | Form                           |
+| **Page Name**    | Edit External Personal         |
+| **Page Number**  | 20                             |
+| **Target Table** | `EXTERNAL_PERSONAL`            |
+| **Page Mode**    | Modal Dialog *(рекомендовано)* |
+| **Source Type**  | SQL Query                      |
+| **Primary Key**  | `ID`                           |
+
+---
+
+## 🔹 🧩 SQL Source для форми
+
+```sql
+SELECT 
+    id,
+    company_id,
+    unit_id,
+    work_type_id,
+    work_type_text,
+    people_count,
+    department_id,
+    date_create,
+    creator,
+    date_update,
+    updator
+FROM external_personal
+WHERE id = :P20_ID
+```
+
+---
+
+## 🔹 🧾 Елементи сторінки
+
+| Item               | Тип          | Призначення                  | Примітка                                                   |
+| ------------------ | ------------ | ---------------------------- | ---------------------------------------------------------- |
+| `P20_ID`           | Hidden       | Ідентифікатор запису         | Передається з IR                                           |
+| `P20_COMPANY_NAME` | Display Only | Назва компанії               | LOV: `SELECT name FROM company WHERE id = :P20_COMPANY_ID` |
+| `P20_UNIT_NAME`    | Display Only | Назва підрозділу             | LOV: `SELECT name FROM units WHERE id = :P20_UNIT_ID`      |
+| `P20_WORK_TYPE`    | Display Only | Тип робіт                    | `NVL(wt.name, ep.work_type_text)`                          |
+| `P20_PEOPLE_COUNT` | Number Field | **Редагується користувачем** | Додай Label: “Кількість персоналу”                         |
+| `P20_CREATOR`      | Display Only | Хто створив                  | Read-only                                                  |
+| `P20_DATE_CREATE`  | Display Only | Коли створено                | Read-only                                                  |
+| `P20_UPDATOR`      | Display Only | Хто оновив                   | Read-only                                                  |
+| `P20_DATE_UPDATE`  | Display Only | Коли оновлено                | Read-only                                                  |
+
+---
+
+## 🔹 ⚙️ Process → **Update Record**
+
+**Process Name:** `UPDATE_EP`
+**When Button Pressed:** `UPDATE`
+**PL/SQL Code:**
+
+```plsql
+BEGIN
+    UPDATE external_personal
+       SET people_count = :P20_PEOPLE_COUNT,
+           date_update  = SYSDATE,
+           updator      = :APP_USER
+     WHERE id = :P20_ID;
+
+    APEX_DEBUG.MESSAGE('Updated record ID=' || :P20_ID || ' by ' || :APP_USER);
+END;
+```
+
+✅
+
+* Після оновлення оновлюється кількість персоналу.
+* Зберігається дата і користувач, що зробив зміни.
+
+---
+
+## 🔹 🧠 Process → “Close Dialog and Refresh Report”
+
+**Process Type:** *Close Dialog*
+**Settings:**
+
+* “After Processing”
+* **Dialog Action:** Close Dialog
+* **Dialog Return Value:** Success
+* **Affecting Regions:** Main IR Region on Page 10
+
+---
+
+## 🔹 🧱 Button Setup
+
+| Button   | Label     | Position       | Action                                       |
+| -------- | --------- | -------------- | -------------------------------------------- |
+| `CANCEL` | Скасувати | Top → Right    | *Defined by Dialog framework (Close Dialog)* |
+| `UPDATE` | Оновити   | Bottom → Right | *Submit Page* (calls `UPDATE_EP`)            |
+
+---
+
+## 🔹 🧰 IR Integration (основна сторінка)
+
+У твоєму IR на основній сторінці (наприклад, Page 10)
+створи колонку:
+
+```sql
+'<a href="javascript:void(0)" 
+   onclick="apex.navigation.dialog(' ||
+   apex_util.prepare_url('f?p=&APP_ID.:20:&SESSION.::NO::P20_ID:' || id) ||
+   ',{title:''Редагування запису'',height:400,width:600,modal:true,dialog:null});"
+   class="t-Button t-Button--small t-Button--edit">
+   <span class="fa fa-edit"></span></a>' AS edit_link
+```
+
+> 🔹 Вона відкриє модальне вікно (Page 20) з формою редагування.
+
+---
+
+## 🔹 🧾 Опціонально: Повідомлення про успіх
+
+Додай Dynamic Action після процесу `UPDATE_EP` →
+Action: “Show Notification” → Message:
+`Кількість персоналу успішно оновлено.`
+
+---
+
+## 🔹 🔒 Безпека та аудит
+
+Оскільки в тебе вже є тригер `TRG_EP_AUDIT`, при оновленні цей запис автоматично копіюється в `EXTERNAL_PERSONAL_HISTORY`.
+Отже, уся історія зберігається без додаткових дій на формі.
+
+---
+
+## 🔹 🔍 Резюме архітектури
+
+| Крок | Компонент             | Дія                                                    |
+| ---- | --------------------- | ------------------------------------------------------ |
+| 1    | IR (Page 10)          | Кнопка 🖉 відкриває Page 20 (Modal)                    |
+| 2    | Page 20 (Form)        | Завантажує дані з `EXTERNAL_PERSONAL`                  |
+| 3    | Кнопка Оновити        | Виконує UPDATE + встановлює `date_update`, `updator`   |
+| 4    | Тригер `TRG_EP_AUDIT` | Зберігає старі значення до `EXTERNAL_PERSONAL_HISTORY` |
+| 5    | Close Dialog          | Повертає `Success`, IR оновлюється                     |
+
+---
+
+Хочеш, щоб я підготував також аналогічний **Ajax Delete шаблон** із `confirm()` і збереженням історії у `EXTERNAL_PERSONAL_HISTORY` (через той самий тригер)?
