@@ -1,0 +1,153 @@
+Ідеально ✅
+Твій запит зараз показує агреговані значення по компаніях і один **загальний Total**,
+а потрібно, щоб **перед кожною групою компаній з певним `company_type_name` з’являвся розділювальний рядок** (наприклад, “Державні компанії”, “Приватні компанії” тощо).
+
+---
+
+## 🔹 Оновлений SQL із розділювальними рядками `company_type_name`
+
+```sql
+WITH base_data AS (
+    SELECT 
+        ct.id   AS company_type_id,
+        ct.name AS company_type_name,
+        c.name  AS company_name,
+        SUM(ep.people_count) AS total_people,
+        0 AS is_total,
+        NULL AS row_class,
+        0 AS is_header
+    FROM external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+    WHERE TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+      AND ep.department_id IN (
+          SELECT TO_NUMBER(column_value)
+          FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+      )
+      AND ep.date_end IS NULL
+    GROUP BY ct.id, ct.name, c.name
+),
+headers AS (
+    SELECT 
+        DISTINCT
+        ct.id   AS company_type_id,
+        ct.name AS company_type_name,
+        ct.name AS company_name,  -- назва групи
+        NULL AS total_people,
+        0 AS is_total,
+        'row-header' AS row_class,
+        1 AS is_header
+    FROM company_type ct
+    WHERE EXISTS (
+        SELECT 1
+        FROM external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        WHERE c.company_type_id = ct.id
+          AND TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+          AND ep.department_id IN (
+              SELECT TO_NUMBER(column_value)
+              FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+          )
+          AND ep.date_end IS NULL
+    )
+),
+totals AS (
+    SELECT 
+        NULL AS company_type_id,
+        'Усього' AS company_type_name,
+        'Всього' AS company_name,
+        SUM(ep.people_count) AS total_people,
+        1 AS is_total,
+        'row-total' AS row_class,
+        0 AS is_header
+    FROM external_personal ep
+    WHERE TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+      AND ep.department_id IN (
+          SELECT TO_NUMBER(column_value)
+          FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+      )
+      AND ep.date_end IS NULL
+)
+SELECT *
+FROM (
+    SELECT * FROM headers
+    UNION ALL
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY company_type_id, is_header DESC, company_name;
+```
+
+---
+
+## 🔹 🧠 Як це працює
+
+| Частина     | Що робить                                                                    |
+| ----------- | ---------------------------------------------------------------------------- |
+| `base_data` | твої звичайні рядки: компанія — кількість                                    |
+| `headers`   | додає розділювальний рядок із назвою `company_type_name` перед кожною групою |
+| `totals`    | формує один глобальний рядок “Всього” в кінці                                |
+| `row_class` | використовується для CSS-оформлення                                          |
+| `ORDER BY`  | забезпечує: заголовок → компанії → Total                                     |
+
+---
+
+## 🔹 🔍 Приклад результату
+
+```
+Державні компанії
+   Укрпошта                12
+   Укрзалізниця             8
+Приватні компанії
+   SoftServe                6
+   Нова пошта               9
+Усього
+   Всього                  35
+```
+
+---
+
+## 🔹 🎨 Оформлення через CSS у APEX
+
+У **Page → CSS → Inline** додай:
+
+```css
+/* Рядок-заголовок типу компанії */
+.row-header td {
+  background-color: #f3f4f7 !important;
+  color: #003366 !important;
+  font-weight: bold;
+  border-top: 2px solid #c5cae9;
+}
+
+/* Рядок Всього */
+.row-total td {
+  background-color: #d4edda !important;
+  color: #155724 !important;
+  font-weight: bold;
+  border-top: 2px solid #b7e4c7;
+}
+```
+
+---
+
+## 🔹 🔧 У Interactive Report
+
+У **Attributes → Advanced → Custom Attributes**
+додай:
+
+```
+class="#ROW_CLASS#"
+```
+
+→ тоді APEX автоматично застосує CSS до кожного рядка з відповідним `ROW_CLASS`.
+
+---
+
+✅ **Результат:**
+
+* Розділювальні рядки з назвами типів компаній (“headers”) з’являються у правильних місцях.
+* Основні рядки йдуть під ними.
+* Внизу один зелений рядок “Всього”.
+* IR лишається динамічним, фільтри за датою і департаментами працюють як і раніше.

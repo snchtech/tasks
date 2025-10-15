@@ -1,0 +1,148 @@
+Чудово 👍
+Тоді уточнюємо мету:
+
+* ти хочеш **залишити структуру звіту**, як зараз (усі компанії + Total у кінці, не по групах);
+* але **додати вивід назв типів компаній (company_type_name)** як окремі *рядки-заголовки* **перед кожною групою компаній**.
+
+Тобто формат має бути такий 👇
+
+```
+Державні компанії
+  Укрпошта …  
+  Укрзалізниця …  
+Приватні компанії
+  SoftServe …  
+  Нова пошта …  
+Total … (загальний внизу)
+```
+
+---
+
+## 🔹 Рішення
+
+Найпростіше — сформувати *третій блок* `headers`, який вставить “рядки-заголовки” для кожного `company_type`, а потім все об’єднати у потрібному порядку.
+Твій `Total` залишиться глобальним внизу.
+
+---
+
+### ✅ Оновлений SQL:
+
+```sql
+WITH base_data AS (
+    SELECT 
+        ct.id          AS company_type_id,
+        ct.name        AS company_type_name,
+        c.id           AS company_id,
+        c.name         AS company_name,
+        NVL(wt.name, ep.work_type_text) AS work_type_name,
+        u.id           AS unit_id,
+        u.name         AS unit_name,
+        ep.people_count,
+        ep.date_create,
+        ep.creator,
+        0 AS is_total,
+        0 AS is_header
+    FROM external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+        LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+        LEFT JOIN units u      ON u.id = ep.unit_id
+    WHERE ep.date_end IS NULL
+),
+totals AS (
+    SELECT 
+        NULL AS company_type_id,
+        'Усього' AS company_type_name,
+        NULL AS company_id,
+        'Total' AS company_name,
+        NULL AS work_type_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        SUM(ep.people_count) AS people_count,
+        NULL AS date_create,
+        NULL AS creator,
+        1 AS is_total,
+        0 AS is_header
+    FROM external_personal ep
+    WHERE ep.date_end IS NULL
+),
+headers AS (
+    SELECT 
+        DISTINCT
+        ct.id          AS company_type_id,
+        ct.name        AS company_type_name,
+        NULL AS company_id,
+        ct.name AS company_name, -- відображається як заголовок
+        NULL AS work_type_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        NULL AS people_count,
+        NULL AS date_create,
+        NULL AS creator,
+        0 AS is_total,
+        1 AS is_header
+    FROM external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+    WHERE ep.date_end IS NULL
+)
+SELECT *
+FROM (
+    SELECT * FROM headers
+    UNION ALL
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY 
+    company_type_id NULLS LAST, 
+    is_header DESC, 
+    is_total, 
+    company_name;
+```
+
+---
+
+## 🔹 🧠 Як це працює
+
+| Частина     | Призначення                                                               |
+| ----------- | ------------------------------------------------------------------------- |
+| `base_data` | усі рядки компаній із повною інформацією                                  |
+| `headers`   | вставляє рядок з назвою типу компанії перед кожною групою                 |
+| `totals`    | створює єдиний загальний рядок “Усього” в кінці                           |
+| `ORDER BY`  | забезпечує правильну послідовність: спочатку заголовок → компанії → Total |
+
+---
+
+## 🔹 🔍 Результат у звіті
+
+```
+Державні компанії
+   Укрпошта                12
+   Укрзалізниця             8
+Приватні компанії
+   SoftServe                6
+   Нова пошта               9
+Усього
+   Total                   35
+```
+
+---
+
+## 🔹 🎨 Виділення стилями в APEX
+
+У Interactive Report додай **Highlight Rules**:
+
+| Умова           | Стиль                                                        |
+| --------------- | ------------------------------------------------------------ |
+| `IS_HEADER = 1` | `background-color:#f3f3f3; font-weight:bold; color:#003366;` |
+| `IS_TOTAL = 1`  | `background-color:#d4edda; color:#155724; font-weight:bold;` |
+
+---
+
+✅ **Отримаєш:**
+
+* повну таблицю з усіма рядками;
+* “розділювачі” з назвами типів компаній як групові заголовки;
+* один фінальний рядок “Total” у кінці;
+* логічний порядок сортування і просте оформлення в IR.

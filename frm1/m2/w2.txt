@@ -1,0 +1,172 @@
+Дуже добре 👌
+Ти хочеш **зберегти усю інформацію з твого запиту**, але **додати розділювальні рядки з назвами типів компаній** — тобто вивести структуру у вигляді:
+
+```
+Державні компанії
+  Укрпошта …
+  Укрзалізниця …
+Приватні компанії
+  SoftServe …
+  Нова пошта …
+```
+
+І при цьому, щоб усі дані, включно з totals, лишились.
+
+---
+
+## 🔹 1️⃣ Завдання в SQL
+
+Ми додамо третю частину (крім `base_data` і `totals`) — **`headers`**, яка створить один рядок на кожен `company_type_name`.
+
+---
+
+## 🔹 2️⃣ Готовий SQL
+
+```sql
+WITH base_data AS (
+    SELECT 
+        ct.id          AS company_type_id,
+        ct.name        AS company_type_name,
+        c.id           AS company_id,
+        c.name         AS company_name,
+        NVL(wt.name, ep.work_type_text) AS work_type_name,
+        u.id           AS unit_id,
+        u.name         AS unit_name,
+        ep.people_count,
+        ep.date_create,
+        ep.creator,
+        0 AS is_total,
+        0 AS is_header
+    FROM external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+        LEFT JOIN work_type wt ON wt.id = ep.work_type_id
+        LEFT JOIN units u      ON u.id = ep.unit_id
+    WHERE ep.date_end IS NULL
+),
+totals AS (
+    SELECT 
+        ct.id AS company_type_id,
+        ct.name AS company_type_name,
+        NULL AS company_id,
+        'Total' AS company_name,
+        NULL AS work_type_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        SUM(pc.total_people) AS people_count,
+        NULL AS date_create,
+        NULL AS creator,
+        1 AS is_total,
+        0 AS is_header
+    FROM (
+        SELECT 
+            c.company_type_id,
+            ep.company_id,
+            SUM(ep.people_count) AS total_people
+        FROM external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        WHERE ep.date_end IS NULL
+        GROUP BY c.company_type_id, ep.company_id
+    ) pc
+    JOIN company_type ct ON ct.id = pc.company_type_id
+    GROUP BY ct.id, ct.name
+),
+headers AS (
+    SELECT 
+        ct.id AS company_type_id,
+        ct.name AS company_type_name,
+        NULL AS company_id,
+        ct.name AS company_name,     -- буде відображатись як заголовок
+        NULL AS work_type_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        NULL AS people_count,
+        NULL AS date_create,
+        NULL AS creator,
+        0 AS is_total,
+        1 AS is_header
+    FROM company_type ct
+    WHERE EXISTS (
+        SELECT 1
+        FROM external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        WHERE c.company_type_id = ct.id
+          AND ep.date_end IS NULL
+    )
+)
+SELECT *
+FROM (
+    SELECT * FROM headers
+    UNION ALL
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY company_type_id, is_header DESC, is_total, company_name;
+```
+
+---
+
+## 🔹 3️⃣ Що відбувається
+
+| Частина     | Опис                                                   |
+| ----------- | ------------------------------------------------------ |
+| `base_data` | усі звичайні записи                                    |
+| `totals`    | підсумковий рядок `"Total"` для кожного `company_type` |
+| `headers`   | заголовок для кожного `company_type`                   |
+| `is_header` | спеціальний прапорець для стилізації                   |
+
+---
+
+## 🔹 4️⃣ Приклад результату
+
+```
+COMPANY_TYPE_ID | COMPANY_NAME        | PEOPLE_COUNT | IS_HEADER | IS_TOTAL
+-----------------|--------------------|---------------|------------
+1                | Державні компанії  |               | 1         | 0
+1                | Укрпошта           | 12            | 0         | 0
+1                | Укрзалізниця       | 8             | 0         | 0
+1                | Total              | 20            | 0         | 1
+2                | Приватні компанії  |               | 1         | 0
+2                | SoftServe          | 6             | 0         | 0
+2                | Нова пошта         | 9             | 0         | 0
+2                | Total              | 15            | 0         | 1
+```
+
+---
+
+## 🔹 5️⃣ Візуальне оформлення в APEX (Highlight Rules)
+
+У **Interactive Report** → **Highlight → Add**:
+
+| Condition       | Style                                                                                          |
+| --------------- | ---------------------------------------------------------------------------------------------- |
+| `IS_HEADER = 1` | `background-color: #e2e3f3; font-weight: bold; color: #1a237e; border-top: 2px solid #c5cae9;` |
+| `IS_TOTAL = 1`  | `background-color: #d4edda; color: #155724; font-weight: bold; border-top: 2px solid #b7e4c7;` |
+
+---
+
+## 🔹 6️⃣ Підсумок
+
+✅ Результат у звіті:
+
+```
+Державні компанії
+   Укрпошта ............. 12
+   Укрзалізниця ......... 8
+   Total ................ 20
+Приватні компанії
+   SoftServe ............ 6
+   Нова пошта ........... 9
+   Total ................ 15
+```
+
+✅ Повністю сумісно з твоєю архітектурою APEX:
+
+* підтримує `Highlight` (IS_HEADER, IS_TOTAL);
+* легко оновлюється при фільтрах `P_REPORT_DATE`, `P_REPORT_DEPARTMENTS`;
+* можна форматувати заголовки як групи (або навіть у Classic Report як `breaks`).
+
+---
+
+Хочеш, щоб я показав, як зробити, щоб рядки з `IS_HEADER = 1` виглядали **як групові заголовки без колонок** (злиті на всю ширину, як секційні рядки у Classic Report)?
