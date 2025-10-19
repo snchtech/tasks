@@ -1,0 +1,111 @@
+Дуже логічно 💪
+Ти хочеш додати у свій звіт “інтелектуальну” логіку для відображення автора і дати — тобто:
+
+* якщо запис оновлювався (`UPDATOR`, `DATE_UPDATE`),
+  → показати їх;
+* якщо ні — показати початкові (`CREATOR`, `DATE_CREATE`).
+
+---
+
+## 🔹 Оновлений SQL із умовною логікою
+
+```sql
+WITH base_data AS (
+    SELECT 
+        u.id              AS unit_id,
+        u.name            AS unit_name,
+        ct.id             AS company_type_id,
+        ct.name           AS company_type_name,
+        c.id              AS company_id,
+        c.name            AS company_name,
+        ep.people_count,
+        -- ✅ Якщо є оновлення — беремо UPDATOR / DATE_UPDATE, інакше CREATOR / DATE_CREATE
+        CASE 
+            WHEN ep.updator IS NOT NULL THEN ep.updator 
+            ELSE ep.creator 
+        END AS creator,
+        CASE 
+            WHEN ep.date_update IS NOT NULL THEN ep.date_update 
+            ELSE ep.date_create 
+        END AS date_display,
+        0 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+        JOIN units u         ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+        AND ep.date_end IS NULL
+),
+totals AS (
+    SELECT 
+        u.id              AS unit_id,
+        u.name            AS unit_name,
+        NULL              AS company_type_id,
+        NULL              AS company_type_name,
+        NULL              AS company_id,
+        'Всього'          AS company_name,
+        SUM(ep.people_count) AS people_count,
+        NULL              AS creator,
+        NULL              AS date_display,
+        1 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        JOIN units u   ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+        AND ep.date_end IS NULL
+    GROUP BY 
+        u.id, u.name
+)
+SELECT * 
+FROM (
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY unit_name, is_total, company_type_name, company_name;
+```
+
+---
+
+## 🔹 🔍 Пояснення
+
+| Колонка        | Логіка                                                                     |
+| -------------- | -------------------------------------------------------------------------- |
+| `creator`      | якщо `EP.UPDATOR` існує → показати `UPDATOR`, інакше `CREATOR`             |
+| `date_display` | якщо `EP.DATE_UPDATE` існує → показати `DATE_UPDATE`, інакше `DATE_CREATE` |
+
+---
+
+## 🔹 🧾 Результат
+
+| Unit  | Company      | People | Creator                     | Date Display         |
+| ----- | ------------ | ------ | --------------------------- | -------------------- |
+| Київ  | Укрпошта     | 8      | ivanov_i                    | 06.10.2025 12:32     |
+| Київ  | Укрзалізниця | 11     | petrenko_o                  | 06.10.2025 09:44     |
+| Львів | SoftServe    | 7      | shevchuk_v                  | 06.10.2025 08:05     |
+| Львів | Нова пошта   | 6      | **kuzmenko_n** *(оновлено)* | **06.10.2025 15:10** |
+| —     | Всього       | 32     |                             |                      |
+
+---
+
+✅ **Результат у APEX:**
+
+* ти можеш просто замінити колонку `DATE_CREATE` на `DATE_DISPLAY`
+  (наприклад, “Дата / час подання”)
+* і колонку `CREATOR` залишити ту саму, але з цією логікою.
+
+---
+
+Хочеш, щоб я показав, як у звіті APEX для `DATE_DISPLAY` зробити автоматичне форматування дати (`DD.MM.YYYY HH24:MI`) без зміни SQL?
