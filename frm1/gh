@@ -1,0 +1,170 @@
+To achieve this functionality in Oracle APEX, you can use **Dynamic Actions** combined with some **PL/SQL** and **JavaScript**. Here's how to implement your described logic step-by-step.
+
+---
+
+## ✅ GOAL SUMMARY:
+
+You have:
+
+* A **Checkbox Group** (`P1_CHECKBOX`)
+* A **Text Item** (`P1_TEXT`)
+* You want:
+
+  1. If `P1_TEXT` is **NULL**, show some default checkboxes (like "unit")
+  2. If `P1_TEXT` is **NOT NULL** (on change):
+
+     * Check if the user has a certain **role** (e.g., `ADMIN`)
+
+       * If **yes**: Set checkbox group to values from a **SQL SELECT** where the value matches `P1_TEXT`
+       * If **no**: Set checkbox group value to `P1_TEXT` only and **disable** it
+
+---
+
+## 🛠️ STEP-BY-STEP SOLUTION
+
+---
+
+### 1. **Default Behavior When `P1_TEXT` is NULL**
+
+Create a **Dynamic Action** on **Page Load**:
+
+* **Name**: "Set Default Checkbox Value"
+* **Event**: Page Load
+* **Condition**: `P1_TEXT IS NULL`
+* **True Action**:
+
+  * Action: **Set Value**
+  * Set Type: **Static Assignment**
+  * Value: `'unit'` (or whatever default value you want)
+  * Affected Item: `P1_CHECKBOX`
+
+---
+
+### 2. **When `P1_TEXT` Changes and is NOT NULL**
+
+Create another **Dynamic Action**:
+
+* **Name**: "Handle Text Change"
+* **Event**: Change
+* **Selection Type**: Item(s)
+* **Item(s)**: `P1_TEXT`
+* **Client-side Condition**: `P1_TEXT is NOT NULL`
+
+---
+
+#### 2.1 **True Action 1** – Check Role and Set Values
+
+Use **PL/SQL** to:
+
+* Check if the user has the role
+* Based on that, return the appropriate value(s) for the checkbox group
+
+**True Action:**
+
+* **Action**: Set Value
+* **Set Type**: **PL/SQL Function Body**
+* **PL/SQL Code**:
+
+```plsql
+DECLARE
+  l_role_exists BOOLEAN;
+  l_value       VARCHAR2(4000);
+BEGIN
+  -- Replace with your role checking logic
+  SELECT COUNT(*) > 0
+  INTO l_role_exists
+  FROM user_roles -- your table for roles
+  WHERE username = :APP_USER AND role_name = 'ADMIN';
+
+  IF l_role_exists THEN
+    -- Example: Return multiple values from a query
+    SELECT LISTAGG(some_column, ':') WITHIN GROUP (ORDER BY some_column)
+    INTO l_value
+    FROM your_table
+    WHERE filter_column = :P1_TEXT;
+  ELSE
+    -- If not authorized, just return the text value
+    l_value := :P1_TEXT;
+  END IF;
+
+  RETURN l_value;
+END;
+```
+
+* **Items to Submit**: `P1_TEXT`
+* **Affected Item**: `P1_CHECKBOX`
+* **Page Items to Return**: `P1_CHECKBOX`
+
+---
+
+#### 2.2 **True Action 2** – Enable/Disable Checkbox Group
+
+* **Action**: Execute JavaScript Code
+* **Code**:
+
+```javascript
+let textVal = $v("P1_TEXT");
+let checkbox = apex.item("P1_CHECKBOX");
+let isAdmin = /* logic to check if admin (see below) */;
+
+if (isAdmin) {
+  checkbox.enable();
+} else {
+  checkbox.disable();
+}
+```
+
+⚠️ **Important**: You’ll need a way to tell the front-end whether the user is admin or not.
+
+---
+
+### 🔄 How to Pass Role Info to Front-End?
+
+#### Option A: Store it in an Application Item (e.g., `G_IS_ADMIN`)
+
+* Set it at login or page load (in a **Before Header Process**):
+
+```plsql
+DECLARE
+  l_exists NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO l_exists FROM user_roles
+  WHERE username = :APP_USER AND role_name = 'ADMIN';
+
+  :G_IS_ADMIN := CASE WHEN l_exists > 0 THEN 'Y' ELSE 'N' END;
+END;
+```
+
+Then in JavaScript:
+
+```javascript
+if ($v("G_IS_ADMIN") === 'Y') {
+  apex.item("P1_CHECKBOX").enable();
+} else {
+  apex.item("P1_CHECKBOX").disable();
+}
+```
+
+#### Option B: Use a Hidden Item on the Page (`P1_IS_ADMIN`) and set it via PL/SQL, then access it from JS.
+
+---
+
+## ✅ Summary
+
+| Situation                                     | Action                                                          |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| `P1_TEXT` is `NULL`                           | Set default value (e.g., "unit") to checkbox group              |
+| `P1_TEXT` is NOT `NULL` and user is admin     | Query values based on text and set checkbox group               |
+| `P1_TEXT` is NOT `NULL` and user is NOT admin | Set checkbox value to only `P1_TEXT` and disable checkbox group |
+
+---
+
+## 🧪 Tip for Testing
+
+* Use debug mode in APEX to see value flows
+* Use `console.log` in JavaScript actions to inspect values
+* Temporarily add a region showing internal items like `P1_IS_ADMIN` or `G_IS_ADMIN`
+
+---
+
+Would you like a working example or template export of this behavior in APEX?
