@@ -1,0 +1,173 @@
+IF l_list_position_ id IS NOT NULL AND l_list_department_id IS NULL AND l_list_unit_id IS NULL AND l_list_uchastok IS NULL THEN
+IF l_list position_id = l_current_user_position_gl THEN
+l_is_position:= true;
+ELSE
+l_is position := false;
+END IF;
+l_is_role := l_is_position;
+ELSIF l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL AND l_list_unit id IS NULL AND l_list_uchastok IS NULL THEN
+IF l_list position_id - l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+IF l_list_department_id = l_current_ user_department_gl THEN
+l_is_department := true;
+ELSE
+l_is_department := false;
+END IF;
+l_is_role := l_is_position AND l_is_department;
+ELSIF l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL AND l_list_ unit_id IS NULL AND l_list_uchastok IS NOT NULL THEN
+IF l_list_position_id = l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+IF l_list department_id = l_current _user_department_gl THEN
+ELSE
+l_is_department := true;
+l_is_department := false;
+END IF;
+IF l_list_uchastok = l_current_user_uchastok_gl THEN
+l_is_uchastok := true;
+ELSE
+l_is_uchastok := false;
+END IF;
+l_is_role := l_is_position AND l_is_department AND l_is_uchastok;
+ELSIF 1_list_position_id IS NOT NULL AND 1_list_department_ id IS NULL AND 1_list_ unit_id IS NOT NULL AND 1_list_ uchastok IS NULL THEN
+IF l_list_position_id = l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+l_is_unit := CASE WHEN :PO_SUBSTITUTION_MODE = 1 AND (INSTR(:PO_NEW_ROLES, 'U_' || l_list_unit_id) > 0) THEN
+TRUE
+WHEN :PO_SUBSTITUTION MODE = = AND APEX_ACL.HAS_USER_ROLE(:APP_ID, :APP_USER, 'U_' || l_list_unit_id) THEN END;
+l_is_role := l_is_position AND l_is_unit;
+
+
+
+
+
+
+
+l_is_role := l_is_position AND l_is_unit;
+ELSIF l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL AND l_list_unit_id IS NOT NULL AND l_list_uchastok IS NOT NULL THEN
+IF l_ist_position_id = l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+IF l_list_department_id = l_current_user_department_gl THEN
+l_is_department := true;
+ELSE
+l_is_department := false;
+END IF;
+IF l_list_uchastok = l_current_user_uchastok_gl THEN
+l_is_uchastok := true;
+ELSE
+l_is_uchastok := false;
+END IF;
+l_is_unit := APEX_ACL.HAS_USER_ROLE (p_application_id => l_application_id,
+p_user_name => v('APP_USER'),
+p_role_static_id => 'U_' || l_list_ unit_id);
+l_is_role := l_is_position AND l_is_department AND l_is_unit AND l_is_uchastok;
+ELSIF l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL AND l_list_unit_id IS NOT NULL AND l_list_uchastok IS NULL THEN IF 1_list_position_id = l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+
+
+
+IF l_list_department_id = l_current_user_department_gl THEN
+l_is_department := true;
+ELSE
+l_is_department := false;
+END IF;
+
+l_is_unit := APEX_ACL.HAS_USER_ROLE (p_application_id => l_application_id,
+p_user_name => v('APP_USER'),
+p_role_static_id => 'U_' || l_list_ unit_id);
+
+l_is_role := l_is_position AND l_is_department AND l_is_unit;
+
+ELSIF l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL AND l_list_unit_id IS NOT NULL THEN
+IF l_list_position_id = l_current_user_position_gl THEN
+l_is_position := true;
+ELSE
+l_is_position := false;
+END IF;
+IF l_list_ department_id = l_current_user_department_gl THEN
+l_is_department := true;
+ELSE
+l_is_department := false;
+END IF;
+
+
+
+l_is_unit := APEX_ACL.HAS_USER_ROLE (p_application_id => l_application_id,
+p_user_name => v('APP_USER'),
+p_role_static_id => 'U_' || l_list_ unit_id);
+
+
+l_is_role := l_is_position AND l_is_department AND l_is_unit;
+ELSIF l_list_position_id IS NULL AND l_list_department_id IS NULL AND l_list_unit_id IS NULL AND l_list_tab_no IS NOT NULL THEN
+IF 1 list_tab_no - 1_current_ user_tabno_gl THEN
+l_is_tabno := true;
+ELSE
+l_is_tabno := false;
+END IF;
+
+
+l_is_role := l_is_tabno;
+ELSIF l_list_position_id IS NULL AND l_list_department_id IS NULL AND l_list_unit_id IS NULL AND l_list_tab_no IS NULL AND l_list_shift IS NOT NULL THEN
+null;
+END IF;
+-- SIGN ANOTHER Person
+IF l_count_cb = 0 THEN
+IF l_list_tabno IS NOT NULL THEN
+
+
+
+
+
+
+select t.kategoria_otiz into l_list_kategoria_otiz from KBS.Personal@To_Tasktracker10 t
+where t.tab_no = l_list_tab_no
+and t.priznak is null;
+ELSIF l_list_tab_no IS NULL AND l_list_position_id IS NOT NULL AND l_list_department_id IS NOT NULL THEN
+select t1.kategoria_otiz
+into l_list_kategoria_otiz from KBS.Personal@To_Tasktracker10 t1 where t1.dolznost  = l_list_position_id and ti.tseh_id = l_list_department_id and t1.priznak is null and rownum = 1;
+ELSE
+l_list_kategoria_otiz: = NULL;
+END IF;
+
+IF TASK_TRACKER_PKG.CAN_SIGN_BY_OTHER_PERSONAL(
+p_signature_user_id => l_list_tab_no,
+p_signature_position_id = l_list_position_id,
+p_signature_department => l_list_department_id,
+p_signature_uchastok => l_list_uchastok,
+p_signature_kategoria => l_list_kategoria_otiz,
+p_cur_position_id => NVL(:PO_NEW_ POSITION ID, :PO_CUR_USER_ POSITION),
+p_cur_department_id => NVL(:PO_NEW_DEPARTMENT_ID, •PO_CUR _USER_ DEPARTMENT),
+p_cur_uchastok => NVL(:PO_NEW_UCHASTOK, :PO_CUR_UCHASTOK),
+p_cur_kategoria => NVL (:PO_NEW_KATEGORIA_OTIZ, :PO_CUR_KATEGORIA_OTIZ)
+) THEN
+HTP.P('‹button type-"button" id="button-sign-by-another" class-"byname-signature-button" data-signature-id="' || l_signature_id || '" <button>');
+END IF;
+END IF;
+
+IF l_is_role AND l_count_cb = 0 THEN
+HTP.P('<button id-"signature-btn" data-signature-id-"'|| l_signature_id || '" class-"confirm-signature-button">' || l_substage_btn_text || '</button>'; 
+l_count_cb := l_count_cb + 1;
+ELSIF l_is_role AND l_count_cb > 0 THEN
+HTP.P('<span class="wait-confirm-signature-text"›Очікує відмітки</span>');
+ELSIF NOT l_is_role AND l_count_cb = 0 THEN
+HTP.P('<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає‹/span>');
+l_count_cb := l_count_cb + 1;
+ELSIF NOT l_is_role AND l_count_cb > 0 THEN
+HTP.P('<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+END IF;
+HTP.P('</div>');
+END IF;

@@ -1,0 +1,325 @@
+Чудово, давай одразу “вшити” логіку ролей і кнопку **«Від імені»** у твій пакет так, щоб:
+
+* кнопки / статуси рендерились строго за твоїми правилами (як у наведеному фрагменті),
+* не ламати існуючу структуру, але мінімально розширити її (додамо `uchastok` і, за потреби, `shift`),
+* HTML генерувався через `append(...)`, а не `htp.p`.
+
+Нижче — готові вставки/заміни. Можеш просто застосувати їх у своєму пакеті.
+
+---
+
+# 1) Розширити курсор колекції у `render_substage_rows`
+
+**Було** (фрагмент курсора `c_list`):
+
+```sql
+cursor c_list is
+  select seq_id,
+         c001 as list_position,
+         c002 as list_department,
+         c003 as list_unit,
+         to_number(c009) as list_position_id,
+         to_number(c010) as list_department_id,
+         to_number(c011) as list_unit_id,
+         to_number(c012) as signature_id,
+         to_number(c008) as list_tab_no,
+         to_number(c014) as task_mode,
+         c015             as subtask_content_opt,
+         to_number(c016) as subtask_id
+  from   apex_collections
+  where  collection_name = 'CONFIRM_CART_'||p_stage_id||'_'||p_substage_id
+  order  by to_number(c006);
+```
+
+**Стало** (додаємо `uchastok` і, опційно, `shift`):
+
+```sql
+cursor c_list is
+  select seq_id,
+         c001 as list_position,
+         c002 as list_department,
+         c003 as list_unit,
+         to_number(c009) as list_position_id,
+         to_number(c010) as list_department_id,
+         to_number(c011) as list_unit_id,
+         to_number(c012) as signature_id,
+         to_number(c008) as list_tab_no,
+         to_number(c014) as task_mode,
+         c015             as subtask_content_opt,
+         to_number(c016) as subtask_id,
+         to_number(c013) as list_uchastok,   -- <== НОВЕ
+         to_number(c017) as list_shift       -- <== за потреби (не впливає на логіку кнопок)
+  from   apex_collections
+  where  collection_name = 'CONFIRM_CART_'||p_stage_id||'_'||p_substage_id
+  order  by to_number(c006);
+```
+
+І додай локальні змінні під це:
+
+```sql
+l_list_uchastok   number;
+l_list_shift      number;
+```
+
+та присвоєння у циклі:
+
+```sql
+l_list_uchastok := r.list_uchastok;
+l_list_shift    := r.list_shift;
+```
+
+---
+
+# 2) Додати утиліту для перевірки ролей (узагальнює твій великий `ELSIF`)
+
+Встав нижче секції “ПЕРЕВІРКА РОЛІ...” **нову** функцію (не видаляючи твою `has_role`; ми її більше не викликатимемо з рендера):
+
+```sql
+function compute_role_match(
+  p_list_position_id    in number,
+  p_list_department_id  in number,
+  p_list_unit_id        in number,
+  p_list_uchastok       in number,
+  p_list_tab_no         in number,
+  p_ctx_position_id     in number,
+  p_ctx_department_id   in number,
+  p_ctx_tabno           in number,
+  p_ctx_uchastok        in number,
+  p_substitution_mode   in number,
+  p_new_roles           in varchar2,
+  p_app_id              in number,
+  p_app_user            in varchar2
+) return boolean
+is
+  l_is_position   boolean := true;
+  l_is_department boolean := true;
+  l_is_unit       boolean := true;
+  l_is_uchastok   boolean := true;
+  l_is_tabno      boolean := true;
+
+  function has_unit_role(p_unit_id number) return boolean is
+  begin
+    if p_unit_id is null then
+      return true;
+    end if;
+
+    if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles,'~'), 'U_'||p_unit_id) > 0;
+    else
+      return apex_acl.has_user_role(p_app_id, p_app_user, 'U_'||p_unit_id);
+    end if;
+  end;
+begin
+  -- Якщо заданий тільки табельний
+  if p_list_position_id is null
+     and p_list_department_id is null
+     and p_list_unit_id is null
+     and p_list_tab_no is not null
+  then
+    l_is_tabno := (p_list_tab_no = p_ctx_tabno);
+    return l_is_tabno;
+  end if;
+
+  -- Випадки за твоєю матрицею (спрощено та без зміни логіки)
+  if p_list_position_id is not null then
+    l_is_position := (p_list_position_id = p_ctx_position_id);
+  end if;
+
+  if p_list_department_id is not null then
+    l_is_department := (p_list_department_id = p_ctx_department_id);
+  end if;
+
+  if p_list_unit_id is not null then
+    l_is_unit := has_unit_role(p_list_unit_id);
+  end if;
+
+  if p_list_uchastok is not null then
+    l_is_uchastok := (p_list_uchastok = p_ctx_uchastok);
+  end if;
+
+  return (l_is_position and l_is_department and l_is_unit and l_is_uchastok);
+end;
+```
+
+> Примітка: ця функція відтворює твою логіку перевірок, включаючи `unit` через ролі `U_{id}` з урахуванням `p_substitution_mode`.
+
+---
+
+# 3) Додати “контекст” для `uchastok` у `render_substage_rows`
+
+Тут у тебе контекст користувача передається зверху як `p_ctx_position_id`, `p_ctx_department_id`, `p_ctx_tabno`. Щоб не розривати інтерфейс усіх викликів, **для uchastok** (і за потреби категорії) візьмемо з сесійних item’ів — так само, як у твоєму фрагменті.
+
+Додай у `render_substage_rows` службові локальні значення:
+
+```sql
+-- поточні контекстні значення з APEX-стейту (без зміни сигнатури функцій)
+l_ctx_uchastok          number := to_number(nullif(v('PO_NEW_UCHASTOK'), ''));
+l_ctx_kategoria_otiz    number := to_number(nullif(v('PO_NEW_KATEGORIA_OTIZ'), ''));
+
+-- фолйбек на "поточні" якщо "нові" порожні
+begin
+  if l_ctx_uchastok is null then
+    l_ctx_uchastok := to_number(nullif(v('PO_CUR_UCHASTOK'), ''));
+  end if;
+  if l_ctx_kategoria_otiz is null then
+    l_ctx_kategoria_otiz := to_number(nullif(v('PO_CUR_KATEGORIA_OTIZ'), ''));
+  end if;
+end;
+```
+
+(Цей блок можна поставити на початку `render_substage_rows`, після відкриття контейнера.)
+
+---
+
+# 4) Заміна блоку “кнопка/статус” у `render_substage_rows`
+
+**Заміни** весь блок, де зараз викликається `has_role(...)` і рендериться кнопка/тексти статусів, на наступний:
+
+```sql
+-- Чи є підпис (історія) -- (залишається як було вище)
+l_have_sign := has_any_signature(l_signature_id);
+
+if l_have_sign = 'Y' then
+  -- (твій існуючий блок показу історії + статусів «Анульовано / успіх» — лишаємо без змін)
+  ...
+else
+  -- Немає підпису → показуємо або кнопки, або статуси
+  append(p_buf, '<div class="c-cart-date-time"></div>');
+  append(p_buf, '<div class="c-cart-pib"></div>');
+  append(p_buf, '<div class="c-cart-signer-comment"></div>');
+
+  append(p_buf, '<div class="c-cart-signer-mark">');
+
+  declare
+    l_is_role             boolean := false;
+    l_list_kategoria_otiz number;
+    -- для CAN_SIGN_BY_OTHER_PERSONAL
+    l_cur_position_id     number := nvl(to_number(nullif(v('PO_NEW_POSITION_ID'), '')),  p_ctx_position_id);
+    l_cur_department_id   number := nvl(to_number(nullif(v('PO_NEW_DEPARTMENT_ID'), '')),p_ctx_department_id);
+    l_cur_uchastok        number := nvl(to_number(nullif(v('PO_NEW_UCHASTOK'), '')),     l_ctx_uchastok);
+    l_cur_kategoria       number := nvl(to_number(nullif(v('PO_NEW_KATEGORIA_OTIZ'), '')),l_ctx_kategoria_otiz);
+    l_can_byname          boolean := false;
+  begin
+    -- 4.1 Перевірка ролі (нова матриця)
+    l_is_role := compute_role_match(
+      p_list_position_id    => l_list_position_id,
+      p_list_department_id  => l_list_department_id,
+      p_list_unit_id        => l_list_unit_id,
+      p_list_uchastok       => l_list_uchastok,
+      p_list_tab_no         => l_list_tab_no,
+      p_ctx_position_id     => p_ctx_position_id,
+      p_ctx_department_id   => p_ctx_department_id,
+      p_ctx_tabno           => p_ctx_tabno,
+      p_ctx_uchastok        => l_ctx_uchastok,
+      p_substitution_mode   => p_substitution_mode,
+      p_new_roles           => p_new_roles,
+      p_app_id              => p_app_id,
+      p_app_user            => p_app_user
+    );
+
+    -- 4.2 Підтягнути категорію ОТіЗ виконавця для "Від імені"
+    if l_count_cb = 0 then
+      if l_list_tab_no is not null then
+        begin
+          select t.kategoria_otiz
+            into l_list_kategoria_otiz
+            from kbs.personal@to_tasktracker10 t
+           where t.tab_no = l_list_tab_no
+             and t.priznak is null;
+        exception when no_data_found then
+          l_list_kategoria_otiz := null;
+        end;
+      elsif l_list_tab_no is null and l_list_position_id is not null and l_list_department_id is not null then
+        begin
+          select t1.kategoria_otiz
+            into l_list_kategoria_otiz
+            from kbs.personal@to_tasktracker10 t1
+           where t1.dolznost = l_list_position_id
+             and t1.tseh_id  = l_list_department_id
+             and t1.priznak is null
+             and rownum = 1;
+        exception when no_data_found then
+          l_list_kategoria_otiz := null;
+        end;
+      else
+        l_list_kategoria_otiz := null;
+      end if;
+
+      -- 4.3 Перевірка права підпису "Від імені"
+      begin
+        l_can_byname := task_tracker_pkg.can_sign_by_other_personal(
+          p_signature_user_id   => l_list_tab_no,
+          p_signature_position_id => l_list_position_id,
+          p_signature_department  => l_list_department_id,
+          p_signature_uchastok    => l_list_uchastok,
+          p_signature_kategoria   => l_list_kategoria_otiz,
+          p_cur_position_id       => l_cur_position_id,
+          p_cur_department_id     => l_cur_department_id,
+          p_cur_uchastok          => l_cur_uchastok,
+          p_cur_kategoria         => l_cur_kategoria
+        );
+      exception when others then
+        l_can_byname := false;
+      end;
+
+      if l_can_byname then
+        append(p_buf,
+          '<button type="button" id="button-sign-by-another" '||
+          'class="byname-signature-button" data-signature-id="'||l_signature_id||'">Від імені</button>');
+      end if;
+    end if;
+
+    -- 4.4 Основна кнопка / статуси
+    if l_is_role and l_count_cb = 0 then
+      append(p_buf,
+        '<button id="signature-btn" data-signature-id="'|| l_signature_id ||
+        '" class="confirm-signature-button">'|| h(p_substage_btn_text) || '</button>');
+      l_count_cb := l_count_cb + 1;
+
+    elsif l_is_role and l_count_cb > 0 then
+      append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+
+    elsif (not l_is_role) and l_count_cb = 0 then
+      append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+      l_count_cb := l_count_cb + 1;
+
+    else
+      append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+    end if;
+
+  end; -- declare
+
+  append(p_buf, '</div>'); -- .c-cart-signer-mark
+end if; -- немає підпису
+```
+
+Це рівно відтворює твою послідовність: **(а)** спершу (один раз на блок) друкуємо «Від імені», якщо дозволено; **(б)** далі — основна кнопка/статуси залежно від матчу ролей і `l_count_cb`.
+
+---
+
+# 5) (Опціонально) Протягнути `uchastok`/`kategoria` у верхній `render(...)`
+
+Щоб зовсім не залежати від `v('PO_*')`, можна додати параметри до `render(...)` і пробросити їх у `render_substage_rows(...)`. Але це тягне зміну сигнатур і місць виклику. Я залишив варіант **без зміни публічних параметрів**: ми зчитуємо `PO_NEW_*` / `PO_CUR_*` із сесії (як у твоєму прикладі). Якщо хочеш — скажи, підготую версію з явними параметрами.
+
+---
+
+# 6) CSS/JS — без змін
+
+Класи:
+
+* `.byname-signature-button` — для «Від імені»
+* `.confirm-signature-button` — основна кнопка
+* `.wait-confirm-signature-text` / `...-current` — як і було
+
+Подальша робота з JS (відкриття модалки вибору ПІБ “від імені” тощо) лишається такою самою: у кнопки є `data-signature-id`.
+
+---
+
+## Підсумок
+
+* Додали `uchastok` до колекції (`c013`) і врахували його в перевірках.
+* Уніфікували логіку ролей у `compute_role_match(...)` відповідно до твого `ELSIF`-ланцюга.
+* Додали генерацію кнопки **«Від імені»** з викликом `TASK_TRACKER_PKG.CAN_SIGN_BY_OTHER_PERSONAL(...)`.
+* Перенесли весь блок рендеру кнопок/статусів у нову послідовність.
+
+Якщо хочеш — можу швидко дати повний оновлений пакет `confirm_cart_pkg` у цілому вигляді (щоб просто `replace` і скомпілювати).
