@@ -1,0 +1,25 @@
+Ось готова умова (PL/SQL Expression) для Server-side Condition, що працює і для звичайної ролі, і для заміщення через `P0_NEW_USER_ROLE`:
+
+```sql
+(:APP_PAGE_ID IN (1,8))
+AND
+(
+  /* режим заміщення: ролі беремо з P0_NEW_USER_ROLE (формат R_5:R_6) */
+  (NVL(:PO_SUBSTITUTION_MODE,0) = 1
+   AND INSTR(':'||NVL(:P0_NEW_USER_ROLE,'')||':', ':R_5:') > 0)
+
+  OR
+
+  /* звичайний режим: перевірка через APEX ACL */
+  (NVL(:PO_SUBSTITUTION_MODE,0) <> 1
+   AND APEX_ACL.HAS_USER_ROLE(:APP_ID, :APP_USER, 'R_5'))
+)
+```
+
+Пояснення коротко:
+
+* `:APP_PAGE_ID IN (1,8)` — як і було.
+* В режимі заміщення дивимось у `:P0_NEW_USER_ROLE`, де ролі зберігаються як `R_5:R_6`. Пошук робимо безпечно через роздільники: `INSTR(':'||roles||':', ':R_5:') > 0`, щоб не зловити `R_50`.
+* В іншому випадку — стандартна перевірка `APEX_ACL.HAS_USER_ROLE`.
+
+Якщо `:PO_SUBSTITUTION_MODE` у тебе інший (наприклад, `1/0` або `Y/N`), заміни порівняння відповідно.

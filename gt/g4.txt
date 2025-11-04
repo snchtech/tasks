@@ -1,0 +1,169 @@
+Крута ідея. Є два робочі шляхи, але найнадійніший для «бекупу в папку, що під Git» — **писати файли з БД через `UTL_FILE` у директорію, яку бачить сам сервер БД**, і яка (через мережевий шаринг/NFS) **відповідає вашій локальній git-теці**. Далі просто `git add/commit/push`.
+
+Нижче — готовий набір скриптів і кроків.
+
+---
+
+# ✅ Крок 0. Підготуйте директорію для файлів
+
+1. На **сервері БД** (або змонтуйте мережеву теку, що вказує на ваш локальний git-репозиторій):
+
+* Linux: змонтуйте CIFS/NFS у, наприклад, `/u01/git/apex-repo/db`.
+* Windows (DB-сервер): створіть спільну теку, напр. `D:\git\apex-repo\db`.
+
+2. Створіть в Oracle об’єкт DIRECTORY і дайте права:
+
+```sql
+-- Під SYS або з правами CREATE ANY DIRECTORY
+CREATE OR REPLACE DIRECTORY GIT_DIR AS '/u01/git/apex-repo/db';  -- або 'D:\git\apex-repo\db'
+GRANT READ, WRITE ON DIRECTORY GIT_DIR TO YOUR_SCHEMA;
+```
+
+> Важливо: `UTL_FILE` пише **на файлову систему сервера БД**, а не вашого ПК. Тому або запускайте БД локально, або дайте серверу БД доступ до вашої git-теки як до мережевого шару.
+
+---
+
+# ✅ Крок 1. Експорт DDL для пакетів, процедур, функцій, тригерів, в’юшок, секвенсів
+
+Скопіюйте й запустіть у PL/SQL Developer (SQL Window):
+
+```sql
+-- Експорт DDL об'єктів у окремі .sql файли в DIRECTORY GIT_DIR
+DECLARE
+  -- універсальний writer для CLOB → файл
+  PROCEDURE write_clob(p_dir IN VARCHAR2, p_filename IN VARCHAR2, p_clob IN CLOB) IS
+    l_fh    UTL_FILE.FILE_TYPE;
+    l_pos   PLS_INTEGER := 1;
+    l_chunk VARCHAR2(32767);
+    l_len   PLS_INTEGER := DBMS_LOB.GETLENGTH(p_clob);
+  BEGIN
+    l_fh := UTL_FILE.FOPEN(p_dir, p_filename, 'w', 32767);
+    WHILE l_pos <= l_len LOOP
+      l_chunk := DBMS_LOB.SUBSTR(p_clob, 32000, l_pos);
+      UTL_FILE.PUT(l_fh, l_chunk);
+      l_pos := l_pos + 32000;
+    END LOOP;
+    UTL_FILE.NEW_LINE(l_fh);
+    UTL_FILE.FCLOSE(l_fh);
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF UTL_FILE.IS_OPEN(l_fh) THEN UTL_FILE.FCLOSE(l_fh); END IF;
+      RAISE;
+  END;
+
+  -- вивантаження одного об'єкта
+  PROCEDURE export_one(p_owner IN VARCHAR2, p_name IN VARCHAR2, p_type IN VARCHAR2) IS
+    l_ddl CLOB;
+    l_file VARCHAR2(4000);
+  BEGIN
+    -- Налаштовуємо вигляд DDL (без STORAGE/SEGMENT, з крапкою з комою)
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'STORAGE',          FALSE);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SEGMENT_ATTRIBUTES',FALSE);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'CONSTRAINTS',       TRUE);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'REF_CONSTRAINTS',   TRUE);
+    DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SQLTERMINATOR',     TRUE);
+
+    IF p_type = 'PACKAGE' THEN
+      -- spec
+      l_ddl  := DBMS_METADATA.GET_DDL('PACKAGE_SPEC', p_name, p_owner);
+      l_file := 'package_spec.'||LOWER(p_owner)||'.'||LOWER(p_name)||'.sql';
+      write_clob('GIT_DIR', l_file, l_ddl);
+      -- body
+      l_ddl  := DBMS_METADATA.GET_DDL('PACKAGE_BODY', p_name, p_owner);
+      l_file := 'package_body.'||LOWER(p_owner)||'.'||LOWER(p_name)||'.sql';
+      write_clob('GIT_DIR', l_file, l_ddl);
+    ELSIF p_type IN ('PROCEDURE','FUNCTION','TRIGGER','VIEW','SEQUENCE','TYPE','SYNONYM') THEN
+      l_ddl  := DBMS_METADATA.GET_DDL(p_type, p_name, p_owner);
+      l_file := LOWER(p_type)||'.'||LOWER(p_owner)||'.'||LOWER(p_name)||'.sql';
+      write_clob('GIT_DIR', l_file, l_ddl);
+    END IF;
+  END;
+
+  -- >>> ВКАЗАТИ СВОГО ВЛАСНИКА (схему) ТУТ <<<
+  c_owner VARCHAR2(128) := UPPER(:p_owner); -- у PL/SQL Developer можна ввести значення bind-parameter
+
+BEGIN
+  FOR r IN (
+    SELECT owner, object_name, object_type
+    FROM   all_objects
+    WHERE  owner = c_owner
+       AND object_type IN ('PACKAGE','PROCEDURE','FUNCTION','TRIGGER','VIEW','SEQUENCE','TYPE','SYNONYM')
+       AND status = 'VALID'
+    ORDER BY object_type, object_name
+  ) LOOP
+    export_one(r.owner, r.object_name, r.object_type);
+  END LOOP;
+END;
+/
+```
+
+**Що отримаєте:** у каталозі `GIT_DIR` з’являться файли на кшталт:
+
+```
+package_spec.MYSCHEMA.auth_pkg.sql
+package_body.MYSCHEMA.auth_pkg.sql
+view.MYSCHEMA.v_users.sql
+function.MYSCHEMA.calc_score.sql
+trigger.MYSCHEMA.t_users_bi.sql
+...
+```
+
+Після цього — у вашій git-теці: `git add . && git commit -m "Export DDL" && git push`.
+
+---
+
+# ✅ Крок 2. Експорт APEX (опційно — додайте до того ж каталогу)
+
+Якщо потрібно ще й **вивантажувати APEX-апку** у файл `f<APP_ID>.sql` (або за сторінками — split), використайте `APEX_EXPORT`:
+
+```sql
+-- Експорт всієї аплікації APEX в один файл f<APP_ID>.sql
+DECLARE
+  l_files  apex_t_export_files;
+  l_zip    BLOB;
+  l_sql    CLOB;
+  l_app_id NUMBER := :p_app_id; -- введіть APP_ID
+BEGIN
+  -- Повний експорт як SQL (не ZIP):
+  l_files := APEX_EXPORT.GET_APPLICATION(p_application_id => l_app_id);
+  -- У файлах буде один елемент із .sql (якщо не просили split), беремо перший
+  FOR i IN 1..l_files.COUNT LOOP
+    IF l_files(i).filename LIKE 'f%.sql' THEN
+      UTL_FILE.PUT_RAW(
+        UTL_FILE.FOPEN('GIT_DIR', l_files(i).filename, 'wb', 32767),
+        UTL_RAW.CAST_TO_RAW(l_files(i).contents)
+      );
+      UTL_FILE.FCLOSE_ALL;
+    END IF;
+  END LOOP;
+END;
+/
+```
+
+> Хочете **split-експорт по сторінках/компонентах** — замість `GET_APPLICATION` використовуйте інші процедури `APEX_EXPORT` (або APEXExport (Java) у CI/на сервері), що збережуть багато `.sql` файлів — так у Git видно дифи по сторінках.
+
+---
+
+# ✅ Крок 3. Як запускати в PL/SQL Developer
+
+1. Відкрийте **SQL Window**, підключіться під схемою-власником (або користувачем із SELECT ANY DICTIONARY + доступом до DIRECTORY).
+2. Виконайте `CREATE DIRECTORY` + `GRANT` (разово).
+3. Запустіть блок із **Кроку 1** (вкажіть `:p_owner`).
+4. (Опційно) Запустіть блок із **Кроку 2** (вкажіть `:p_app_id`).
+5. Перейдіть у вашу папку репозиторію — там уже лежать *.sql файли → **commit/push**.
+
+---
+
+## Поради
+
+* Щоби дифи були чистішими, ми вимкнули `STORAGE` і `SEGMENT_ATTRIBUTES` та увімкнули `SQLTERMINATOR`. За потреби додайте інші трансформації: `EMIT_SCHEMA`, `PRETTY` тощо.
+* Для **міграцій** тримайте окрему теку `db/migrations/` і запускайте їх у CI перед імпортом APEX.
+* Якщо БД на Linux, а ваша git-тека — на Windows-ПК, найпростіше дати серверу БД доступ до вашої теки як **мережевого шару** (CIFS/NFS) і змонтувати його в ОС сервера БД; тоді `GIT_DIR` вказує саме туди.
+
+---
+
+Хочеш — під твоє середовище піджену:
+
+* зроблю варіант для **split-експорту APEX** у файли сторінок;
+* підкажу, як **змонтувати мережеву теку** так, щоб `GIT_DIR` прямо писав у ваш локальний репозиторій;
+* або дам **версію для SQLcl**, якщо зручніше запускати це з клієнта і писати одразу на локальний диск без UTL_FILE.

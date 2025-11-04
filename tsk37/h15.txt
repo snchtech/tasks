@@ -1,0 +1,103 @@
+Ось готовий фрагмент, який додає ваше правило:
+
+* якщо **для stage = 2** немає «незакритих» `signaturerights` (усі мають запис у `signaturehistory`), **і** останній (за часом) запис у `signaturehistory` для stage = 2 має `new_status_id = 13`, то для завдання ставимо **статус 15**;
+* інакше — працює ваша попередня логіка (беремо статус з останнього підетапу за `MAX(stages_id)`; якщо його немає — fallback на `st`).
+
+> У коді нижче припускаю, що у вашому `SELECT` вже приєднана таблиця ( або view ) зі “статусом за замовчуванням” як `st.id / st.name`, а основна таблиця завдань — `t`.
+
+```sql
+/* === ЕФЕКТИВНИЙ СТАТУС ДЛЯ ВИВОДУ (ID і NAME) === */
+WITH
+  -- SR тільки stage = 2 по поточному завданню
+  sr2 AS (
+    SELECT r.task_id, r.id AS signright_id, r.stages_id
+    FROM   TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r
+    WHERE  r.task_id = t.id
+      AND  r.stages_id = 2
+  ),
+  -- Чи є "незакриті" SR (без жодного запису у history із NEW_STATUS_ID)
+  open_sr2 AS (
+    SELECT 1 AS flg
+    FROM   sr2 r
+    WHERE  NOT EXISTS (
+             SELECT 1
+             FROM   TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h
+             WHERE  h.signright_id = r.signright_id
+             AND    h.new_status_id IS NOT NULL
+           )
+    FETCH FIRST 1 ROW ONLY
+  ),
+  -- Останній (за часом) статус у history для stage = 2
+  last_h2 AS (
+    SELECT new_status_id
+    FROM (
+      SELECT h.new_status_id,
+             ROW_NUMBER() OVER (ORDER BY h.sdate DESC, h.id DESC) AS rn
+      FROM   TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h
+      JOIN   sr2 r ON r.signright_id = h.signright_id
+      WHERE  h.new_status_id IS NOT NULL
+    )
+    WHERE rn = 1
+  ),
+  -- Ваша базова логіка (останній статус за MAX(stages_id) по всіх stage)
+  base_status AS (
+    SELECT s2.id AS status_id
+    FROM   TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h
+    JOIN   TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r
+           ON r.id = h.signright_id AND r.task_id = t.id
+    JOIN   TaskTracker.DICT_STATUS@TO_Tasktracker10 s2
+           ON s2.id = h.new_status_id
+    WHERE  h.new_status_id IS NOT NULL
+      AND  r.task_id = t.id
+      AND  r.stages_id = (
+             SELECT MAX(r2.stages_id)
+             FROM   TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h2
+             JOIN   TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r2
+                    ON r2.id = h2.signright_id
+             WHERE  r2.task_id = r.task_id
+             AND    h2.new_status_id IS NOT NULL
+           )
+    FETCH FIRST 1 ROW ONLY
+  ),
+  -- Остаточний (ефективний) статус ID з урахуванням правила "13 -> 15" для stage=2
+  effective_status AS (
+    SELECT CASE
+             WHEN NVL((SELECT COUNT(*) FROM open_sr2), 0) = 0
+                  AND (SELECT new_status_id FROM last_h2) = 13
+               THEN 15
+             ELSE NVL((SELECT status_id FROM base_status), st.id)
+           END AS status_id
+    FROM   dual
+  )
+SELECT ds.name AS status_name
+FROM   effective_status es
+JOIN   TaskTracker.DICT_STATUS@TO_Tasktracker10 ds
+       ON ds.id = es.status_id
+```
+
+### Як інтегрувати у ваш `SELECT`
+
+1. Замість попереднього фрагмента:
+
+```sql
+COALESCE(
+  (SELECT s2.name ... FETCH FIRST ROW ONLY),
+  st.name
+) AS status_name
+```
+
+вставте наведений вище `WITH ... SELECT ds.name AS status_name`.
+
+2. Якщо у вас у вибірці потрібен **ID** статусу — просто витягніть його з CTE:
+
+```sql
+, (SELECT status_id FROM effective_status) AS status_id
+, (SELECT ds.name   FROM effective_status es
+     JOIN TaskTracker.DICT_STATUS@TO_Tasktracker10 ds ON ds.id = es.status_id) AS status_name
+```
+
+### Нотатки
+
+* Сортування «останнього» у `last_h2` йде по `h.sdate DESC, h.id DESC`. За потреби замініть на ваш «канонічний» критерій останнього запису.
+* Якщо хочете мінімізувати повторні підзапити, можна завернути все у загальний `WITH` для всього вашого `SELECT` і звертатися до `effective_status` один раз.
+* Логіка «є незакриті SR у stage=2» (`open_sr2`) має пріоритет: тільки коли **жодного** «відкритого» немає, і «останній» у stage=2 — `13`, тоді йдемо у статус `15`.

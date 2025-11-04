@@ -1,0 +1,65 @@
+Ось охайна версія твого блоку з урахуванням заміщення (через `user_ctx`) і виправленими неточностями:
+
+```plsql
+DECLARE
+  v_symbol_id  NUMBER;
+  v_number_id  NUMBER;
+  v_time_start DATE;
+  v_time_end   DATE;
+  v_logger_id  NUMBER;
+BEGIN
+  WITH user_ctx AS (
+    SELECT CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0) = 1
+                THEN :PO_NEW_USER_TABNO
+                ELSE :P0_CUR_USER_TABNO
+           END AS tab_no
+    FROM dual
+  )
+  SELECT l.id,
+         l.shift_symbol_id,
+         l.shift_number_id,
+         /* якщо TIME_START/END у таблиці типу DATE — лишаємо як є: */
+         l.time_start,
+         l.time_end
+  INTO   v_logger_id, v_symbol_id, v_number_id, v_time_start, v_time_end
+  FROM   asics.shift_personal_logger@to_tasktracker10 l
+  CROSS JOIN user_ctx u
+  WHERE  l.tab_no   = u.tab_no
+    AND  l.date_end IS NULL
+    /* SYSDATE вже DATE, тож порівнюємо напряму: */
+    AND  SYSDATE BETWEEN l.time_start AND l.time_end
+  ORDER BY l.time_start DESC
+  FETCH FIRST 1 ROW ONLY;
+
+  -- далі твоя логіка використання v_* змінних...
+
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    v_symbol_id  := NULL;
+    v_number_id  := NULL;
+    v_time_start := NULL;
+    v_time_end   := NULL;
+    v_logger_id  := NULL;
+    -- за потреби: повідомлення/лог або залишити тихо
+END;
+/
+```
+
+### Якщо `TIME_START` / `TIME_END` зберігаються як `VARCHAR2`
+
+Тоді заміни блок вибірки дат на конвертацію з маскою (і для `SELECT`, і для умови):
+
+```plsql
+TO_DATE(l.time_start, 'DD.MM.YYYY HH24:MI') AS time_start,
+TO_DATE(l.time_end,   'DD.MM.YYYY HH24:MI') AS time_end
+...
+AND SYSDATE BETWEEN TO_DATE(l.time_start, 'DD.MM.YYYY HH24:MI')
+                AND TO_DATE(l.time_end,   'DD.MM.YYYY HH24:MI')
+```
+
+> Ключові зміни:
+>
+> * Враховано заміщення: ефективний `tab_no` береться з `:PO_NEW_USER_TABNO` або `:P0_CUR_USER_TABNO`.
+> * Прибрано зайві `TO_DATE(SYSDATE, ...)`.
+> * Виправлені імена змінних та синтаксичні помилки.
+> * Додано обробку `NO_DATA_FOUND`.

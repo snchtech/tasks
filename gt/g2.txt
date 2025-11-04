@@ -1,0 +1,160 @@
+Класне запитання! Ось практичний спосіб, як **вписати GitLab у процес розробки Oracle APEX** — від збереження артефактів до CI/CD і код-рев’ю.
+
+# 1) Що саме з APEX варто зберігати в GitLab
+
+* **Експорт застосунку APEX**
+
+  * як **один файл** `f<APP_ID>.sql` (швидко ставити на інші середовища);
+  * або **“split export” (розбиття на сторінки/компоненти)** — зручно порівнювати зміни в MR.
+* **SQL/PLSQL схемні зміни**: `db/migrations/*.sql` (таблиці, пакети, представлення).
+* **Статичні файли (JS/CSS/зображення)**: `apex/static/*` + будь-які фронтенд-білди.
+* **Тести** (utPLSQL), утиліти, скрипти деплою: `tests/*`, `scripts/*`.
+* **Документація/процеси**: README, інструкції, стандарти коміту.
+
+# 2) Робочий цикл з GitLab (для команди)
+
+1. Розробник створює **гілку** (`feature/...`) і робить зміни в APEX/SQL.
+2. Експортує APEX (single або split) → комітить у репо.
+3. Створює **Merge Request** → **code review** (видно дифи сторінок/SQL).
+4. Після схвалення MR тригериться **pipeline**: тести → міграції → імпорт APEX → smoke-перевірки.
+5. Релізи логуються в **GitLab Releases/Tags**, артефакти зберігаються як **Artifacts**.
+
+# 3) Мінімальна структура репозиторію
+
+```
+apex/
+  app/
+    f123.sql              # або split-експорт у підпапках
+  static/                 # JS/CSS/зображення
+db/
+  migrations/             # DDL/DML скрипти по версіях
+tests/
+  utplsql/                # тести
+scripts/
+  install_apex.sql        # імпорт застосунку через APEX_APPLICATION_INSTALL
+  run_migrations.sql
+.gitlab-ci.yml
+README.md
+```
+
+# 4) Імпорт APEX у pipeline (ядро деплою)
+
+Класична послідовність через **SQLcl**:
+
+```sql
+-- scripts/install_apex.sql
+set serveroutput on
+whenever sqlerror exit 1
+begin
+  apex_application_install.set_workspace('YOUR_WORKSPACE');
+  apex_application_install.set_application_id(123);
+  apex_application_install.set_application_alias('MY_APP');
+  apex_application_install.set_schema('PARSING_SCHEMA');
+  apex_application_install.set_auto_install_sup_obj(true); -- за потреби
+end;
+/
+@@apex/app/f123.sql
+```
+
+# 5) Приклад простого `.gitlab-ci.yml` (Dev → Test → Prod)
+
+```yaml
+stages: [test, deploy]
+
+variables:
+  ORACLE_HOME: "/opt/oracle"
+  # У GitLab → Settings → CI/CD → Variables:
+  # DB_USER, DB_PASS, DB_TNS (masked, protected)
+  # APEX_WORKSPACE, APP_ID, APP_ALIAS, PARSING_SCHEMA
+
+image: ghcr.io/your-org/sqlcl:latest   # образ з встановленим SQLcl
+
+before_script:
+  - echo "Connecting to Oracle via SQLcl"
+
+test:utplsql:
+  stage: test
+  script:
+    - sql -s /nolog <<'SQL'
+      connect ${DB_USER}/${DB_PASS}@${DB_TNS}
+      set serveroutput on
+      whenever sqlerror exit 1
+      @tests/utplsql/run_all.sql
+      SQL
+  artifacts:
+    when: always
+    paths: [ tests/utplsql/report/* ]
+  only: [ merge_requests, branches ]
+
+deploy:dev:
+  stage: deploy
+  environment:
+    name: dev
+  script:
+    - sql -s /nolog <<'SQL'
+      connect ${DB_USER}/${DB_PASS}@${DB_TNS}
+      whenever sqlerror exit 1
+      @db/migrations/apply_all.sql
+      begin
+        apex_application_install.set_workspace('${APEX_WORKSPACE}');
+        apex_application_install.set_application_id(${APP_ID});
+        apex_application_install.set_application_alias('${APP_ALIAS}');
+        apex_application_install.set_schema('${PARSING_SCHEMA}');
+      end;
+      /
+      @apex/app/f${APP_ID}.sql
+      SQL
+  only: [ main ]
+  when: on_success
+
+deploy:test:
+  stage: deploy
+  environment:
+    name: test
+  script:
+    - # аналогічно, але інші креденшіали/ТNS через Variables
+  when: manual
+  only: [ tags ]
+
+deploy:prod:
+  stage: deploy
+  environment:
+    name: production
+    url: https://your-prod-url
+  script:
+    - # як вище, з prod-секретами + manual approval
+  when: manual
+  only: [ tags ]
+```
+
+# 6) Керування міграціями БД
+
+* Тримайте **міграції атомарними і впорядкованими** (001_..., 002_...).
+* Один агрегуючий скрипт `db/migrations/apply_all.sql` викликає їх по черзі.
+* За бажанням — **Liquibase** або власна таблиця-журнал застосованих міграцій.
+
+# 7) Тести й якість
+
+* **utPLSQL** для PL/SQL-пакетів (покриття, звіти в артефакти).
+* **Статичний аналіз** (наприклад, SonarQube + плагін для PL/SQL).
+* Лінтери/форматери для JS/CSS статичних файлів APEX.
+
+# 8) Секрети та безпека в GitLab
+
+* **CI/CD Variables**: `DB_USER`, `DB_PASS`, `DB_TNS`, `APEX_*` — як **masked + protected**.
+* Відокремлюйте **environments** (dev/test/prod) і використовуйте **manual jobs** для прод-деплою.
+
+# 9) Практичні поради
+
+* Для зручних дифів — **split export** або принаймні стабілізуйте експорт (вимикайте “export date/time”, якщо можливо), щоб не “шуміли” коміти.
+* Виносьте **конфіг у змінні середовища** (aliases, schema), а не хардкодьте у `f*.sql`.
+* Тримайте **одну “джерельну” правду**: або розробники експортять з DEV і пушать у Git, або деплой генерує артефакт з main.
+* Для статичних файлів (і APEX темплейтів) — ведіть окремі папки, щоб MR чітко показували фронтенд-зміни.
+
+---
+
+Хочеш — під твою інфраструктуру піджену:
+
+* готовий **Docker-образ GitLab Runner** із SQLcl;
+* **скелет репозиторію** (із split-експортом);
+* або **повний .gitlab-ci.yml** з трьома середовищами, утилітами й звітами utPLSQL.

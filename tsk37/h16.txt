@@ -1,0 +1,65 @@
+Так, можна без `WITH`. Ось компактний варіант прямо в `SELECT`, лише скалярні підзапити:
+
+```sql
+CASE
+  /* Умова правила: для stage=2 НІМАЄ «відкритих» SR і останній статус у history = 13 */
+  WHEN NOT EXISTS (
+         SELECT 1
+         FROM TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r2
+         WHERE r2.task_id = t.id
+           AND r2.stages_id = 2
+           AND NOT EXISTS (
+                 SELECT 1
+                 FROM TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h2
+                 WHERE h2.signright_id = r2.id
+                   AND h2.new_status_id IS NOT NULL
+               )
+       )
+       AND NVL((
+         SELECT new_status_id
+         FROM (
+           SELECT h.new_status_id
+           FROM TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h
+           JOIN TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r
+             ON r.id = h.signright_id
+           WHERE r.task_id = t.id
+             AND r.stages_id = 2
+             AND h.new_status_id IS NOT NULL
+           ORDER BY h.sdate DESC, h.id DESC
+         )
+         WHERE ROWNUM = 1
+       ), -1) = 13
+  THEN (SELECT s15.name
+        FROM TaskTracker.DICT_STATUS@TO_Tasktracker10 s15
+        WHERE s15.id = 15)
+
+  /* Інакше — базова логіка «останній статус за MAX(stages_id)» або fallback на st.name */
+  ELSE COALESCE(
+         (SELECT s2.name
+          FROM TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h
+          JOIN TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r
+            ON r.id = h.signright_id AND r.task_id = t.id
+          JOIN TaskTracker.DICT_STATUS@TO_Tasktracker10 s2
+            ON s2.id = h.new_status_id
+          WHERE h.new_status_id IS NOT NULL
+            AND r.stages_id = (
+                  SELECT MAX(r3.stages_id)
+                  FROM TaskTracker.SIGNATUREHISTORY@TO_Tasktracker10 h3
+                  JOIN TaskTracker.SIGNATURERIGHTS@TO_Tasktracker10 r3
+                    ON r3.id = h3.signright_id
+                  WHERE r3.task_id = r.task_id
+                    AND h3.new_status_id IS NOT NULL
+                )
+          FETCH FIRST 1 ROW ONLY
+         ),
+         st.name
+       )
+END AS status_name
+```
+
+Пояснення коротко:
+
+* Перша гілка `WHEN ... THEN` спрацьовує тільки якщо для `stage=2` **всі** SR мають запис у `SIGNATUREHISTORY` (тобто немає «відкритих») **і** останній запис має `new_status_id = 13` — тоді повертаємо назву статусу `15`.
+* В іншому випадку — твоя попередня логіка з «останнім статусом за максимальним `stages_id`», із запасним варіантом `st.name`.
+
+Якщо захочеш ще й ID виводити, можу дати такий самий inline-варіант для `status_id`. Для продуктивності переконайся, що є індекси на `SIGNATUREHISTORY(signright_id, new_status_id, sdate)` і `SIGNATURERIGHTS(task_id, stages_id)`.

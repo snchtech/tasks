@@ -1,0 +1,106 @@
+Ось акуратний варіант запиту з новою логікою “зміни”:
+
+* беремо **усі завдання**, що:
+
+  1. **починаються в інтервалі зміни** (`planning_date_start BETWEEN shift_start AND shift_end`), **або**
+  2. **закінчуються в інтервалі зміни** (`planning_date_end BETWEEN shift_start AND shift_end`), **або**
+  3. **мають у SIGNATURERIGHTS** запис із `shift_symbol_id = :P0_EFFECTIVE_SHIFT_SYMBOL_ID` (визначається з урахуванням заміщення).
+
+* додаємо до CTE обчислення **effective_shift_symbol_id** із двох айтемів: `:P0_CURRENT_SHIFT_SYMBOL_ID` і `:P0_NEW_CURRENT_SHIFT_SYMBOL_ID`.
+
+> Примітка: якщо `:P0_SHIFT_START` / `:P0_SHIFT_END` — тип DATE, прибери `TO_DATE(...)`. Якщо це рядки — лишай `TO_DATE` з маскою.
+
+```sql
+WITH user_ctx AS (
+    SELECT
+        CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_TABNO      ELSE :PO_CUR_USER_TABNO      END AS user_id,
+        CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID     ELSE :PO_CUR_USER_POSITION   END AS position_id,
+        CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID   ELSE :PO_CUR_USER_DEPARTMENT END AS department_id,
+        CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID         ELSE :PO_CUR_USER_UNIT       END AS unit_id
+    FROM dual
+),
+shift_ctx AS (
+    SELECT
+        -- Якщо у тебе айтеми з типом DATE, заміни на просто :P0_SHIFT_START / :P0_SHIFT_END без TO_DATE
+        TO_DATE(:P0_SHIFT_START, 'DD.MM.YYYY HH24:MI') AS shift_start,
+        TO_DATE(:P0_SHIFT_END,   'DD.MM.YYYY HH24:MI') AS shift_end,
+        /* Ефективний (поточний) символ зміни з урахуванням заміщення */
+        CASE
+            WHEN :PO_SUBSTITUTION_MODE = 1
+                THEN :P0_NEW_CURRENT_SHIFT_SYMBOL_ID
+            ELSE :P0_CURRENT_SHIFT_SYMBOL_ID
+        END AS effective_shift_symbol_id
+    FROM dual
+)
+SELECT
+    t.id,
+    t.task_content,
+    t.planning_date_start,
+    t.planning_date_end,
+    s.status_main_id,
+    -- за бажанням можна показати, який саме effective_shift використовувався:
+    sc.effective_shift_symbol_id
+FROM tasks t
+JOIN status s
+  ON s.id = t.status_id
+CROSS JOIN shift_ctx sc
+-- за потреби: приєднання інших таблиць, фільтри по користувачу з user_ctx
+-- JOIN user_ctx uc ON ... (якщо потрібна логіка, що залежить від користувача)
+WHERE
+    -- режим "SHIFT" увімкнено
+    (:P1_TAB_MODE = 'SHIFT')
+    -- не нульовий основний статус
+    AND s.status_main_id <> 0
+    -- умова "початок у зміні" або "кінець у зміні" або "прив'язаний до символу зміни"
+    AND (
+        (t.planning_date_start BETWEEN sc.shift_start AND sc.shift_end)
+        OR
+        (t.planning_date_end   BETWEEN sc.shift_start AND sc.shift_end)
+        OR
+        EXISTS (
+            SELECT 1
+            FROM signaturerights sr
+            WHERE sr.task_id = t.id
+              AND sr.shift_symbol_id = sc.effective_shift_symbol_id
+        )
+    )
+-- інші фільтри, сортування
+ORDER BY t.planning_date_start DESC;
+```
+
+## Що додати/оновити в APEX
+
+1. **Page Items to Submit** (щоб сервер бачив значення під час AJAX/refresh):
+
+   * `P1_TAB_MODE`
+   * `P0_SHIFT_START`
+   * `P0_SHIFT_END`
+   * `P0_CURRENT_SHIFT_SYMBOL_ID`
+   * `P0_NEW_CURRENT_SHIFT_SYMBOL_ID`
+   * (за потреби) `PO_SUBSTITUTION_MODE`, `PO_NEW_*`, `PO_CUR_*` — якщо їх джерело не серверне
+
+2. Якщо `:P0_SHIFT_START` / `:P0_SHIFT_END` мають тип **DATE** — прибери `TO_DATE(...)` у CTE `shift_ctx` і залишай їх напряму:
+
+```sql
+shift_start => :P0_SHIFT_START,
+shift_end   => :P0_SHIFT_END
+```
+
+3. Якщо у тебе вже є попередні фільтри по інтервалу (старі OR-умови), **видали** їх, щоб не дублювати логіку.
+
+4. Якщо звіт інколи не повинен працювати в режимі “SHIFT”, можна обгорнути блок у секцію:
+
+```sql
+AND (
+    :P1_TAB_MODE <> 'SHIFT'
+    OR (
+      s.status_main_id <> 0 AND (
+        ... (умови із shift_ctx)
+      )
+    )
+)
+```
+
+але у твоєму формулюванні достатньо як у прикладі вище.
+
+Якщо треба — згенерую версію під **Interactive Report**/**Interactive Grid** із окремим **Server-side Condition** на `P1_TAB_MODE = 'SHIFT'`.
