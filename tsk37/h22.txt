@@ -1,0 +1,156 @@
+Так — без проблем. Той пакет можна розширити ще однією процедурою, яка вночі «пробігає» всі активні шаблони, що мають спрацювати **сьогодні**, і викликає `instantiate_once(...)` для кожного. Далі — ставимо `DBMS_SCHEDULER` на щоденний запуск.
+
+Нижче — готові мінімально потрібні шматки.
+
+# 1) Додамо в пакет «масовий» запуск на день
+
+```plsql
+alter package task_template_inst_pkg compile; -- якщо вже існує
+
+create or replace package body task_template_inst_pkg as
+  -- … ваша процедура instantiate_once як раніше …
+
+  /* Згенерувати всі завдання на вказану дату (за замовчуванням — сьогодні) */
+  procedure instantiate_for_day(p_run_date in date default trunc(sysdate)) is
+    /* плановий час беремо з PERIOD_TIME, якщо він є (год:хв), інакше p_run_date */
+    function apply_period_time(p_base date, p_time date) return date is
+    begin
+      if p_time is null then
+        return p_base;
+      else
+        return trunc(p_base) + (p_time - trunc(p_time)); -- додаємо частку доби з часу
+      end if;
+    end;
+
+    /* стабільний номер дня тижня 1..7, понеділок=1 */
+    function iso_dow(p_d date) return number is
+    begin
+      return to_char(p_d, 'D', 'NLS_TERRITORY=UNITED KINGDOM'); -- Пн=1 … Нд=7
+    end;
+
+    cursor c_due is
+      select t.id as template_id,
+             nvl(t.creator_id, :P0_CUR_USER_TABNO) as creator_id, -- або інший автор за замовчуванням
+             apply_period_time(p_run_date, t.period_time) as planned_dt
+      from   task_templates t
+      where  nvl(t.status_id,0) <> 0            -- активні (підлаштуйте умову активності)
+        and  (t.date_end is null or t.date_end > p_run_date)
+        and  (t.period_start_date is null or t.period_start_date <= p_run_date)
+        and  (
+              /* варіант: одноразовий запуск — по NEXT_RUN_DATE */
+              (t.period_mode = 'ONCE'   and trunc(t.next_run_date) = trunc(p_run_date))
+              /* щодня кожні N днів від старту */
+           or (t.period_mode = 'DAILY'  and mod(trunc(p_run_date) - trunc(nvl(t.period_start_date, t.date_create)),
+                                                greatest(nvl(t.period_interval,1),1)) = 0)
+              /* щотижня за днями в TASK_TEMPLATE_WEEKDAY (weekday 1..7, Пн=1) */
+           or (t.period_mode = 'WEEKLY' and exists (
+                 select 1
+                 from   task_template_weekday w
+                 where  w.template_id = t.id
+                   and  w.weekday     = iso_dow(p_run_date)
+               ))
+             );
+
+    l_task_id number;
+  begin
+    for r in c_due loop
+      instantiate_once(
+        p_template_id => r.template_id,
+        p_creator_id  => r.creator_id,
+        p_now         => r.planned_dt,
+        o_task_id     => l_task_id
+      );
+
+      /* За бажанням: відразу зрушити NEXT_RUN_DATE на наступну подію */
+      /* Якщо у вас є функція GET_NEXT_RUN_DATE(...) — використайте її тут: */
+      /*
+      update task_templates t
+         set t.next_run_date = get_next_run_date(
+                                 p_period_mode      => t.period_mode,
+                                 p_period_interval  => t.period_interval,
+                                 p_period_time      => t.period_time,
+                                 p_weekly_days      => t.weekly_days, -- якщо зберігаєте рядком '1:3:5'
+                                 p_from_date        => p_run_date
+                               ),
+             t.date_update   = sysdate,
+             t.updator       = r.creator_id
+       where t.id = r.template_id;
+      */
+    end loop;
+
+    commit; -- пакет запускається з job’а: комітимо раз на кінець
+  end instantiate_for_day;
+
+end task_template_inst_pkg;
+/
+```
+
+> Примітки:
+>
+> * Логіку добору **періодів** адаптуйте під свої значення `PERIOD_MODE` (я привів три типові: `ONCE`, `DAILY`, `WEEKLY`).
+> * Якщо дні тижня зберігаєте **в окремій таблиці** `TASK_TEMPLATE_WEEKDAY` (ви так і маєте) — перевірка через `exists(...)`, як вище.
+> * Якщо ще й тримаєте `WEEKLY_DAYS` як рядок `1:3:5` — можна або використовувати вашу функцію `GET_NEXT_RUN_DATE`, або замінити `exists` на парсинг рядка.
+
+# 2) Job на щоденний нічний запуск
+
+Запускаємо, скажімо, о **00:10** за Києвом.
+
+```plsql
+begin
+  dbms_scheduler.create_job(
+    job_name        => 'JOB_INSTANTIATE_TEMPLATES_DAILY',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => q'[
+      begin
+        task_template_inst_pkg.instantiate_for_day(trunc(systimestamp at time zone 'Europe/Kiev'));
+      end;
+    ]',
+    start_date      => to_timestamp_tz(to_char(trunc(sysdate)+10/1440,'yyyy-mm-dd hh24:mi')||' Europe/Kiev',
+                                       'yyyy-mm-dd hh24:mi TZR'),
+    repeat_interval => 'FREQ=DAILY;BYHOUR=0;BYMINUTE=10;BYSECOND=0;TZ=Europe/Kiev',
+    enabled         => true,
+    comments        => 'Щоденне нічне створення завдань зі шаблонів'
+  );
+end;
+/
+```
+
+> У різних версіях Oracle таймзона називається `Europe/Kiev`. Якщо у вашому інстансі доступний `Europe/Kyiv` — можете поставити його; інакше залишайте `Europe/Kiev`.
+
+# 3) (Опційно) Лог/моніторинг
+
+Рекомендую завести просту таблицю логу, щоб бачити, що створилось і чи були помилки:
+
+```plsql
+create table template_inst_log(
+  log_id        number generated always as identity,
+  log_dtm       timestamp default systimestamp,
+  template_id   number,
+  task_id       number,
+  status        varchar2(20),  -- 'OK'/'ERR'
+  err_msg       varchar2(4000)
+);
+
+-- і в циклі:
+begin
+  instantiate_once(...);
+  insert into template_inst_log(template_id, task_id, status)
+  values (r.template_id, l_task_id, 'OK');
+exception
+  when others then
+    insert into template_inst_log(template_id, status, err_msg)
+    values (r.template_id, 'ERR', substr(sqlerrm,1,4000));
+end;
+```
+
+# 4) Що врахувати
+
+* **STATUS_ID** новоствореного `TASKS`: якщо потрібен фіксований стартовий статус — поставте його напряму в `insert`.
+* **Авторство**: у масовому режимі логічно ставити `CREATOR_ID = CREATOR_ID шаблону` або сервісного користувача.
+* **Планові дати**: зараз `PLANNING_DATE_START = p_run_date (+ time)`, `PLANNING_DATE_END = + EXECUTION_TERM_DAYS`; для підзавдань — `+ TERM_DAYS`.
+* **Паралельні запуски**: за потреби додайте `DBMS_LOCK.request` в початок `instantiate_for_day`, щоб не отримати дублікати при повторному старті.
+
+Після цього у вас:
+
+* ручна кнопка «Згенерувати разове завдання» (вже є),
+* і nightly job, який кожної ночі «вистрілює» завдання за розкладом зі всіх шаблонів.

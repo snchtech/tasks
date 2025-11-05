@@ -1,0 +1,88 @@
+Ось готовий SQL для вкладки **«До виконання»**. Він вибирає ті завдання, де є **ваш** рядок у `SIGNATURERIGHTS` (`user_tabno = ефективний tabno з урахуванням заміщення`), **ще без підпису**, і **немає жодних “попередніх”** (за етапом) незакритих підписантів.
+
+```sql
+SELECT
+  t.id,
+  t.task_content,
+  t.planning_date_start,
+  t.planning_date_end,
+  r.id            AS signright_id,
+  r.stages_id     AS stage_no
+FROM tasktracker.tasks@to_tasktracker10 t
+JOIN tasktracker.signaturerights@to_tasktracker10 r
+  ON r.task_id = t.id
+WHERE
+  /* 1) Ваш підписний рядок (з урахуванням заміщення) */
+  r.user_tabno = CASE
+                   WHEN NVL(:PO_SUBSTITUTION_MODE,0) = 1
+                     THEN :PO_NEW_USER_TABNO
+                   ELSE :P0_CUR_USER_TABNO
+                 END
+
+  /* 2) Для цього рядка ще НІ РАЗУ не ставили підпис (немає запису у history) */
+  AND NOT EXISTS (
+        SELECT 1
+        FROM tasktracker.signaturehistory@to_tasktracker10 h
+        WHERE h.signright_id   = r.id
+          AND h.new_status_id IS NOT NULL
+      )
+
+  /* 3) Немає "попередніх" (ранiших за stages_id) рядків у цьому ж завданні,
+        які теж ще не підписані (тобто ви — наступний у черзі) */
+  AND NOT EXISTS (
+        SELECT 1
+        FROM tasktracker.signaturerights@to_tasktracker10 r_prev
+        WHERE r_prev.task_id = r.task_id
+          AND r_prev.stages_id < r.stages_id
+          AND NOT EXISTS (
+                SELECT 1
+                FROM tasktracker.signaturehistory@to_tasktracker10 h2
+                WHERE h2.signright_id   = r_prev.id
+                  AND h2.new_status_id IS NOT NULL
+              )
+      )
+
+ORDER BY r.stages_id, t.planning_date_start DESC;
+```
+
+### Примітки та варіанти
+
+* Якщо у вас у межах **того ж `stages_id`** є кілька підписантів із власним порядком (наприклад, поле `order_no` або `id` як проксі), і потрібно, щоб “попередні у межах етапу” теж були закриті — розширте блок `NOT EXISTS` так:
+
+```sql
+AND NOT EXISTS (
+  SELECT 1
+  FROM tasktracker.signaturerights@to_tasktracker10 r_prev
+  WHERE r_prev.task_id = r.task_id
+    AND (
+         r_prev.stages_id < r.stages_id
+         OR (r_prev.stages_id = r.stages_id AND r_prev.id < r.id)  -- або r_prev.order_no < r.order_no
+        )
+    AND NOT EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturehistory@to_tasktracker10 h2
+          WHERE h2.signright_id   = r_prev.id
+            AND h2.new_status_id IS NOT NULL
+        )
+)
+```
+
+* Якщо вкладку треба показувати лише коли, наприклад, `:P1_TAB_MODE = 'TODO'`, додайте умову в `WHERE` або як **Server-side Condition** регіону.
+
+### Що додати в APEX (щоб все працювало при refresh)
+
+**Page Items to Submit** у вашому звіті:
+
+* `P0_CUR_USER_TABNO`
+* `PO_SUBSTITUTION_MODE`
+* `PO_NEW_USER_TABNO`
+
+(і, звісно, будь-які інші айтоми, що впливають на фільтри вкладки)
+
+### Індекси для швидкодії (бажано)
+
+* `SIGNATURERIGHTS(task_id, stages_id, user_tabno)`
+* `SIGNATUREHISTORY(signright_id, new_status_id)`
+* `TASKS(id)` (PK уже є)
+
+Якщо треба повернути ще й “чому саме запис у вас ‘до виконання’” (наприклад, показати попередній етап/підписанта) — скажіть, додам пояснювальну колонку/підзапит.

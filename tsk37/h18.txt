@@ -1,0 +1,165 @@
+ок, зробимо це акуратно й “по-APEX’івськи”. Нижче — готові фрагменти для нової галочки **P4_IMMEDIATE_ASSIGN** («Одразу видати завдання») на сторінці формування маршруту виконавців (id=4) + перевірки при зміні списку виконавців та автозапису в `SIGNATUREHISTORY` при збереженні.
+
+---
+
+# 1) Checkbox P4_IMMEDIATE_ASSIGN
+
+**Створіть item** `P4_IMMEDIATE_ASSIGN` (Checkbox, single value `Y`, Label: «Одразу видати завдання»).
+Зробіть його *Server-side Condition* (PL/SQL Expression):
+
+```plsql
+:P6_TASK_ACTION_MODE = 1
+AND EXISTS (
+  SELECT 1
+  FROM apex_collections
+  WHERE collection_name = 'ADD_PERMIT_1_2'
+    AND to_number(c008) =
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+             THEN :PO_NEW_USER_TABNO
+             ELSE :P0_CUR_USER_TABNO
+        END
+    -- якщо потрібно гарантувати "перший запис Етапу 1":
+    -- AND to_number(c00X_stage) = 1                -- (підставте вашу колонку колекції для stage)
+    -- AND seq_id = (
+    --     SELECT MIN(seq_id)
+    --     FROM apex_collections
+    --     WHERE collection_name = 'ADD_PERMIT_1_2'
+    --       AND to_number(c00X_stage) = 1
+    -- )
+)
+```
+
+> Якщо у вашій колекції **немає окремої колонки для номера етапу**, а порядок гарантує «перший запис для Етапу 1», лишайте перевірку лише по `c008` (tabno), або використайте `MIN(seq_id)` без умови stage.
+
+**Items to Submit** (для регіону/процесу, де рендериться чекбокс):
+`P6_TASK_ACTION_MODE, PO_SUBSTITUTION_MODE, P0_CUR_USER_TABNO, PO_NEW_USER_TABNO`.
+
+---
+
+# 2) Перевіряти чекбокс при зміні виконавців (кнопка **add_permit**)
+
+Щоб галочка автоматично ховалась/показувалась після переформування маршруту:
+
+### 2.1 Створіть Ajax Callback (Page Process) `P4_CAN_IMMEDIATE_ASSIGN` (Execution: Ajax, Point: On Demand):
+
+```plsql
+DECLARE
+  l_effective_tabno NUMBER :=
+    CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END;
+  l_can VARCHAR2(1) := 'N';
+BEGIN
+  IF :P6_TASK_ACTION_MODE = 1 THEN
+    SELECT CASE WHEN EXISTS (
+             SELECT 1
+             FROM apex_collections
+             WHERE collection_name = 'ADD_PERMIT_1_2'
+               AND to_number(c008) = l_effective_tabno
+             -- тут за потреби додайте перевірку "перший запис Етапу 1"
+           ) THEN 'Y' ELSE 'N' END
+    INTO l_can
+    FROM dual;
+  END IF;
+
+  -- Повертаємо просту відповідь
+  owa_util.mime_header('application/json', FALSE);
+  htp.p('{"can":"'||l_can||'"}');
+  owa_util.http_header_close;
+END;
+```
+
+### 2.2 Dynamic Action на кнопці **add_permit**
+
+* **When**: Click → Button `ADD_PERMIT`
+* **True Action 1**: Ваша існуюча логіка формування маршруту (як було)
+* **True Action 2**: **Execute JavaScript Code** — виклик Ajax і керування видимістю/значенням чекбокса:
+
+```javascript
+apex.server.process("P4_CAN_IMMEDIATE_ASSIGN", {
+  pageItems: [
+    "P6_TASK_ACTION_MODE",
+    "PO_SUBSTITUTION_MODE",
+    "P0_CUR_USER_TABNO",
+    "PO_NEW_USER_TABNO"
+  ]
+}).done(function (res) {
+  var show = res && res.can === "Y";
+  var $fc = apex.item("P4_IMMEDIATE_ASSIGN").node.closest(".t-Form-fieldContainer");
+  if ($fc) {
+    $fc.classList.toggle("u-hidden", !show);
+  }
+  // За бажанням скидайте значення, якщо не дозволено
+  if (!show) apex.item("P4_IMMEDIATE_ASSIGN").setValue(null);
+});
+```
+
+> Якщо ви хочете, щоб APEX сам перераховував server-side condition, можна просто **Refresh** регіон/сабрегіон з чекбоксом після `add_permit`. Наведений Ajax-варіант швидший і без перерендеру.
+
+---
+
+# 3) Дія при збереженні (кнопка **save_permit**)
+
+Потрібно: якщо **`P4_IMMEDIATE_ASSIGN = 'Y'`**, то **окрім запису в `SIGNATURERIGHTS`** додатково **автоматично створити** запис у `SIGNATUREHISTORY` **для першого рядка етапу 2**, **де збігається tabno** і **ще нема підпису**.
+
+Створіть **Page Process** (Submit Processing) під/після вашого існуючого процесу запису `SIGNATURERIGHTS`:
+
+```plsql
+DECLARE
+  l_effective_tabno  NUMBER :=
+    CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END;
+  l_signright_id     NUMBER;
+  l_status_id        NUMBER := NVL(:P4_ASSIGN_STATUS_ID,  /* optional page item для гнучкості */
+                                   12 /* <- ваш "статус видачі/передано" за замовчуванням */);
+BEGIN
+  -- Виконуємо тільки якщо галочка стоїть
+  IF :P4_IMMEDIATE_ASSIGN = 'Y' THEN
+
+    /* Знаходимо ПЕРШИЙ signatureright для ЕТАПУ 2 по завданню та tabno,
+       який ще НЕ має запису у SIGNATUREHISTORY */
+    SELECT r.id
+    INTO   l_signright_id
+    FROM   tasktracker.signaturerights@to_tasktracker10 r
+    WHERE  r.task_id    = :P6_TASK_ID
+      AND  r.stages_id  = 2
+      AND  r.user_tabno = l_effective_tabno
+      AND  NOT EXISTS (
+             SELECT 1
+             FROM tasktracker.signaturehistory@to_tasktracker10 h
+             WHERE h.signright_id   = r.id
+               AND h.new_status_id IS NOT NULL
+           )
+    ORDER BY r.id
+    FETCH FIRST 1 ROW ONLY;
+
+    /* Робимо підпис "миттєво" */
+    INSERT INTO tasktracker.signaturehistory@to_tasktracker10
+      (id, signright_id, new_status_id, sdate, signer_by, note)
+    VALUES
+      (tasktracker.seq_signaturehistory.NEXTVAL,
+       l_signright_id,
+       l_status_id,
+       SYSDATE,
+       l_effective_tabno,
+       NULL);
+
+  END IF;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    -- Нічого не робимо: нема відповідного рядка для автопідпису
+    NULL;
+END;
+```
+
+> Якщо у вас є **порядок** всередині етапу 2 (наприклад `order_no`), краще сортувати ним, а не `r.id`:
+> `ORDER BY r.order_no, r.id`.
+
+---
+
+## Швидкі нотатки
+
+* **Колекція `ADD_PERMIT_1_2`**: ми використовуємо `c008` як `tabno` (як і в попередніх ваших запитах). Якщо у вас інша колонка — підмініть у виразах.
+* **Етап 1 / перший запис**: якщо номер етапу є у колекції — додайте перевірку `c00X_stage = 1` та `seq_id = (select min...)`.
+* **Статус для автозапису**: зробив параметром `:P4_ASSIGN_STATUS_ID` (за замовчуванням 12). Зручно для налаштувань без перекомпіляції.
+* **Items to Submit** для кнопок `add_permit` та `save_permit`:
+  `P6_TASK_ACTION_MODE, P6_TASK_ID, PO_SUBSTITUTION_MODE, P0_CUR_USER_TABNO, PO_NEW_USER_TABNO, P4_IMMEDIATE_ASSIGN, P4_ASSIGN_STATUS_ID`.
+
+Якщо хочеш — підкину варіант, де замість Ajax-callback ми просто **Refresh** регіону з чекбоксом і покладаємось на server-side condition; це ще простіше підтримувати, але інколи повільніше.

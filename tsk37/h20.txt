@@ -1,0 +1,61 @@
+Суть: не робимо «refresh» завжди — робимо його лише якщо в модальному щось змінилось. Є два надійних способи.
+
+---
+
+## Варіант A (без JS, «low-code» через Items to Return)
+
+**На модальній сторінці (картка завдання):**
+
+1. Створіть hidden-item, напр. `PXX_REFRESH_FLAG` (Default = `N`).
+2. У всіх діях, що реально змінюють дані (Save / Підпис / Видати тощо), **встановіть** `PXX_REFRESH_FLAG := 'Y'` (PL/SQL процес після валідацій або DA «Set Value» перед Submit).
+3. У властивостях модальної сторінки → **Dialog** → **Return Item(s)** додайте `PXX_REFRESH_FLAG`.
+
+**На батьківській сторінці (основний звіт):**
+4) Створіть **Dynamic Action**: Event = **Dialog Closed** (Page).
+True Action: **Refresh** вашого регіону зі звітом.
+**Client-side Condition → JavaScript Expression:**
+
+```javascript
+this.data && this.data.PXX_REFRESH_FLAG === 'Y'
+```
+
+(APEX прокидає повернуті айтеми у `this.data`.)
+
+> Результат: якщо відкрив/закрив «просто подивитися» (прапорок лишився `N`) — Refresh НЕ виконаний і ніяких «звіт оновлено». Якщо була дія (прапорок `Y`) — Refresh відбудеться.
+
+---
+
+## Варіант B (JS-payload через `apex.navigation.dialog.close`)
+
+**На модальній:**
+
+* Після успішного збереження викликайте:
+
+  ```javascript
+  apex.navigation.dialog.close(true, { changed: true });
+  ```
+* На Cancel / хрестик — нічого не ставимо або:
+
+  ```javascript
+  apex.navigation.dialog.close(false);
+  ```
+
+**На батьківській:**
+
+* DA: Event = **Dialog Closed**.
+  True Action: **Refresh** звіту.
+  **Client-side Condition → JavaScript Expression:**
+
+  ```javascript
+  this.data && this.data.changed === true
+  ```
+
+---
+
+### Дрібниці, щоб усе спрацювало
+
+* У кнопці/лінку, що відкриває модальне вікно, увімкніть **Dialog** (не «Redirect»), і додайте потрібні **Dialog Page Items to Return** (для Варіанта A).
+* Якщо звіт оновлюється через Partial Page Refresh, внесіть у **Items to Submit** ті айтеми, що впливають на SQL (якщо є).
+* Якщо у вас було «On Close *or Canceled* → Refresh», просто заберіть це правило й залиште **тільки** DA з умовою вище.
+
+Обидва підходи вирішують проблему: **Refresh лише коли були зміни**, і користувач більше не бачить плутаного «звіт оновлено», якщо він просто закрив перегляд.

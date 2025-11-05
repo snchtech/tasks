@@ -1,0 +1,186 @@
+Окей, зробимо “кнопку-одним-кліком” для разового створення завдання зі **шаблону** з автогенерацією **підзавдань** і правильними плановими датами.
+
+Нижче — готовий **PL/SQL-пакет** + короткий **APEX-процес** для кнопки.
+
+> Припущення (потрібно для коректного копіювання ієрархії):
+>
+> 1. У `TASK_TEMPLATE_SUBTASKS` є первинний ключ `ID` (на який посилається `PARENT_ID`).
+> 2. У `TASKS` і `TASK_SUBTASKS` є послідовності `SEQ_TASKS` і `SEQ_TASK_SUBTASKS` (заміни, якщо інші).
+> 3. У `TASKS` є колонки щонайменше: `ID, TASK_CONTENT, CREATOR_ID, STATUS_ID, DEPARTMENT_ID, UNIT_ID, TYPE_ID, PAGE_LIST_ID, PLANNING_DATE_START, PLANNING_DATE_END, DATE_CREATE, DATE_UPDATE, UPDATOR` (скоригуй мапінг під свої назви).
+> 4. У `TASK_SUBTASKS` є колонки: `ID, TASK_ID, SUBTASK_CONTENT, STATUS_ID, PARENT_ID, SUBTASK_ORDER, DATE_CREATE, DATE_UPDATE, CREATOR, UPDATOR, PLANNING_DATE_END` (+ за потреби інші).
+
+---
+
+# 1) Пакет для інсталяції шаблону в разове завдання
+
+```plsql
+create or replace package task_template_inst_pkg as
+  /**
+   * Створює ОДИН разовий TASK із TEMPLATE_ID.
+   * p_template_id      — ID шаблону
+   * p_creator_id       — хто ініціює (tabno/ID користувача — як у TASKS.CREATOR_ID)
+   * p_now              — "дата створення" (якщо null -> SYSDATE)
+   * o_task_id          — повертає ID створеного завдання
+   */
+  procedure instantiate_once(
+    p_template_id in number,
+    p_creator_id  in number,
+    p_now         in date   default null,
+    o_task_id     out number
+  );
+end task_template_inst_pkg;
+/
+
+create or replace package body task_template_inst_pkg as
+
+  procedure instantiate_once(
+    p_template_id in number,
+    p_creator_id  in number,
+    p_now         in date   default null,
+    o_task_id     out number
+  ) is
+    -- дані шаблону
+    l_now                   date := nvl(p_now, sysdate);
+    l_task_id               number;
+    l_exec_term_days        number;
+    l_status_id             number;
+    l_department_id         number;
+    l_unit_id               number;
+    l_type_id               number;
+    l_page_list_id          number;
+    l_task_content          task_templates.task_content%type;
+
+    -- мапа ID шаблонних підзавдань -> нові ID підзавдань
+    type t_map is table of number index by number;
+    l_id_map                t_map;
+
+    -- курсор усіх підшаблонів у правильному порядку (спершу корені)
+    cursor c_tpl_subs is
+      select ts.id, ts.subtask_content, ts.status_id, ts.parent_id,
+             ts.subtask_order, ts.term_days, ts.creator, ts.updator
+      from   task_template_subtasks ts
+      where  ts.template_id = p_template_id
+      order  by case when ts.parent_id is null then 0 else 1 end, ts.subtask_order, ts.id;
+
+  begin
+    -- 1) Прочитати шаблон
+    select t.task_content,
+           t.status_id,
+           t.department_id,
+           t.unit_id,
+           t.type_id,
+           t.page_list_id,
+           nvl(t.execution_term_days, 0)
+    into   l_task_content,
+           l_status_id,
+           l_department_id,
+           l_unit_id,
+           l_type_id,
+           l_page_list_id,
+           l_exec_term_days
+    from   task_templates t
+    where  t.id = p_template_id;
+
+    -- 2) Створити TASK
+    insert into tasks(
+      id, task_content, creator_id, status_id,
+      department_id, unit_id, type_id, page_list_id,
+      planning_date_start, planning_date_end,
+      date_create, date_update, updator
+    ) values (
+      seq_tasks.nextval,
+      l_task_content,
+      p_creator_id,
+      l_status_id,              -- або встанови дефолтний "Створено" якщо треба
+      l_department_id,
+      l_unit_id,
+      l_type_id,
+      l_page_list_id,
+      l_now,                    -- початок = дата створення
+      l_now + l_exec_term_days, -- кінець = DATE_CREATE + EXECUTION_TERM_DAYS
+      l_now, l_now, p_creator_id
+    )
+    returning id into l_task_id;
+
+    -- 3) Скопіювати підзавдання з ієрархією
+    for r in c_tpl_subs loop
+      -- знайти нового батька (за мапою), якщо був
+      declare
+        l_new_parent_id number := null;
+        l_new_sub_id    number;
+      begin
+        if r.parent_id is not null then
+          l_new_parent_id := l_id_map(r.parent_id); -- підніме NO_DATA_FOUND якщо порядок не витриманий
+        end if;
+
+        insert into task_subtasks(
+          id, task_id, subtask_content, status_id,
+          parent_id, subtask_order,
+          date_create, date_update, creator, updator,
+          planning_date_end
+        ) values (
+          seq_task_subtasks.nextval,
+          l_task_id,
+          r.subtask_content,
+          nvl(r.status_id, l_status_id),   -- або дефолт
+          l_new_parent_id,
+          r.subtask_order,
+          l_now, l_now, nvl(r.creator, p_creator_id), nvl(r.updator, p_creator_id),
+          l_now + nvl(r.term_days, 0)      -- кінець підзавдання = DATE_CREATE + TERM_DAYS
+        )
+        returning id into l_new_sub_id;
+
+        -- запам’ятати відповідність шаблонного ID -> нового ID
+        l_id_map(r.id) := l_new_sub_id;
+      end;
+    end loop;
+
+    o_task_id := l_task_id;
+  end instantiate_once;
+
+end task_template_inst_pkg;
+/
+```
+
+---
+
+# 2) Як підвісити на кнопку «Згенерувати разове завдання» (APEX)
+
+**Кнопка** на картці шаблону (наприклад, сторінка P7, item `P7_TEMPLATE_ID`): `CREATE_ONE_TASK`.
+
+**Process (Submit Processing, *after validations*):** `Create One Task From Template`
+
+```plsql
+declare
+  l_task_id number;
+  -- ефективний автор (врах. заміщення, якщо потрібно):
+  l_creator_id number := nvl(:PO_NEW_USER_TABNO, :P0_CUR_USER_TABNO);
+begin
+  task_template_inst_pkg.instantiate_once(
+    p_template_id => :P7_TEMPLATE_ID,
+    p_creator_id  => l_creator_id,
+    p_now         => sysdate,
+    o_task_id     => l_task_id
+  );
+
+  -- опційно: повідомлення і/або редирект на картку створеного TASK
+  apex_util.set_session_state('P1_NEW_TASK_ID', l_task_id);
+  apex_application.g_print_success_message :=
+    'Створено завдання № '||l_task_id||' на основі шаблону.';
+
+  -- приклад редиректу (якщо потрібно):
+  -- apex_util.redirect_url(apex_page.get_url(
+  --   p_page => 10, p_items => 'P10_TASK_ID', p_values => l_task_id));
+end;
+```
+
+---
+
+## Куди ще глянути / налаштувати
+
+* Якщо в `TASKS` / `TASK_SUBTASKS` потрібні ще поля (наприклад, пріоритет, автори/виконавці, `PAGE_LIST_ID` на рівні підзавдання тощо) — просто додай у `insert`.
+* Якщо `STATUS_ID` для новоствореного завдання має бути **фіксований** (наприклад, “Створено” = 1), заміни `l_status_id` у вставці на це значення.
+* Якщо потрібно зберегти **NEXT_RUN_DATE** у `TASKS` — додай поле, але у разовому сценарії воно зазвичай не потрібне.
+* Якщо відсутній `ID` у `TASK_TEMPLATE_SUBTASKS` — **краще додати**. Без нього немає на що посилатися в `PARENT_ID`. Якщо не можна — скажи, підкину обхідний варіант (синтетичний ключ у CTE), але це гірше.
+
+Готово — ставиш кнопку, процес і працюєш. Якщо підкажеш точні назви колонок у `TASKS`/`TASK_SUBTASKS`, можу підправити вставки під твою схему 1-в-1.
