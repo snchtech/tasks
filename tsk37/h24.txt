@@ -1,0 +1,121 @@
+Ось як акуратно додати перевірку **участку** (UCHASTOK) з урахуванням заміщення і не зламати пріоритети `OR/AND`.
+
+### 1) Ефективні значення користувача (без WITH, прямо в умові)
+
+Щоб не плодити `WITH`, використаємо скалярні вирази:
+
+```sql
+/* Ефективні значення з урахуванням заміщення */
+CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_USER_TABNO   ELSE :P0_CUR_USER_TABNO   END  -- uc_user_id
+CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_POSITION_ID  ELSE :PO_CUR_USER_POSITION END  -- uc_position_id
+CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END -- uc_department_id
+CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UNIT_ID      ELSE :PO_CUR_USER_UNIT      END  -- uc_unit_id
+CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UCHASTOK     ELSE :PO_CUR_UCHASTOK       END  -- uc_uchastok
+```
+
+Щоб читалось, нижче я позначу їх псевдонімами `uc_*` у коментарях.
+
+---
+
+### 2) Додана логіка для Access Level = 2 (враховано department, unit, uchastok, tasks.date_end IS NULL)
+
+Обгорніть ваш блок **AL=2** дужками, додайте умову по `ac.uchastok`, фільтр по `tasks.date_end is null`, а також перевірку uchastok у `tasks` і `signaturerights`:
+
+```sql
+/* ========= Access Level 2 ========= */
+(
+  al.access_level = 2
+  AND (ac.position_id   IS NULL OR ac.position_id   = /* uc_position_id */ 
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_POSITION_ID  ELSE :PO_CUR_USER_POSITION END)
+  AND (ac.department_id IS NULL OR ac.department_id = /* uc_department_id */
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END)
+  AND (ac.unit_id       IS NULL OR ac.unit_id       = /* uc_unit_id */ 
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UNIT_ID      ELSE :PO_CUR_USER_UNIT      END)
+  AND (ac.user_id       IS NULL OR ac.user_id       = /* uc_user_id */ 
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_USER_TABNO   ELSE :P0_CUR_USER_TABNO     END)
+  /* нове: якщо в access_control задано uchastok — він теж має збігатися */
+  AND (ac.uchastok     IS NULL OR ac.uchastok      = /* uc_uchastok */
+        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UCHASTOK     ELSE :PO_CUR_UCHASTOK       END)
+
+  /* завдання має бути активним */
+  AND t.date_end IS NULL
+
+  /* збіги по самому завданню (департ/юніт/участок) АБО по правах підпису (signaturerights) */
+  AND (
+        /* --- Перевірка по TASKS --- */
+        EXISTS (
+          SELECT 1
+          FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+          WHERE t1.id = t.task_id
+            AND t1.department_id = /* uc_department_id */
+                CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END
+            AND ( /* якщо у користувача unit не заданий — не обмежуємо */
+                 CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END
+               IS NULL
+                 OR t1.unit_id =
+                    CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END
+                )
+            /* нове: фільтр по участку (якщо у користувача є uchastok) */
+            AND ( CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END
+                  IS NULL
+                  OR t1.uchastok_id =
+                     CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END
+                )
+        )
+        OR
+        /* --- Перевірка по SIGNATURERIGHTS --- */
+        EXISTS (
+          SELECT 1
+          FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+          WHERE sr.task_id = t.task_id
+            AND (
+                 /* прямий виконавець */
+                 sr.user_tabno =
+                   CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END
+                 /* або правило посада+департ+(юніт)+участок */
+                 OR (
+                      sr.position_id   = /* uc_position_id */
+                        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_POSITION_ID  ELSE :PO_CUR_USER_POSITION END
+                  AND sr.department_id = /* uc_department_id */
+                        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END
+                  AND (sr.unit_id IS NULL OR sr.unit_id =
+                        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END)
+                  /* нове: враховуємо uchastok у правах підпису (якщо він там заданий) */
+                  AND (sr.uchastok_id IS NULL OR sr.uchastok_id =
+                        CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1 THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END)
+                    )
+                )
+        )
+      )
+)
+/* ======== кінець Access Level 2 ======== */
+```
+
+#### Пояснення ключових моментів
+
+* `t.date_end IS NULL` — фільтрує лише активні завдання.
+* У частині `TASKS`:
+
+  * Department — обов’язково збігається;
+  * Unit — тільки якщо в користувача він заданий;
+  * **Uchastok** — теж тільки якщо в користувача він заданий: тоді вимагаємо `t1.uchastok_id = uc_uchastok`.
+* У частині `SIGNATURERIGHTS`:
+
+  * або **прямий** збіг по `user_tabno`,
+  * або **комбіноване** правило (`position + department + (unit?) + (uchastok?)`), де `unit_id` і `uchastok_id` перевіряються лише якщо вони **задані** в праві.
+* Для `task_access_control ac` додано перевірку `ac.uchastok` проти ефективного `uc_uchastok`.
+
+---
+
+### 3) На що звернути увагу
+
+* **Назва колонки участку** у `TASKS`: я використав `t1.uchastok_id`. Якщо у вас інша (`UCHASTOK`), замініть.
+* Переконайтесь, що є індекси:
+
+  * `TASKS(id, department_id, unit_id, uchastok_id, date_end)`
+  * `SIGNATURERIGHTS(task_id, user_tabno, position_id, department_id, unit_id, uchastok_id)`
+  * `TASK_ACCESS_CONTROL(position_id, department_id, unit_id, user_id, uchastok)`
+* Додайте у **Items to Submit** для регіону всі використані айтеми:
+  `PO_SUBSTITUTION_MODE, P0_CUR_USER_TABNO, PO_NEW_USER_TABNO, PO_CUR_USER_POSITION, PO_NEW_POSITION_ID, PO_CUR_USER_DEPARTMENT, PO_NEW_DEPARTMENT_ID, PO_CUR_USER_UNIT, PO_NEW_UNIT_ID, PO_CUR_UCHASTOK, PO_NEW_UCHASTOK`.
+
+Якщо захочеш, можу скласти повний фрагмент для всіх рівнів доступу (1/2/3) з однаковим стилем і правильною розстановкою дужок — щоб нічого не “з’їлося” пріоритетами `OR`.

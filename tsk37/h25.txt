@@ -1,0 +1,167 @@
+Ок, нижче — цілісний фрагмент для **всіх трьох рівнів доступу (1/2/3)** з урахуванням **UCHASTOK** та **заміщення**. Це — готовий блок для розділу `WHERE` вашого основного рапорту. Я залишив ваші аліаси:
+`t` — ваш джерельний набір (де є `t.task_id`),
+`al` — джерело рівня доступу,
+`ac` — рядок з `TASK_ACCESS_CONTROL` (якщо він у вас лівим джойном підтягується).
+
+> Важливо: усюди перевіряємо тільки **активні** завдання (`t.date_end IS NULL`).
+> Ефективні значення користувача беруться інлайном через `CASE` (без `WITH`).
+
+```sql
+/* ===== АКТИВНІ ЗАВДАННЯ ===== */
+AND t.date_end IS NULL
+
+/* ===== ДОСТУП 1/2/3 ===== */
+AND (
+  /* -------------------- ACCESS LEVEL 1: "персональний" -------------------- */
+  (
+    al.access_level = 1
+    AND (
+         /* Ви — автор завдання */
+         EXISTS (
+           SELECT 1
+           FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+           WHERE t1.ID = t.TASK_ID
+             AND t1.CREATOR_ID = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                       THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END)
+         )
+         /* або Ви безпосередній виконавець / підписант у правах */
+         OR EXISTS (
+           SELECT 1
+           FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+           WHERE sr.TASK_ID = t.TASK_ID
+             AND (
+                   sr.USER_TABNO = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                         THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END)
+                OR (
+                     sr.POSITION_ID   = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                               THEN :PO_NEW_POSITION_ID ELSE :PO_CUR_USER_POSITION END)
+                 AND sr.DEPARTMENT_ID = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                               THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END)
+                 AND (sr.UNIT_ID IS NULL OR sr.UNIT_ID =
+                       (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                             THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END))
+                 AND (sr.UCHASTOK_ID IS NULL OR sr.UCHASTOK_ID =
+                       (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                             THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END))
+                   )
+                 )
+         )
+    )
+  )
+
+  OR
+
+  /* -------------------- ACCESS LEVEL 2: "за правилами з TAC" -------------------- */
+  (
+    al.access_level = 2
+    /* Рядок у TASK_ACCESS_CONTROL під користувача (NULL = "будь-що") */
+    AND (ac.POSITION_ID   IS NULL OR ac.POSITION_ID   = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                                              THEN :PO_NEW_POSITION_ID ELSE :PO_CUR_USER_POSITION END))
+    AND (ac.DEPARTMENT_ID IS NULL OR ac.DEPARTMENT_ID = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                                              THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END))
+    AND (ac.UNIT_ID       IS NULL OR ac.UNIT_ID       = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                                              THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END))
+    AND (ac.USER_ID       IS NULL OR ac.USER_ID       = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                                              THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END))
+    AND (ac.UCHASTOK      IS NULL OR ac.UCHASTOK      = (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                                              THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END))
+    /* Додатково: завдання має підходити або напряму по TASKS, або по SIGNATURERIGHTS */
+    AND (
+          /* --- фільтр за самим завданням (деп/юніт/участок) --- */
+          EXISTS (
+            SELECT 1
+            FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+            WHERE t1.ID = t.TASK_ID
+              AND t1.DEPARTMENT_ID =
+                    (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                          THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END)
+              AND ( (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                          THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END) IS NULL
+                    OR t1.UNIT_ID =
+                       (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                             THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END) )
+              AND ( (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                          THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END) IS NULL
+                    OR t1.UCHASTOK_ID =
+                       (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                             THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END) )
+          )
+          OR
+          /* --- фільтр за правами підпису/виконання (sr) з участком --- */
+          EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+            WHERE sr.TASK_ID = t.TASK_ID
+              AND (
+                   /* прямий користувач */
+                   sr.USER_TABNO =
+                     (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                           THEN :PO_NEW_USER_TABNO ELSE :P0_CUR_USER_TABNO END)
+                   /* або за правилом посада+департ+(юніт?)+(участок?) */
+                   OR (
+                        sr.POSITION_ID   =
+                          (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                THEN :PO_NEW_POSITION_ID ELSE :PO_CUR_USER_POSITION END)
+                    AND sr.DEPARTMENT_ID =
+                          (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END)
+                    AND (sr.UNIT_ID IS NULL OR sr.UNIT_ID =
+                          (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END))
+                    AND (sr.UCHASTOK_ID IS NULL OR sr.UCHASTOK_ID =
+                          (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                                THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END))
+                      )
+                  )
+          )
+        )
+  )
+
+  OR
+
+  /* -------------------- ACCESS LEVEL 3: "підрозділ/юніт/участок" -------------------- */
+  (
+    al.access_level = 3
+    AND EXISTS (
+      SELECT 1
+      FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+      WHERE t1.ID = t.TASK_ID
+        /* весь департамент користувача */
+        AND t1.DEPARTMENT_ID =
+              (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                    THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END)
+        /* але якщо у користувача заданий UNIT — звужуємо до нього */
+        AND ( (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                    THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END) IS NULL
+              OR t1.UNIT_ID =
+                 (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                       THEN :PO_NEW_UNIT_ID ELSE :PO_CUR_USER_UNIT END) )
+        /* якщо заданий UCHASTOK — звужуємо і до нього */
+        AND ( (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                    THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END) IS NULL
+              OR t1.UCHASTOK_ID =
+                 (CASE WHEN NVL(:PO_SUBSTITUTION_MODE,0)=1
+                       THEN :PO_NEW_UCHASTOK ELSE :PO_CUR_UCHASTOK END) )
+    )
+  )
+)
+```
+
+### Пояснення логіки рівнів
+
+* **Level 1** — доступ до «своїх» задач: ви як **CREATOR** або у вас є **рядок у `SIGNATURERIGHTS`** (безпосередньо або за правилом *position+department+(unit?)+(uchastok?)*).
+* **Level 2** — доступ за **рядком у `TASK_ACCESS_CONTROL`** (NULL у полі = джокер). Додатково завдання має підходити **або** за атрибутами самого `TASKS` (деп/юніт/участок), **або** за `SIGNATURERIGHTS`.
+* **Level 3** — «ширший» доступ по **департаменту** користувача; якщо в користувача є **UNIT/UCHASTOK** — звужуємо до них.
+
+### Практичні нотатки
+
+* Замініть назву колонки участку у `TASKS` на вашу фактичну (`UCHASTOK` vs `UCHASTOK_ID`).
+* Перевірте наявність індексів:
+
+  * `TASKS(ID, DEPARTMENT_ID, UNIT_ID, UCHASTOK_ID, DATE_END)`
+  * `SIGNATURERIGHTS(TASK_ID, USER_TABNO, POSITION_ID, DEPARTMENT_ID, UNIT_ID, UCHASTOK_ID)`
+  * `TASK_ACCESS_CONTROL(USER_ID, POSITION_ID, DEPARTMENT_ID, UNIT_ID, UCHASTOK)`
+* У **APEX Region → Items to Submit** додайте всі використані айтеми:
+  `PO_SUBSTITUTION_MODE, P0_CUR_USER_TABNO, PO_NEW_USER_TABNO, PO_CUR_USER_POSITION, PO_NEW_POSITION_ID, PO_CUR_USER_DEPARTMENT, PO_NEW_DEPARTMENT_ID, PO_CUR_USER_UNIT, PO_NEW_UNIT_ID, PO_CUR_UCHASTOK, PO_NEW_UCHASTOK`.
+
+Якщо треба — можу зібрати цей блок із вашими точними назвами колонок/аліасів, щоб просто вставити без правок.
