@@ -1,0 +1,85 @@
+так, саме так і роблять для діалогів без перезавантаження сторінки: закриваємо діалог → на батьківській сторінці ловимо подію **Dialog Closed** і там уже показуємо success + confirm. Ось як налаштувати стабільно.
+
+# Що робимо
+
+## 1) На сторінці діалогу (де створюєш завдання)
+
+* Додай 2 hidden items: `P7_NEW_TASK_ID`, `P7_SHOW_POST_CREATE`.
+* У процесі створення після виклику пакета вистави:
+
+  ```plsql
+  :P7_NEW_TASK_ID      := l_task_id;
+  :P7_SHOW_POST_CREATE := 'Y';
+  ```
+* (Опція А — рекомендую) У **Page Designer → Page → Dialog** додай в **Dialog Return Items**:
+  `P7_NEW_TASK_ID, P7_SHOW_POST_CREATE`
+  Тоді APEX поверне ці значення при будь-якому закритті (і кнопкою, і хрестиком, і ESC).
+* (Опція Б) Або в True Action **Close Dialog** додай **Items to Return** ті ж самі: `P7_NEW_TASK_ID, P7_SHOW_POST_CREATE`.
+
+> Success-повідомлення з процесу в діалозі краще **не показувати в діалозі**. Ми виведемо його на батьківській сторінці.
+
+## 2) На батьківській сторінці (де «Журнал» або основний звіт)
+
+Створи **Dynamic Action**:
+
+* **Event:** `Dialog Closed`
+* **Selection Type:** `Region` (будь-який, подія все одно глобальна) або **Page** (не критично)
+* **Client-side Condition:** *JavaScript expression*
+
+  ```javascript
+  this.data && this.data.P7_SHOW_POST_CREATE === 'Y'
+  ```
+* **True Action 1: Execute JavaScript Code** (показати success і confirm; за потреби — оновити звіт):
+
+  ```javascript
+  var d = this.data || {};
+  var taskId = d.P7_NEW_TASK_ID;
+
+  // 1) Success у батьківському вікні
+  apex.message.showPageSuccess('Завдання № ' + taskId + ' створено у «Журналі завдань».');
+
+  // 2) (опційно) Рефреш основного звіту, але лише якщо створили
+  // apex.region('report_static_id').refresh();
+
+  // 3) Confirm: перейти чи залишитись
+  apex.message.confirm('Перейти до «Журналу завдань»?', function(ok){
+    if (ok) {
+      apex.navigation.redirect(
+        apex.util.makeApplicationUrl({
+          pageId: 1,                 // ID сторінки Журналу
+          items:  'P1_TASK_ID',      // опційно: відкрити щойно створене
+          values: taskId
+        })
+      );
+    }
+    // якщо "Залишитись" — нічого не робимо
+  });
+  ```
+* **False Action:** нічого (коли діалог закрито без створення або прапорець ≠ 'Y').
+
+> Завдяки **Dialog Return Items** значення `P7_*` приїде у `this.data` без перезавантаження сторінки.
+
+# Важливі дрібниці
+
+* Якщо використовуєш **Close Dialog** як true-action на кнопці «Створити», то **спершу** виконай процес (Submit Page / Process), **потім** `Close Dialog`, щоб повернулись актуальні `P7_*`.
+* Якщо хочеш ще простіше: замість confirm зроби **toast-кнопку**:
+
+  ```javascript
+  apex.message.showToast({
+    message: 'Завдання створено.',
+    type: 'success',
+    duration: 8000,
+    actions: [{
+      label: 'Відкрити в Журналі',
+      action: function(){
+        apex.navigation.redirect(apex.util.makeApplicationUrl({
+          pageId: 1, items: 'P1_TASK_ID', values: this.data.P7_NEW_TASK_ID
+        }));
+      }.bind({data: this.data})
+    }]
+  });
+  ```
+* Якщо потрібно, щоб при **Cancel** діалог **не** оновлював звіт — став умову на рефреш лише при `P7_SHOW_POST_CREATE='Y'`, як в коді вище.
+* Якщо на одній сторінці кілька діалогів — у DA можна додати перевірку `this.data.dialogPageId === 7` (ID діалогу), щоб реагувати лише на конкретний.
+
+Цей підхід не вимагає перезавантажувати сторінку й працює однаково добре для кнопки `Close Dialog` і для хрестика, якщо задані **Dialog Return Items**.

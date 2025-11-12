@@ -1,0 +1,174 @@
+Коротко: так, варто трохи допрацювати і схеми, і процедуру, щоб повністю відповідати вашим таблицям і мати “слід” походження задачі зі шаблону.
+
+# Що додати у структури/обмеження
+
+1. **TASKS**
+
+* Заповнювати при інстанціюванні:
+
+  * `IS_GENERATED = 1`
+  * `GENERATED_DATE = SYSDATE`
+  * `TEMPLATE_ID = p_template_id`
+  * (опційно) `UCHASTOK_ID` — прокидати параметром у процедуру, бо в шаблоні його нема.
+  * (опційно) `TASK_CODE` — якщо маєте генератор/послідовність коду.
+* Індекси (для звітів і джоїнів):
+
+  * `IDX_TASKS_TEMPLATE` (TEMPLATE_ID)
+  * `IDX_TASKS_DEPT_UNIT_UCH` (DEPARTMENT_ID, UNIT_ID, UCHASTOK_ID)
+  * `IDX_TASKS_GEN` (IS_GENERATED, GENERATED_DATE)
+* FK (якщо є довідники): `DEPARTMENT_ID`, `UNIT_ID`, `TYPE_ID`, `PAGE_LIST_ID`, `TEMPLATE_ID → TASK_TEMPLATES(ID)`.
+
+2. **TASK_SUBTASKS**
+
+* Заповнювати:
+
+  * `TEMPLATE_SUBTASK_ID = <ID рядка з TASK_TEMPLATE_SUBTASKS>`
+  * `PLANNING_DATE_END = l_now + TERM_DAYS`
+* Індекс:
+
+  * `IDX_TSUB_TASK` (TASK_ID)
+  * `IDX_TSUB_TPLSUB` (TEMPLATE_SUBTASK_ID)
+
+3. **TASK_TEMPLATE_SUBTASKS**
+
+* Гарантуйте PK `ID`, бо від нього йде мапа `TEMPLATE_SUBTASK_ID`.
+* Індекс: `IDX_TPLSUB_TEMPLATE` (TEMPLATE_ID, PARENT_ID, SUBTASK_ORDER).
+
+4. **Узгоджені дефолти/NOT NULL**
+
+* Варто мати дефолти: `DATE_CREATE DEFAULT SYSDATE`, `DATE_UPDATE DEFAULT SYSDATE`.
+* Якщо логіка вимагає — `STATUS_ID` для створених задач/підзадач ставте фіксованим (напр., “Створено”), а не тягніть зі шаблону.
+
+---
+
+# Оновлена процедура (мінімально змінено, під ваші поля)
+
+```plsql
+create or replace package task_template_inst_pkg as
+  procedure instantiate_once(
+    p_template_id   in number,
+    p_creator_id    in number,
+    p_now           in date    default null,
+    o_task_id       out number,
+    p_uchastok_id   in number  default null,   -- ← якщо треба задати участок
+    p_task_code     in varchar2 default null   -- ← якщо генеруєте код зовні
+  );
+end task_template_inst_pkg;
+/
+
+create or replace package body task_template_inst_pkg as
+  procedure instantiate_once(
+    p_template_id   in number,
+    p_creator_id    in number,
+    p_now           in date    default null,
+    o_task_id       out number,
+    p_uchastok_id   in number  default null,
+    p_task_code     in varchar2 default null
+  ) is
+    l_now            date   := nvl(p_now, sysdate);
+    l_task_id        number;
+    l_exec_term_days number;
+    l_status_id      number;
+    l_department_id  number;
+    l_unit_id        number;
+    l_type_id        number;
+    l_page_list_id   number;
+    l_task_content   task_templates.task_content%type;
+
+    type t_map is table of number index by number;
+    l_id_map         t_map;
+
+    cursor c_tpl_subs is
+      select ts.id, ts.subtask_content, ts.status_id, ts.parent_id,
+             ts.subtask_order, ts.term_days, ts.creator, ts.updator
+      from   task_template_subtasks ts
+      where  ts.template_id = p_template_id
+      order  by case when ts.parent_id is null then 0 else 1 end, ts.subtask_order, ts.id;
+  begin
+    -- 1) Шаблон
+    select t.task_content,
+           t.status_id,
+           t.department_id,
+           t.unit_id,
+           t.type_id,
+           t.page_list_id,
+           nvl(t.execution_term_days, 0)
+      into l_task_content,
+           l_status_id,
+           l_department_id,
+           l_unit_id,
+           l_type_id,
+           l_page_list_id,
+           l_exec_term_days
+      from task_templates t
+     where t.id = p_template_id;
+
+    -- 2) TASKS (з “слідами” генерації)
+    insert into tasks(
+      id,
+      date_create, date_update,
+      is_generated, generated_date, template_id, task_code,
+      task_content, creator_id, status_id,
+      department_id, unit_id, type_id, page_list_id,
+      planning_date_start, planning_date_end,
+      updator, uchastok_id
+    ) values (
+      seq_tasks.nextval,
+      l_now, l_now,
+      1, l_now, p_template_id, p_task_code,
+      l_task_content, p_creator_id, l_status_id,      -- за потреби: тут поставте фіксований стартовий статус
+      l_department_id, l_unit_id, l_type_id, l_page_list_id,
+      l_now,
+      l_now + l_exec_term_days,
+      p_creator_id, p_uchastok_id
+    )
+    returning id into l_task_id;
+
+    -- 3) Підзавдання (з посиланням на шаблонне підзавдання)
+    for r in c_tpl_subs loop
+      declare
+        l_new_parent_id number := null;
+        l_new_sub_id    number;
+      begin
+        if r.parent_id is not null then
+          l_new_parent_id := l_id_map(r.parent_id);
+        end if;
+
+        insert into task_subtasks(
+          id, task_id,
+          subtask_content, status_id,
+          planning_date_end,
+          parent_id, subtask_order,
+          template_subtask_id,
+          date_create, date_update, creator, updator
+        ) values (
+          seq_task_subtasks.nextval, l_task_id,
+          r.subtask_content, nvl(r.status_id, l_status_id),      -- або фіксований стартовий статус
+          l_now + nvl(r.term_days, 0),
+          l_new_parent_id, r.subtask_order,
+          r.id,
+          l_now, l_now, nvl(r.creator, p_creator_id), nvl(r.updator, p_creator_id)
+        )
+        returning id into l_new_sub_id;
+
+        l_id_map(r.id) := l_new_sub_id;
+      end;
+    end loop;
+
+    o_task_id := l_task_id;
+    -- Коміт лишаємо викликачеві (APEX-процесу / джобу)
+  end instantiate_once;
+end task_template_inst_pkg;
+/
+```
+
+---
+
+## Дрібні поради
+
+* Якщо часто робите “разові задачі з шаблону” — додайте **лог-таблицю** (template_id, task_id, dtm, who, status, error) для аудиту.
+* Якщо плануєте нічний **Scheduler job** — в масовій процедурі використовуйте цю саму `instantiate_once(...)`, а `PLANNING_DATE_START` обчислюйте з урахуванням `PERIOD_TIME/WEEKLY_TIME`.
+* Якщо `TERM_DAYS` може бути `NULL`, ми вже ставимо `+0`. Якщо потрібно “без дати завершення” для `NULL` — міняємо на `case when r.term_days is null then null else l_now + r.term_days end`.
+* Переконайтесь, що є послідовності `SEQ_TASKS` та `SEQ_TASK_SUBTASKS` (або замініть на ваші).
+
+Якщо скажете, які саме значення мають бути “дефолтними” для `STATUS_ID` у задачі/підзавданні, підставлю їх у код, щоб не тягнути зі шаблону.

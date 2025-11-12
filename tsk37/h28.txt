@@ -1,0 +1,162 @@
+Коротко: логіка ок, але для джоба треба виправити 5 речей:
+
+1. **Жодних APEX-змінних** у джобі (`:P0_CUR_USER_TABNO` → не можна).
+2. **Назва таблиці тижневих днів**: у вас `TASK_WEEKDAYS`, а не `task_template_weekday`.
+3. Для **WEEKLY** беріть `WEEKLY_TIME`, а не `PERIOD_TIME`.
+4. Додайте **захист від дублікатів** (якщо джоб спрацює двічі).
+5. (Опційно) Логування/обробка помилок.
+
+Нижче — виправлена процедура для пакета (готова для джоба).
+
+---
+
+### Виправлена `instantiate_for_day` (ідемпотентна, без APEX-змінних)
+
+```plsql
+create or replace package body task_template_inst_pkg as
+  -- ... тут ваша процедура instantiate_once(...) без змін ...
+
+  /* Згенерувати всі завдання на вказану дату (за замовчуванням — сьогодні).
+     p_service_creator_id — хто виступає "автором" при масовій генерації (сервісний користувач).
+     p_default_status_id  — якщо треба перезаписати стартовий статус (інакше з шаблону).
+  */
+  procedure instantiate_for_day(
+    p_run_date           in date   default trunc(sysdate),
+    p_service_creator_id in number default null,
+    p_default_status_id  in number default null
+  ) is
+
+    /* Додаємо час до дати (беремо лише «частку доби» з time_col) */
+    function apply_time(p_base date, p_time date) return date is
+    begin
+      if p_time is null then
+        return p_base;
+      else
+        return trunc(p_base) + (p_time - trunc(p_time));
+      end if;
+    end;
+
+    /* Пн=1 … Нд=7, стабільно */
+    function iso_dow(p_d date) return number is
+    begin
+      return to_number(to_char(p_d, 'D', 'NLS_TERRITORY=UNITED KINGDOM'));
+    end;
+
+    /* Антидубль: чи вже є інстанс цього шаблону на цю дату/час (ідемпотентність) */
+    function exists_task(p_template_id number, p_planned_dt date) return boolean is
+      l_dummy number;
+    begin
+      select 1
+        into l_dummy
+        from tasks
+       where template_id = p_template_id
+         and is_generated = 1
+         and trunc(planning_date_start) = trunc(p_planned_dt)
+         and (   -- якщо важлива точна хвилина
+             planning_date_start = p_planned_dt
+             or planning_date_start between p_planned_dt - 1/1440 and p_planned_dt + 1/1440
+             );
+      return true;
+    exception when no_data_found then
+      return false;
+    end;
+
+    /* Шаблони, що мають спрацювати у p_run_date */
+    cursor c_due is
+      select
+        t.id                                    as template_id,
+        nvl(p_service_creator_id, t.creator_id) as creator_id,
+        case
+          when t.period_mode = 'WEEKLY' then apply_time(p_run_date, t.weekly_time)
+          else                               apply_time(p_run_date, t.period_time)
+        end                                   as planned_dt
+      from task_templates t
+      where nvl(t.status_id, 0) <> 0                           -- активний шаблон (адаптуйте під свої коди)
+        and (t.date_end is null or t.date_end > p_run_date)
+        and (t.period_start_date is null or t.period_start_date <= p_run_date)
+        and (
+              -- одноразовий запуск по NEXT_RUN_DATE
+              (t.period_mode = 'ONCE'
+               and trunc(t.next_run_date) = trunc(p_run_date))
+
+           or -- щодня кожні N днів від старту
+              (t.period_mode = 'DAILY'
+               and mod(trunc(p_run_date) - trunc(nvl(t.period_start_date, t.date_create)),
+                       greatest(nvl(t.period_interval, 1), 1)) = 0)
+
+           or -- щотижня: є запис у TASK_WEEKDAYS з weekday = iso_dow(p_run_date)
+              (t.period_mode = 'WEEKLY'
+               and exists (
+                     select 1
+                       from task_weekdays w
+                      where w.template_id = t.id
+                        and w.weekday     = iso_dow(p_run_date)
+                   ))
+            );
+
+    l_task_id number;
+  begin
+    for r in c_due loop
+      -- антидубль
+      if not exists_task(r.template_id, r.planned_dt) then
+        -- створюємо завдання
+        instantiate_once(
+          p_template_id => r.template_id,
+          p_creator_id  => r.creator_id,
+          p_now         => r.planned_dt,
+          o_task_id     => l_task_id
+          -- p_uchastok_id / p_task_code додайте, якщо у вас вони в сигнатурі
+        );
+
+        -- (необов’язково) оновити статус на дефолтний для масової генерації
+        if p_default_status_id is not null then
+          update tasks
+             set status_id  = p_default_status_id,
+                 date_update = sysdate,
+                 updator     = r.creator_id
+           where id = l_task_id;
+        end if;
+
+        -- (необов’язково) пересунути NEXT_RUN_DATE, якщо у вас є службова функція
+        -- update task_templates set next_run_date = get_next_run_date(...), date_update=sysdate, updator=r.creator_id
+        -- where id = r.template_id;
+      end if;
+    end loop;
+
+    commit; -- пакет викликається з джоба → коміт наприкінці
+  exception
+    when others then
+      -- рекомендовано: логувати помилки у власну LOG-таблицю
+      -- insert into template_inst_log(log_dtm, template_id, status, err_msg) values (systimestamp, null, 'ERR', substr(sqlerrm,4000));
+      rollback;
+      raise;
+  end instantiate_for_day;
+end task_template_inst_pkg;
+/
+```
+
+---
+
+### Чому саме ці правки
+
+* **Без `:P0_CUR_USER_TABNO`**: у `DBMS_SCHEDULER` нема APEX-сесії; беремо `t.creator_id` або передаємо `p_service_creator_id`.
+* **`TASK_WEEKDAYS`**: курсор посилається на правильну таблицю з днів.
+* **Час**: `WEEKLY` → `WEEKLY_TIME`, інші → `PERIOD_TIME` (як у ваших полях).
+* **Антидубль**: перевірка на вже створене завдання із цього шаблону на цю дату/час.
+* **Ідемпотентність**: повторний запуск джоба не множить задачі.
+* **Коміт**: у кінці — правильно для джоба; у разі помилки — `rollback` і (бажано) лог.
+
+---
+
+### Рекомендовані індекси (для швидкості)
+
+```sql
+create index idx_tt_active on task_templates(status_id, period_mode, period_start_date, date_end);
+create index idx_tt_week   on task_weekdays(template_id, weekday);
+
+create index idx_tasks_tpl_dt on tasks(template_id, is_generated, planning_date_start);
+```
+
+---
+
+Якщо хочеш, додам ще **процедуру планування наступної дати** (`get_next_run_date`) під ваші `PERIOD_MODE/INTERVAL/WEEKLY_*`, щоб оновлювати `NEXT_RUN_DATE` після кожної інстанціації.

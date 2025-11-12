@@ -1,0 +1,136 @@
+Ось три зручні варіанти. Я б узяв №1 — він простий і «рідний» для APEX.
+
+---
+
+## ВАРІАНТ 1. Success + confirm після перезавантаження сторінки
+
+**Ідея:** процес створення виставляє success-повідомлення і прапорець. На `Page Load` показуємо `apex.message.confirm(...)` з переходом.
+
+### 1) Processing (PL/SQL)
+
+```plsql
+declare
+  l_task_id number;
+begin
+  task_template_inst_pkg.instantiate_once(
+    p_template_id => :P7_TEMPLATE_ID,
+    p_creator_id  => :P0_CUR_USER_TABNO,
+    p_now         => sysdate,
+    o_task_id     => l_task_id
+  );
+
+  :P7_NEW_TASK_ID        := l_task_id;      -- hidden item на сторінці
+  :P7_SHOW_POST_CREATE   := 'Y';            -- hidden item (Default NULL)
+
+  apex_util.set_success_message(
+    'Завдання № '||l_task_id||' створено у «Журналі завдань».'
+  );
+end;
+```
+
+> Переконайся, що `P7_NEW_TASK_ID` і `P7_SHOW_POST_CREATE` додані в **Items to Return** (або просто є на сторінці).
+
+### 2) DA: *When Page Loads* → **Execute JavaScript Code**
+
+**Client-side Condition:** *Item = Value* → `P7_SHOW_POST_CREATE = Y`
+
+```javascript
+apex.message.confirm(
+  "Перейти до «Журналу завдань»?",
+  function( ok ){
+    if ( ok ) {
+      apex.navigation.redirect(
+        apex.util.makeApplicationUrl({
+          pageId: 1,                               // стор. Журналу
+          items:   "P1_TASK_ID",                   // опційно — відкрити щойно створене
+          values:  $v("P7_NEW_TASK_ID")
+        })
+      );
+    } else {
+      // Залишаємося тут. Щоб прапорець не тригерив confirm вдруге:
+      $s("P7_SHOW_POST_CREATE", "");
+    }
+  }
+);
+```
+
+Готово: після процесу побачиш зелене **success** і одразу confirm «Перейти / Залишитись».
+
+---
+
+## ВАРІАНТ 2. Кнопки прямо у success-повідомленні (без confirm)
+
+В success-текст додаємо дві дії-посилання.
+
+### Processing
+
+```plsql
+apex_util.set_success_message(
+  'Завдання № '||l_task_id||' створено у «Журналі завдань». '||
+  '<a href="'||
+  apex_page.get_url(p_page => 1, p_items => 'P1_TASK_ID', p_values => l_task_id)
+  ||'">Перейти</a> &nbsp; <a href="javascript:void(0)" onclick="apex.message.clearErrors()">Залишитись</a>'
+);
+```
+
+Плюси: мінімум логіки. Мінус: лінки в повідомленні менш помітні, ніж модальний confirm.
+
+---
+
+## ВАРІАНТ 3. «Перейти» як окрема кнопка-Toast
+
+Показати success, а нижче — невеличкий toast з «Перейти».
+
+### Processing (success як завжди)
+
+```plsql
+apex_util.set_success_message('Завдання № '||l_task_id||' створено...');
+:P7_NEW_TASK_ID := l_task_id;
+:P7_SHOW_POST_CREATE := 'Y';
+```
+
+### DA: *When Page Loads* (умова `P7_SHOW_POST_CREATE=Y`)
+
+**Execute JavaScript:**
+
+```javascript
+apex.message.showToast({
+  message: 'Відкрити у «Журналі завдань»',
+  type:    'info',
+  duration: 8000,
+  actions: [
+    {
+      label: 'Перейти',
+      action: function(){
+        apex.navigation.redirect(
+          apex.util.makeApplicationUrl({
+            pageId: 1,
+            items: "P1_TASK_ID",
+            values: $v("P7_NEW_TASK_ID")
+          })
+        );
+      }
+    },
+    {
+      label: 'Закрити',
+      action: function(){ /* нічого */ }
+    }
+  ]
+});
+$s("P7_SHOW_POST_CREATE","");   // не повторювати
+```
+
+---
+
+### Нюанси, щоб усе спрацювало
+
+* **Items to Submit/Return.** Якщо регіон перезавантажується, додай `P7_SHOW_POST_CREATE, P7_NEW_TASK_ID` до *Items to Submit*.
+* **Повідомлення HTML.** Якщо у варіанті 2 HTML не рендериться, увімкни *Escape special characters = No* у *Success Message Region* (Universal Theme зазвичай дозволяє HTML).
+* **Redirect пізніше.** Якщо хочеш спершу показати сторінку, а перейти через 2–3 сек без питань:
+
+  ```javascript
+  setTimeout(function(){ apex.navigation.redirect('...'); }, 2500);
+  ```
+* **Dialog modal.** Якщо картка відкривається у модальному — поверни `P7_NEW_TASK_ID` і тригерь confirm на батьківській сторінці (Event: **Dialog Closed**, `this.data.P7_SHOW_POST_CREATE==='Y'`).
+
+Якщо скажеш № сторінки «Журналу» та чи потрібно одразу відкрити конкретне завдання/фільтр, піджену урл/параметри під тебе.

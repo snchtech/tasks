@@ -1,0 +1,81 @@
+Так, це можна зробити просто й безпечнo через **динамічну дію (Dynamic Action)** або **невеликий JavaScript**, який реагує на значення `P0_SUBSTITUTION_MODE`.
+
+---
+
+## 🔹 Варіант 1. Через JavaScript (рекомендується — мінімальний і точний)
+
+### Кроки:
+
+1. В APEX на сторінці, де є item `P0_SUBSTITUTION_MODE`, додай **Dynamic Action:**
+
+   * **Event:** `Change`
+   * **Selection Type:** `Item(s)`
+   * **Item(s):** `P0_SUBSTITUTION_MODE`
+   * **True Action:** *Execute JavaScript Code*
+
+2. У полі JavaScript встав цей код:
+
+   ```javascript
+   const labelEl = document.querySelector('.t-Header-logo .t-Header-logo-link span.apex-logo-text');
+   const modeVal = $v('P0_SUBSTITUTION_MODE');
+
+   if (labelEl) {
+     if (modeVal === '1') {
+       labelEl.style.color = 'red';
+     } else {
+       labelEl.style.color = 'purple';
+     }
+   }
+   ```
+
+3. Додай **ще одну дію** — **"Execute when Page Loads"** з тим самим кодом,
+   щоб колір оновлювався відразу при відкритті сторінки (не тільки при зміні).
+
+---
+
+## 🔹 Варіант 2. Через CSS + JavaScript (акуратніше, якщо потрібно масштабувати)
+
+Додай в *Inline CSS* сторінки:
+
+```css
+.substitution-active .t-Header-logo .t-Header-logo-link span.apex-logo-text {
+  color: red !important;
+}
+.substitution-inactive .t-Header-logo .t-Header-logo-link span.apex-logo-text {
+  color: purple !important;
+}
+```
+
+А потім встав JavaScript (у DA при зміні `P0_SUBSTITUTION_MODE` або у розділ *Execute when Page Loads*):
+
+```javascript
+const modeVal = $v('P0_SUBSTITUTION_MODE');
+document.body.classList.remove('substitution-active', 'substitution-inactive');
+document.body.classList.add(modeVal === '1' ? 'substitution-active' : 'substitution-inactive');
+```
+
+> ✅ Перевага: легко змінювати кольори пізніше у CSS, без правок JS.
+
+---
+
+## 🔹 Варіант 3. Через динамічну дію без коду
+
+(менш гнучкий, але можна якщо не хочеш JS)
+
+1. Створи **DA (Change on P0_SUBSTITUTION_MODE)**.
+2. Додай **Action = Execute JavaScript Code** з коротким кодом:
+
+   ```javascript
+   $('.t-Header-logo .t-Header-logo-link span.apex-logo-text')
+     .css('color', $v('P0_SUBSTITUTION_MODE') === '1' ? 'red' : 'purple');
+   ```
+3. Додай копію цього DA з **Event = Page Load**, щоб колір одразу виставився після відкриття.
+
+---
+
+💡 **Рекомендація:**
+використай **варіант 2** (з CSS-класами) — це найнадійніше рішення для APEX теми Universal Theme, бо воно не втручається в inline-стилі і працює стабільно навіть при оновленнях теми.
+
+---
+
+Хочеш, я допоможу одразу вставити це у твою сторінку (покажу точну послідовність дій у Page Designer)?

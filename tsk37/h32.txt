@@ -1,0 +1,70 @@
+це стандартна «фіча» UT: після сортування IR фокусується на лінку сортування в заголовку й сторінка підскролює до нього. Найпростіше — **перехопити подію оновлення звіту і примусово перевести фокус у «нейтральне» місце.**
+
+## Швидке рішення (рекомендовано)
+
+1. Дай Interactive Report’у **Static ID**, наприклад `mainIR`.
+
+2. Додай на сторінку **невидимий “якір” для фокусу** (Static Content region → *Source*):
+
+```html
+<a id="neutralFocus" class="u-VisuallyHidden" href="#" tabindex="-1">.</a>
+```
+
+3. Створи **Dynamic Action**:
+
+* **Event:** *Page Load*
+* **True Action:** *Execute JavaScript Code*:
+
+```javascript
+(function setNeutralFocusOnLoad(){
+  // на всяк випадок прибрати фокус з того, що активне
+  if (document.activeElement) { document.activeElement.blur(); }
+  // встановити нейтральний фокус
+  var n = document.getElementById('neutralFocus');
+  if (n) { n.focus(); }
+})();
+```
+
+4. Другий **Dynamic Action**:
+
+* **Event:** *After Refresh*
+* **Selection Type:** *Region* → вибери твій IR зі Static ID `mainIR`
+* **True Action:** *Execute JavaScript Code*:
+
+```javascript
+// Після будь-якого refresh (в т.ч. сортування) — прибираємо «стрибок» фокусу
+setTimeout(function(){
+  if (document.activeElement) { document.activeElement.blur(); }
+  var n = document.getElementById('neutralFocus');
+  if (n) { n.focus(); }
+}, 0);
+```
+
+Готово: при завантаженні сторінки та після кожного рефрешу/сортування фокус піде на прихований елемент, і сторінка не стрибатиме до заголовка колонки.
+
+---
+
+## Альтернатива без додаткового HTML
+
+Якщо не хочеш додавати `<a>`:
+
+* **Page Load** і **After Refresh** (на `mainIR`) — той самий JS, але фокус на `body`:
+
+```javascript
+setTimeout(function(){
+  if (document.activeElement) { document.activeElement.blur(); }
+  // робимо body тимчасово фокусним
+  document.body.setAttribute('tabindex','-1');
+  document.body.focus();
+  // опціонально: прибрати tabindex після
+  setTimeout(function(){ document.body.removeAttribute('tabindex'); }, 100);
+}, 0);
+```
+
+> Працює, але спосіб з «нейтральним якорем» більш акуратний.
+
+---
+
+## Порада
+
+Щоб не втрачати доступність, **не відключай outline** через CSS. Краще керуй саме місцем фокусу, як вище.
