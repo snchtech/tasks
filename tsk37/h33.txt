@@ -1,0 +1,156 @@
+Ага, тепер зрозуміло, де саме ти це тримаєш. Сам код `procedure ... is ... function ... cursor ...` **формально ок**, але судячи з тексту помилки:
+
+> Encountered the symbol "CURSOR" when expecting one of the following: begin function pragma procedure
+
+Oracle вважає, що **на тому рівні, де стоїть `cursor c_due` — курсори не дозволені**. Тобто він бачить не декларативну частину процедури, а або:
+
+* вже *закриту* процедуру (і ми на рівні package body, де з якихось причин не дозволяє cursor),
+* або попередня локальна функція в його очах не завершена коректно.
+
+Щоб не ловити фантомні баги через локальні функції, пропоную **простий і надійний рефакторинг**:
+всі маленькі функції (`apply_time`, `iso_dow`, `exists_task`) і курсор винести в **приватну секцію пакета**, а в `instantiate_for_day` лишити тільки логіку.
+
+Це й чистіше, і гарантія, що помилка зникне.
+
+---
+
+## Як переробити (робочий варіант)
+
+### 1. У тілі пакета, ПЕРЕД `instantiate_for_day`
+
+Додай (один раз, поза будь-якими процедурами):
+
+```plsql
+  ---------------------------------------------------------------------------
+  -- Допоміжні функції для масової генерації (приватні для пакета)
+  ---------------------------------------------------------------------------
+  function apply_time(p_base date, p_time date) return date is
+  begin
+    if p_time is null then
+      return p_base;
+    else
+      return trunc(p_base) + (p_time - trunc(p_time));
+    end if;
+  end apply_time;
+
+  function iso_dow(p_d date) return number is
+  begin
+    -- Пн=1 … Нд=7
+    return to_number(to_char(p_d, 'D', 'NLS_TERRITORY=UNITED KINGDOM'));
+  end iso_dow;
+
+  function exists_task(p_template_id number, p_planned_dt date) return boolean is
+    l_dummy number;
+  begin
+    select 1
+      into l_dummy
+      from tasks
+     where template_id = p_template_id
+       and is_generated = 1
+       and trunc(planning_date_start) = trunc(p_planned_dt)
+       and ( planning_date_start = p_planned_dt
+          or planning_date_start between p_planned_dt - 1/1440
+                                     and p_planned_dt + 1/1440 );
+    return true;
+  exception
+    when no_data_found then
+      return false;
+  end exists_task;
+
+  ---------------------------------------------------------------------------
+  -- Курсор шаблонів для конкретного дня
+  ---------------------------------------------------------------------------
+  cursor c_due (
+    p_run_date           date,
+    p_service_creator_id number
+  ) is
+    select
+      t.id                                    as template_id,
+      nvl(p_service_creator_id, t.creator_id) as creator_id,
+      case
+        when t.period_mode = 'WEEKLY' then apply_time(p_run_date, t.weekly_time)
+        else                               apply_time(p_run_date, t.period_time)
+      end as planned_dt
+    from task_templates t
+    where nvl(t.status_id, 0) <> 0
+      and (t.date_end is null or t.date_end > p_run_date)
+      and (t.period_start_date is null or t.period_start_date <= p_run_date)
+      and (
+            (t.period_mode = 'ONCE'
+             and trunc(t.next_run_date) = trunc(p_run_date))
+         or (t.period_mode = 'DAILY'
+             and mod( trunc(p_run_date)
+                    - trunc(nvl(t.period_start_date, t.date_create)),
+                     greatest(nvl(t.period_interval, 1), 1)
+                   ) = 0)
+         or (t.period_mode = 'WEEKLY'
+             and exists (
+                   select 1
+                     from task_weekdays w
+                    where w.template_id = t.id
+                      and w.weekday     = iso_dow(p_run_date)
+                 ))
+          );
+```
+
+> Важливо: це все стоїть **на одному рівні з іншими процедурами/функціями** в `package body`, наприклад одразу після `instantiate_once`.
+
+---
+
+### 2. Тепер сама процедура `instantiate_for_day`
+
+Вже без внутрішніх функцій/курсора — тільки виклики:
+
+```plsql
+  procedure instantiate_for_day(
+    p_run_date           in date   default trunc(sysdate),
+    p_service_creator_id in number default null,
+    p_default_status_id  in number default null
+  ) is
+    l_task_id number;
+  begin
+    for r in c_due(p_run_date => p_run_date,
+                   p_service_creator_id => p_service_creator_id) loop
+
+      -- антидубль
+      if not exists_task(r.template_id, r.planned_dt) then
+        -- створюємо завдання
+        instantiate_once(
+          p_template_id => r.template_id,
+          p_creator_id  => r.creator_id,
+          p_now         => r.planned_dt,
+          o_task_id     => l_task_id
+        );
+
+        -- за потреби перезаписати статус
+        if p_default_status_id is not null then
+          update tasks
+             set status_id  = p_default_status_id,
+                 date_update = sysdate,
+                 updator     = r.creator_id
+           where id = l_task_id;
+        end if;
+      end if;
+    end loop;
+
+    commit;
+  exception
+    when others then
+      rollback;
+      raise;
+  end instantiate_for_day;
+```
+
+---
+
+### Чому це “магічно” приб’є помилку
+
+* Тепер `cursor c_due` — **пакетний**, а не локальний, і компілятор точно не буде думати, що він “у середині якоїсь функції”.
+* Всі `function ... end ...;` знаходяться окремо й завершені, тому шанс, що Oracle “з’їсть” `end;` і думає, що ти ще в тілі функції — мінімальний.
+* Декларативна секція `instantiate_for_day` стала простою: тільки змінні (`l_task_id`) → `begin`.
+
+Тобто замість боротьби з примхою парсера ми просто робимо структуру пакета простішою й “класичною”.
+
+---
+
+Якщо після цього компіляція все одно дасть помилку — це вже буде точно інший рядок/код навколо, і тоді можна буде подивитися на **ціле тіло пакета** (без чутливих речей, звісно) і по рядку знайти, де Oracle “з’їхав з рейок”. Але з таким рефакторингом має зібратися нормально.

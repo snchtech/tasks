@@ -1,0 +1,143 @@
+Так, так можна 💡
+І це якраз хороший компроміс: **допоміжні функції – на рівні пакета**, а **cursor c_due – локальний всередині `instantiate_for_day`**.
+
+Тоді:
+
+* компілятор менше «плутається» з вкладеними функціями;
+* курсор спокійно живе в декларативній секції процедури і бачить ці функції, бо вони оголошені в тому ж package body.
+
+---
+
+## 1. Виносимо допоміжні функції в package body (приватні)
+
+У тілі пакета (НЕ в spec!), десь вище за `instantiate_for_day`, додаєш:
+
+```plsql
+  ---------------------------------------------------------------------------
+  -- Допоміжні функції для масової генерації
+  ---------------------------------------------------------------------------
+  function apply_time(p_base date, p_time date) return date is
+  begin
+    if p_time is null then
+      return p_base;
+    else
+      return trunc(p_base) + (p_time - trunc(p_time));
+    end if;
+  end apply_time;
+
+  function iso_dow(p_d date) return number is
+  begin
+    -- Пн = 1 … Нд = 7
+    return to_number(to_char(p_d, 'D', 'NLS_TERRITORY=UNITED KINGDOM'));
+  end iso_dow;
+
+  function exists_task(p_template_id number, p_planned_dt date) return boolean is
+    l_dummy number;
+  begin
+    select 1
+      into l_dummy
+      from tasks
+     where template_id = p_template_id
+       and is_generated = 1
+       and trunc(planning_date_start) = trunc(p_planned_dt)
+       and ( planning_date_start = p_planned_dt
+          or planning_date_start between p_planned_dt - 1/1440
+                                     and p_planned_dt + 1/1440 );
+    return true;
+  exception
+    when no_data_found then
+      return false;
+  end exists_task;
+```
+
+> Це **приватні** функції: їх не потрібно додавати в package spec, вони доступні всередині всього `task_template_inst_pkg`.
+
+---
+
+## 2. Усередині `instantiate_for_day` лишаємо тільки cursor + змінні
+
+Тепер процедура виглядає так:
+
+```plsql
+  procedure instantiate_for_day(
+    p_run_date           in date   default trunc(sysdate),
+    p_service_creator_id in number default null,
+    p_default_status_id  in number default null
+  ) is
+    l_task_id number;
+
+    cursor c_due is
+      select
+        t.id                                    as template_id,
+        nvl(p_service_creator_id, t.creator_id) as creator_id,
+        case
+          when t.period_mode = 'WEEKLY' then apply_time(p_run_date, t.weekly_time)
+          else                               apply_time(p_run_date, t.period_time)
+        end as planned_dt
+      from task_templates t
+      where nvl(t.status_id, 0) <> 0
+        and (t.date_end is null or t.date_end > p_run_date)
+        and (t.period_start_date is null or t.period_start_date <= p_run_date)
+        and (
+              (t.period_mode = 'ONCE'
+               and trunc(t.next_run_date) = trunc(p_run_date))
+           or (t.period_mode = 'DAILY'
+               and mod(
+                     trunc(p_run_date)
+                     - trunc(nvl(t.period_start_date, t.date_create)),
+                     greatest(nvl(t.period_interval, 1), 1)
+                   ) = 0)
+           or (t.period_mode = 'WEEKLY'
+               and exists (
+                     select 1
+                       from task_weekdays w
+                      where w.template_id = t.id
+                        and w.weekday     = iso_dow(p_run_date)
+                   ))
+            );
+  begin
+    for r in c_due loop
+      if not exists_task(r.template_id, r.planned_dt) then
+        instantiate_once(
+          p_template_id => r.template_id,
+          p_creator_id  => r.creator_id,
+          p_now         => r.planned_dt,
+          o_task_id     => l_task_id
+        );
+
+        if p_default_status_id is not null then
+          update tasks
+             set status_id  = p_default_status_id,
+                 date_update = sysdate,
+                 updator     = r.creator_id
+           where id = l_task_id;
+        end if;
+      end if;
+    end loop;
+
+    commit;
+  exception
+    when others then
+      rollback;
+      raise;
+  end instantiate_for_day;
+```
+
+Тут важливі моменти:
+
+* `cursor c_due` **оголошений між `is` і `begin`** — це правильне місце.
+* Допоміжні функції уже **не всередині процедури**, тож парсер не «ламає голову», де закінчується яка `end;`.
+* У курсорі ми просто викликаємо `apply_time`, `iso_dow`, `exists_task`, які є в тому ж package body.
+
+---
+
+## Чому твоя попередня версія могла давати LS-00103
+
+1. Десь вище в пакеті могла бути дрібниця: “красивий” символ, погане копіювання коментаря, невидимий символ, не-ASCII тире — і парсер думав, що ти все ще всередині функції/процедури.
+2. Локальні вкладені функції + курсор іноді провокують дивні діагностики, коли десь пропущено `end` / `;` не в тому місці, де показує помилка.
+
+Перенісши функції нагору, ми максимально спрощуємо структуру `instantiate_for_day`, і помилка **або зникає**, або, якщо ще щось не так, покаже вже точніше місце.
+
+---
+
+Якщо після такого рефакторингу все одно буде помилка саме на `cursor c_due` — тоді 99%, що проблема не в цій процедурі, а **в якомусь `end;/comment` вище в пакеті**. Тоді можна буде пробігтися по всьому body, але, швидше за все, з таким розділенням воно вже нормально скомпілюється.
