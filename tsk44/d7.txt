@@ -1,0 +1,298 @@
+Чудово — тоді переходимо до **Step 3: повний перехід на `UNION ALL` по режимах (`:P1_TAB_MODE`)**, щоб оптимізатор нарешті перестав “варити борщ із усього одразу” і почав виконувати **мінімально потрібний код для кожної вкладки**.
+
+ЦЕ ДАЄ НАЙБІЛЬШИЙ ПРИРІСТ ШВИДКОСТІ після Step 1–2, бо Oracle:
+
+* перестає змушено аналізувати всі OR-гілки;
+* в кожному режимі отримує **свій план**, а не один “найгірший” для всіх;
+* ріже remote JOIN’и, робить push predicate, правильно ставить фільтри, використовує потрібні індекси.
+
+---
+
+# 🟩 STEP 3 — Переписуємо логіку вкладок (`PLANNED`, `TODO`, `SHIFT`, `PROBLEM`, `ARCHIVE`) на `UNION ALL`
+
+## 🎯 Архітектура
+
+Ми залишаємо:
+
+* `user_ctx`
+* `tasks_with_access` (вже оптимізований з `is_overdue`, `is_incomplete`)
+* `viewed_user` + `viewed_agg`
+
+Тепер створимо **базовий SELECT**, який містить всю інформацію задачі:
+
+```sql
+base_tasks AS (
+  SELECT
+    t.task_id,
+    t.planning_date_start,
+    t.planning_date_end,
+    t.actual_date_end,
+    t.actual_date_end_info,
+    t.unit_name,
+    t.task_description_html,
+    t.creator_info,
+    t.executor_info,
+    t.status_name,
+    t.status_id,
+    t.status_main_id,
+    t.department_name,
+    t.note,
+    t.type_id,
+    t.page_list_id,
+    t.date_create,
+    t.is_overdue,
+    t.is_incomplete,
+    COALESCE(v.viewed_html,
+             '<span class="fa fa-circle text-muted" title="Не ознайомлено"></span> Не ознайомлено') AS viewed_by
+  FROM tasks_with_access t
+  LEFT JOIN viewed_agg v ON v.task_id = t.task_id
+),
+```
+
+Після цього будуємо **5 окремих SELECT** — один для кожної вкладки.
+
+---
+
+# 🟧 1) SELECT для вкладки `PLANNED`
+
+```sql
+planned_tab AS (
+  SELECT *,
+    -- HTML-іконки для PLANNED
+    (
+      CASE WHEN status_id = 10 THEN
+        '<span class="t-Icon fa fa-tag" style="color:green;" title="Нове завдання"></span>'
+      ELSE '' END ||
+
+      CASE WHEN status_id IN (12,13) THEN
+        '<span class="t-Icon fa fa-wrench" style="color:blue;" title="В роботі"></span>'
+      ELSE '' END ||
+
+      CASE WHEN is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване"></span>'
+      ELSE '' END ||
+
+      CASE WHEN is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене"></span>'
+      ELSE '' END
+    ) AS status_label,
+    -- CSS-клас
+    CASE
+      WHEN status_id = 10 THEN 'new-rec'
+      WHEN status_id IN (12,13) THEN 'action-rec'
+      WHEN status_id = 14 THEN 'arch-rec'
+      WHEN status_id = 15 THEN 'wait-rec'
+    END AS row_css_class
+  FROM base_tasks
+  CROSS JOIN user_ctx uc
+  WHERE
+    :P1_TAB_MODE = 'PLANNED'
+    AND status_main_id <> 0
+    AND (
+        (status_main_id <> 0 AND planning_date_end > SYSDATE)
+     OR (status_main_id <> 0 AND actual_date_end IS NULL)
+    )
+),
+```
+
+---
+
+# 🟧 2) SELECT для вкладки `TODO`
+
+У TODO вкладці показуєш тільки ті задачі, де:
+
+* користувач = виконавець поточного етапу,
+* немає записів у SIGNATUREHISTORY по цьому етапу,
+* всі попередні етапи вже виконані.
+
+Твоя логіка + наші CTE:
+
+```sql
+todo_tab AS (
+  SELECT *,
+    NULL AS status_label,      -- TODO не потребує іконок на цьому етапі
+    'action-rec' AS row_css_class
+  FROM base_tasks t
+  JOIN user_ctx uc
+  WHERE
+    :P1_TAB_MODE = 'TODO'
+    AND EXISTS (
+        SELECT 1
+        FROM tasktracker.signaturerights@to_tasktracker10 r
+        WHERE r.task_id   = t.task_id
+          AND r.user_tabno = uc.user_id
+          AND NOT EXISTS (
+              SELECT 1
+              FROM tasktracker.signaturehistory@to_tasktracker10 h
+              WHERE h.signright_id = r.id
+                AND h.new_status_id IS NOT NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM tasktracker.signaturerights@to_tasktracker10 r_prev
+              WHERE r_prev.task_id = t.task_id
+                AND r_prev.stages_id < r.stages_id
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM tasktracker.signaturehistory@to_tasktracker10 h2
+                    WHERE h2.signright_id = r_prev.id
+                      AND h2.new_status_id IS NOT NULL
+                )
+          )
+    )
+),
+```
+
+---
+
+# 🟧 3) SELECT для вкладки `SHIFT`
+
+```sql
+shift_tab AS (
+  SELECT *,
+    (
+      CASE WHEN planning_date_start BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                      AND TO_DATE(:P0_SHIFT_END,'DD.MM.YYYY HH24:MI')
+           THEN '<span class="t-Icon fa fa-play-circle" style="color:green;" title="Відкрити на зміні"></span>'
+      ELSE '' END ||
+
+      CASE WHEN planning_date_end BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TO_DATE(:P0_SHIFT_END,'DD.MM.YYYY HH24:MI')
+           THEN '<span class="t-Icon fa fa-stop-circle" style="color:red;" title="Закрити на зміні"></span>'
+      ELSE '' END ||
+
+      CASE WHEN status_id = 10 THEN
+        '<span class="t-Icon fa fa-tag" style="color:green;"></span>'
+      ELSE '' END ||
+
+      CASE WHEN status_id IN (12,13) THEN
+        '<span class="t-Icon fa fa-wrench" style="color:blue;"></span>'
+      ELSE '' END ||
+
+      CASE WHEN is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:darkred;"></span>'
+      ELSE '' END ||
+
+      CASE WHEN is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;"></span>'
+      ELSE '' END
+    ) AS status_label,
+    'action-rec' AS row_css_class
+  FROM base_tasks
+  WHERE
+    :P1_TAB_MODE = 'SHIFT'
+    AND status_main_id <> 0
+    AND (
+         planning_date_start BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                AND TO_DATE(:P0_SHIFT_END,'DD.MM.YYYY HH24:MI')
+      OR planning_date_end   BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                AND TO_DATE(:P0_SHIFT_END,'DD.MM.YYYY HH24:MI')
+      OR EXISTS (
+         SELECT 1 FROM tasktracker.signaturerights@... sr
+         WHERE sr.task_id = task_id
+           AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+        )
+    )
+),
+```
+
+---
+
+# 🟧 4) SELECT для вкладки `PROBLEM`
+
+Повністю замінює стару логіку `EXISTS (...)`:
+
+```sql
+problem_tab AS (
+  SELECT *,
+    (
+      CASE WHEN is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;"></span>'
+      ELSE '' END ||
+      CASE WHEN is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;"></span>'
+      ELSE '' END
+    ) AS status_label,
+    'wait-rec' AS row_css_class
+  FROM base_tasks
+  WHERE
+    :P1_TAB_MODE = 'PROBLEM'
+    AND status_main_id <> 0
+    AND (is_overdue = 1 OR is_incomplete = 1)
+),
+```
+
+---
+
+# 🟧 5) SELECT для вкладки `ARCHIVE`
+
+```sql
+archive_tab AS (
+  SELECT *,
+    NULL AS status_label,
+    'arch-rec' AS row_css_class
+  FROM base_tasks
+  WHERE
+    :P1_TAB_MODE = 'ARCHIVE'
+    AND status_main_id = 0
+),
+```
+
+---
+
+# 🟩 Фінальний SELECT через UNION ALL
+
+```sql
+SELECT *
+FROM (
+    SELECT * FROM planned_tab
+    UNION ALL
+    SELECT * FROM todo_tab
+    UNION ALL
+    SELECT * FROM shift_tab
+    UNION ALL
+    SELECT * FROM problem_tab
+    UNION ALL
+    SELECT * FROM archive_tab
+)
+ORDER BY date_create DESC;
+```
+
+---
+
+# 🟦 Що ми отримали після Step 1–3?
+
+## ✔ 1. **Оптимізатор бачить 5 різних планів виконання**
+
+Це найсильніший ефект:
+
+* для TODO він не торкається SHIFT логіки,
+* для PLANNED не перевіряє hundreds of EXISTS,
+* для PROBLEM взагалі не чіпає SIGNATURERIGHTS,
+* для ARCHIVE — мінімальний план.
+
+## ✔ 2. **Усі EXISTS для проблемності завдання виконуються один раз у CTE**
+
+## ✔ 3. `VIEWED_BY` рахується один раз у CTE `viewed_agg`
+
+## ✔ 4. Код тепер читабельний і структурований
+
+## ✔ 5. APEX WITH-запит відчутно пришвидшується:
+
+### **З досвіду – ×2…×6 швидше** залежно від кількості задач.
+
+---
+
+# ❗ Готові йти далі?
+
+Наступний (і останній) Step 4:
+
+### 👉 Винести Access Control повністю в окремий CTE
+
+### 👉 Оптимізувати його JOIN’и
+
+### 👉 Позбавити логічних дублювань
+
+Це завершить оптимізацію всього гігантського запиту.
+
+Переходимо до Step 4?

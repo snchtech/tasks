@@ -1,0 +1,260 @@
+Так, це якраз два різні, але пов’язані шматочки логіки:
+
+1. **Після `instantiate_for_day`** треба зрушити `NEXT_RUN_DATE` у `TASK_TEMPLATES`, щоб звіт показував “наступний запуск”.
+2. **При створенні / перегляді шаблону** `NEXT_RUN_DATE` має рахуватись від `SYSDATE`, а не “застигати” на першому значенні.
+
+Я пропоную зробити **одну нормальну функцію `get_next_run_date` в цьому ж пакеті** і використовувати її:
+
+* і в `instantiate_for_day`,
+* і в SQL-звіті / формі (через виклик функції замість сирої колонки).
+
+Нижче — готовий код, який ти можеш вставити й адаптувати.
+
+---
+
+## 1. Функція `get_next_run_date` у пакеті
+
+Додаємо її в `package body task_template_inst_pkg` (НЕ в spec, поки що вистачить приватної):
+
+```plsql
+  ---------------------------------------------------------------------------
+  -- Обчислення наступної дати запуску шаблону від p_from_date (SYSDATE)
+  -- Підтримує DAILY та WEEKLY, з урахуванням PERIOD_START_DATE, DATE_END.
+  ---------------------------------------------------------------------------
+  function get_next_run_date(
+    p_template_id in number,
+    p_from_date   in date default trunc(sysdate)
+  ) return date
+  is
+    l_mode         task_templates.period_mode%type;
+    l_interval     task_templates.period_interval%type;
+    l_start        task_templates.period_start_date%type;
+    l_date_end     task_templates.date_end%type;
+    l_period_time  task_templates.period_time%type;
+    l_weekly_time  task_templates.weekly_time%type;
+
+    l_next   date;
+    l_dow    number;
+    l_exists number;
+  begin
+    -- читаємо параметри шаблону
+    select t.period_mode,
+           nvl(t.period_interval, 1),
+           nvl(t.period_start_date, t.date_create),
+           t.date_end,
+           t.period_time,
+           t.weekly_time
+      into l_mode,
+           l_interval,
+           l_start,
+           l_date_end,
+           l_period_time,
+           l_weekly_time
+      from task_templates t
+     where t.id = p_template_id;
+
+    if l_mode is null then
+      return null;
+    end if;
+
+    -- від якої дати рахувати? максимум з from_date та start_date
+    l_next := greatest(trunc(p_from_date), trunc(l_start));
+
+    if l_mode = 'DAILY' then
+      -- шукаємо НАСТУПНУ дату > p_from_date, яка потрапляє в цикл кожні l_interval днів
+      for i in 1 .. 365 loop
+        l_next := l_next + 1;
+        if mod( trunc(l_next) - trunc(l_start), l_interval ) = 0 then
+          exit;
+        end if;
+      end loop;
+
+    elsif l_mode = 'WEEKLY' then
+      -- шукаємо наступний день тижня, який є в TASK_WEEKDAYS
+      for i in 1 .. 365 loop
+        l_next := l_next + 1;
+        l_dow  := iso_dow(l_next);  -- iso_dow вже є в пакеті
+
+        select count(*)
+          into l_exists
+          from task_weekdays w
+         where w.template_id = p_template_id
+           and w.weekday     = l_dow;
+
+        if l_exists > 0 then
+          exit;
+        end if;
+      end loop;
+
+    elsif l_mode = 'ONCE' then
+      -- одноразовий: наступної дати як такої немає
+      return null;
+    else
+      return null;
+    end if;
+
+    -- обрізка по DATE_END
+    if l_date_end is not null and l_next > l_date_end then
+      return null;
+    end if;
+
+    -- додаємо час
+    if l_mode = 'WEEKLY' then
+      l_next := apply_time(l_next, l_weekly_time);
+    else
+      l_next := apply_time(l_next, l_period_time);
+    end if;
+
+    return l_next;
+  end get_next_run_date;
+```
+
+> Використовуються вже існуючі `apply_time` та `iso_dow` (які ми раніше винесли в пакет).
+
+---
+
+## 2. Оновлення `NEXT_RUN_DATE` всередині `instantiate_for_day`
+
+Тепер у твоїй процедурі `instantiate_for_day` **після створення завдання** додай оновлення шаблону:
+
+```plsql
+  procedure instantiate_for_day(
+    p_run_date           in date   default trunc(sysdate),
+    p_service_creator_id in number default null,
+    p_default_status_id  in number default null
+  ) is
+    l_task_id number;
+
+    cursor c_due is
+      select
+        t.id                                    as template_id,
+        nvl(p_service_creator_id, t.creator_id) as creator_id,
+        case
+          when t.period_mode = 'WEEKLY' then apply_time(p_run_date, t.weekly_time)
+          else                               apply_time(p_run_date, t.period_time)
+        end as planned_dt
+      from task_templates t
+      where nvl(t.status_id, 0) <> 0
+        and (t.date_end is null or t.date_end > p_run_date)
+        and (t.period_start_date is null or t.period_start_date <= p_run_date)
+        and (
+              (t.period_mode = 'ONCE'   and trunc(t.next_run_date) = trunc(p_run_date))
+           or (t.period_mode = 'DAILY'  and mod(trunc(p_run_date) - trunc(nvl(t.period_start_date, t.date_create)),
+                                               greatest(nvl(t.period_interval, 1), 1)) = 0)
+           or (t.period_mode = 'WEEKLY' and exists (
+                 select 1
+                   from task_weekdays w
+                  where w.template_id = t.id
+                    and w.weekday     = iso_dow(p_run_date)
+               ))
+            );
+  begin
+    for r in c_due loop
+      -- антидубль
+      if not exists_task(r.template_id, r.planned_dt) then
+        -- створюємо завдання
+        instantiate_once(
+          p_template_id => r.template_id,
+          p_creator_id  => r.creator_id,
+          p_now         => r.planned_dt,
+          o_task_id     => l_task_id
+        );
+
+        if p_default_status_id is not null then
+          update tasks
+             set status_id  = p_default_status_id,
+                 date_update = sysdate,
+                 updator     = r.creator_id
+           where id = l_task_id;
+        end if;
+
+        -- ТУТ ЗРУШУЄМО NEXT_RUN_DATE ШАБЛОНА НА НАСТУПНИЙ ЗАПУСК
+        update task_templates t
+           set t.next_run_date = get_next_run_date(
+                                   p_template_id => t.id,
+                                   p_from_date   => p_run_date
+                                 ),
+               t.date_update   = sysdate,
+               t.updator       = r.creator_id
+         where t.id = r.template_id;
+      end if;
+    end loop;
+
+    commit;
+  exception
+    when others then
+      rollback;
+      raise;
+  end instantiate_for_day;
+```
+
+Тепер після запуску job’а звіт по `TASK_TEMPLATES` буде показувати **оновлений `NEXT_RUN_DATE`**.
+
+---
+
+## 3. Щоб `NEXT_RUN_DATE` на формі / в звіті завжди був “від сьогодні”
+
+Ситуація, яку ти описав:
+
+> Шаблон створений 14 числа, режим DAILY, інтервал 1.
+> На момент сьогодні (16) `NEXT_RUN_DATE` має показувати 17, а не “15, як було вперше пораховано”.
+
+Є два варіанти:
+
+### Варіант A. Показувати “динамічний” `NEXT_RUN_DATE` (рекомендую)
+
+У звіті APEX замість сирої колонки `NEXT_RUN_DATE` використати:
+
+```sql
+task_template_inst_pkg.get_next_run_date(t.id, trunc(sysdate)) as NEXT_RUN_DATE_CALC
+```
+
+І вже цю колонку показувати як “Наступний запуск” (а фізичну `NEXT_RUN_DATE` можна сховати або лишити для контролю).
+
+Тоді незалежно від того, коли створили, **завжди** буде показано реальну наступну дату відносно `SYSDATE`.
+
+На формі шаблону можна так само в Source / Computation:
+
+```plsql
+:P7_NEXT_RUN_DATE := task_template_inst_pkg.get_next_run_date(:P7_TEMPLATE_ID, trunc(sysdate));
+```
+
+### Варіант B. Оновлювати `NEXT_RUN_DATE` не тільки job’ом, а й при редагуванні
+
+У процесі `Before Submit` (коли зберігаєш шаблон):
+
+```plsql
+:update task_templates t
+   set t.next_run_date = task_template_inst_pkg.get_next_run_date(
+                           p_template_id => t.id,
+                           p_from_date   => trunc(sysdate)
+                         ),
+       t.date_update   = sysdate,
+       t.updator       = :P0_CUR_USER_TABNO
+ where t.id = :P7_TEMPLATE_ID;
+```
+
+Або одразу після вставки нового запису.
+
+---
+
+## Як це відповідає твоєму прикладу з 14, 15, 16, 17
+
+* **Старт**: `PERIOD_START_DATE = 14`, `PERIOD_MODE = 'DAILY'`, `PERIOD_INTERVAL = 1`.
+* Функція `get_next_run_date(id, p_from_date => 16)`:
+
+  * бере `max(16, 14) = 16`,
+  * шукає наступний день через цикл:
+
+    * 17 → `mod(17 - 14, 1) = 0` → це наступне спрацювання,
+  * додає час (якщо заданий),
+  * повертає `17.xx`.
+
+Тобто і **в job** (коли ти викликаєш `instantiate_for_day(trunc(sysdate))`), і **в UI** ти завжди працюєш з однією й тією ж функцією, яка дивиться на `SYSDATE` / `p_from_date`.
+
+---
+
+Якщо хочеш, можу окремо накидати:
+
+* невеличку **view** `TASK_TEMPLATES_V` з уже порахованою колонкою `NEXT_RUN_DATE_CALC`,
+* або приклад **APEX column expression**/item source під твій номер сторінки й назви item’ів.

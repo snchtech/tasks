@@ -1,0 +1,367 @@
+Коротко: так, це все ще можна **помітно** пришвидшити, навіть з уже оптимізованим `V_TASKS_FULL`. Зараз твій APEX-запит знову “вбиває” оптимізацію купою корельованих підзапитів, дубльованою логікою й OR’ами по режимах.
+
+Я розділю відповідь на 3 блоки:
+1️⃣ що саме тут гальмує
+2️⃣ які зміни дадуть найбільший ефект
+3️⃣ приклади переписування (не весь монстр, а ключові місця, щоб ти міг далі за тим же шаблоном).
+
+---
+
+## 1. Де основні гальма в цьому APEX-запиті
+
+### 🔴 1) Великий блок `AND ( ... OR ... OR ... )` по `:P1_TAB_MODE`
+
+```sql
+AND (
+ (P1.TAB_MODE = 'PLANNED' AND (...))
+ OR (:P1_TAB_MODE = 'TODO' AND (...))
+ OR (:P1_TAB_MODE = 'SHIFT' AND (...))
+ OR (:P1_TAB_MODE = 'PROBLEM' AND (...))
+ OR (:P1_TAB_MODE = 'ARCHIVE' AND s.STATUS_MAIN_ID = 0)
+)
+```
+
+Для оптимізатора це дуже погано:
+
+* умови по різних режимах “навалені” одним OR;
+* частина з них містить `EXISTS` з dblink, date-between, тощо;
+* Oracle не може добре “відсікти” гілки для непотрібного режиму, особливо з біндами.
+
+### 🔴 2) Зайвий `GROUP BY` в `tasks_with_access`
+
+У CTE `tasks_with_access` ти робиш `GROUP BY` по всім колонкам `t.*`, але **немає жодної агрегації** (`SUM`, `COUNT` тощо). Це:
+
+* змушує Oracle робити зайвий SORT/GROUP BY;
+* фактично працює як `SELECT DISTINCT`, тільки дорожче.
+
+### 🔴 3) Повторні `EXISTS` по тих самих таблицях
+
+Наприклад, логіка “протерміноване / недозаповнене завдання” в `PROBLEM` і потім **ще раз** аналогічна логіка в `STATUS_LABEL_PROBLEM`, `STATUS_LABEL_PLANNED`, `STATUS_LABEL_SHIFT`:
+
+```sql
+EXISTS (
+  SELECT 1
+  FROM TaskTracker.DICT_APP_CONFIRM_LIST@... d
+  WHERE d.PAGE_LIST_ID = t.PAGE_LIST_ID AND d.PARENT_STAGE_ID IS NOT NULL 
+    AND NOT EXISTS (
+      SELECT 1
+      FROM TaskTracker.SIGNATURERIGHTS@... r
+      WHERE r.TASK_ID = t.TASK_ID AND r.STAGES_ID = d.ID
+    )
+)
+```
+
+Така конструкція повторюється кілька разів → кожен раз новий прохід по dblink таблицях.
+
+### 🔴 4) VIEWED_BY – корельовані підзапити в SELECT
+
+У SELECT’і здоровенний `CASE ... WHEN :PO_SUBSTITUTION_MODE = ...` і в кожній гілці:
+
+```sql
+SELECT ... 
+FROM TASK_VIEWED@...
+JOIN PERSONAL@...
+WHERE tv.TASK_ID = t.TASK_ID
+  AND tv.USER_ID = :PO_CUR_USER_TABNO
+  [AND умови по зміні]
+FETCH FIRST ROW ONLY
+```
+
+Для **кожного** рядка задачі окремий remote-запит у `TASK_VIEWED` + `PERSONAL`.
+
+---
+
+## 2. Що дасть найбільший приріст швидкості
+
+### ✅ 1) Розбити режими (`PLANNED`, `TODO`, `SHIFT`, `PROBLEM`, `ARCHIVE`) на `UNION ALL`
+
+Замість одного гігантського WHERE з OR по `:P1_TAB_MODE`, робимо:
+
+```sql
+SELECT ... 
+FROM tasks_with_access t
+JOIN ... 
+WHERE :P1_TAB_MODE = 'PLANNED'
+  AND s.status_main_id <> 0
+  AND ((t.planning_date_end > SYSDATE AND t.actual_date_end IS NULL) ...)
+
+UNION ALL
+
+SELECT ...
+FROM tasks_with_access t
+JOIN ...
+WHERE :P1_TAB_MODE = 'TODO'
+  AND r.user_tabno = uc.user_id
+  AND NOT EXISTS (... TODO-логіка ...)
+
+UNION ALL
+
+SELECT ...
+FROM tasks_with_access t
+...
+WHERE :P1_TAB_MODE = 'SHIFT'
+  AND s.status_main_id <> 0
+  AND (умови по зміні)
+
+-- і т.д. для PROBLEM, ARCHIVE
+```
+
+Ефект:
+
+* для **кожної гілки** – свій план виконання;
+* в режимі `TODO` Oracle не тягне зайві `EXISTS` для `PROBLEM`;
+* для `ARCHIVE` можна взагалі не чіпати `DICT_APP_CONFIRM_LIST` і `SIGNATURERIGHTS`.
+
+На практиці це часто дає **дуже відчутний буст**.
+
+---
+
+### ✅ 2) Прибрати зайвий `GROUP BY` в `tasks_with_access`
+
+У CTE:
+
+```sql
+tasks_with_access AS (
+  SELECT t.*
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN ...
+  WHERE ...
+  GROUP BY t.TASK_ID, ... t.DATE_CREATE
+)
+```
+
+Якщо у тебе **немає** агрегатів (COUNT/SUM/MIN/MAX...), то:
+
+* або прибираєш `GROUP BY` повністю;
+* або, якщо боїшся дублікатів через JOIN’и, робиш `SELECT DISTINCT t.*`.
+
+```sql
+tasks_with_access AS (
+  SELECT DISTINCT t.*
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s ON s.ID = t.STATUS_ID
+  LEFT JOIN tasktracker.signaturerights@to_tasktracker10 r ON r.task_id = t.task_id
+  WHERE ... (доступ + базові фільтри)
+)
+```
+
+`DISTINCT` при відсутності дублюючих рядків дешевший і простіший за величезний `GROUP BY` по всім колонкам.
+
+---
+
+### ✅ 3) Винести “проблемність” завдання в окремий CTE/колонки в `V_TASKS_FULL`
+
+Ти **кілька разів** обчислюєш:
+
+* “протерміноване” → `t.PLANNING_DATE_END < SYSDATE AND t.ACTUAL_DATE_END IS NULL`
+* “недозаповнене” → ота здоровенна `EXISTS (...)` по `DICT_APP_CONFIRM_LIST` і `SIGNATURERIGHTS`.
+
+Простіше:
+
+1. Додай у `V_TASKS_FULL` (або новий CTE) колонки:
+
+```sql
+is_overdue      NUMBER(1),
+is_incomplete   NUMBER(1)
+```
+
+2. Тоді в APEX-запиті:
+
+```sql
+-- фільтр для PROBLEM
+WHERE :P1_TAB_MODE = 'PROBLEM'
+  AND s.status_main_id <> 0
+  AND (t.is_overdue = 1 OR t.is_incomplete = 1)
+
+-- для статус-іконок
+STATUS_LABEL_PROBLEM AS
+CASE
+  WHEN t.is_overdue = 1 AND t.is_incomplete = 1 THEN '<дві іконки>'
+  WHEN t.is_overdue = 1 THEN '<іконка overdue>'
+  WHEN t.is_incomplete = 1 THEN '<іконка incomplete>'
+END
+```
+
+Жодних повторних `EXISTS` у SELECT’і – усе один раз пораховано у view/CTE.
+
+---
+
+### ✅ 4) Оптимізувати VIEWED_BY: один JOIN замість купи SELECT’ів
+
+Зараз у SELECT:
+
+* велика `CASE WHEN :PO_SUBSTITUTION_MODE = 0/1 ...`
+* і в кожній гілці по `SELECT ... FROM TASK_VIEWED ... WHERE tv.TASK_ID = t.TASK_ID AND tv.USER_ID = :...`.
+
+Патерн оптимізації такий:
+
+1. Створюєш CTE `user_ctx` (вже є).
+2. Робиш CTE `viewed_ctx` – всі перегляди **конкретного користувача** (cur або new), одразу з персональними даними та, за потреби, фільтром по зміні.
+
+```sql
+viewed_ctx AS (
+  SELECT
+    tv.task_id,
+    tv.date_viewed,
+    tv.substitution_id,
+    us.familia  AS fam,
+    us.imya     AS name,
+    us.otchestvo AS pat,
+    us.spr_dolznost AS dol,
+    us.tseh_short AS tseh,
+    us1.familia AS sub_fam,
+    us1.imya    AS sub_name,
+    us1.otchestvo AS sub_pat
+  FROM TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 tv
+  CROSS JOIN user_ctx uc
+  JOIN kbs.personal@TO_TASKTRACKER10 us
+    ON us.tab_no = tv.user_id
+   AND us.priznak IS NULL
+  LEFT JOIN kbs.personal@TO_TASKTRACKER10 us1
+    ON us1.tab_no = tv.substitution_id
+   AND us1.priznak IS NULL
+  WHERE tv.user_id = uc.user_id
+    -- якщо потрібний фільтр по зміні:
+    AND (
+      (uc_position_has_shift = 'N' OR uc_position_has_shift IS NULL)
+      OR (
+        TO_DATE(TO_CHAR(tv.date_viewed, 'DD.MM.YYYY HH24:MI'),'DD.MM.YYYY HH24:MI')
+        BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+            AND TO_DATE(:P0_SHIFT_END,'DD.MM.YYYY HH24:MI')
+      )
+    )
+),
+viewed_agg AS (
+  SELECT
+    task_id,
+    /* тут якщо треба – ROWNUM=1 через ROW_NUMBER OVER (PARTITION BY task_id ...) */
+    (формування HTML-строки з fam/name/dol/... на основі substitution_id) AS viewed_html
+  FROM (
+    SELECT
+      v.*,
+      ROW_NUMBER() OVER (PARTITION BY v.task_id ORDER BY v.date_viewed DESC) rn
+    FROM viewed_ctx v
+  )
+  WHERE rn = 1
+)
+```
+
+3. В основному SELECT просто:
+
+```sql
+LEFT JOIN viewed_agg v ON v.task_id = t.task_id
+
+...
+
+COALESCE(v.viewed_html,
+         '<span class="fa fa-circle text-muted" title="Не ознайомлено"></span> Не ознайомлено') AS VIEWED_BY
+```
+
+І вся потвора з подвійними SELECT’ами, `FETCH FIRST ROW ONLY` і умовами по SUBSTITUTION_MODE йде у CTE, виконується **один раз**.
+
+---
+
+## 3. Приклад скороченої структури переписаного запиту
+
+Щоб не малювати тобі ще одного монстра на 1000 рядків, покажу **каркас**, у який ти зможеш вставляти свою HTML-логіку:
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO    END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT     END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK      END AS uchastok_id
+  FROM dual
+),
+
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    r.user_tabno AS exec_user_tabno,
+    r.stages_id  AS exec_stage_id
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10    s ON s.id = t.status_id
+  LEFT JOIN TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r ON r.task_id = t.task_id
+  WHERE
+    -- тут тільки логіка access_control (EXISTS з task_access_control),
+    -- без умов по :P1_TAB_MODE, без TODO/SHIFT/PROBLEM
+),
+
+viewed_agg AS (
+  -- тут агрегуєш "ознайомлено" для user_ctx.user_id, як описано вище
+),
+
+-- Далі – UNION ALL по режимах
+base_select AS (
+  SELECT t.*, v.viewed_html
+  FROM tasks_with_access t
+  LEFT JOIN viewed_agg v ON v.task_id = t.task_id
+)
+
+SELECT ...
+FROM (
+  -- PLANNED
+  SELECT *
+  FROM base_select
+  WHERE :P1_TAB_MODE = 'PLANNED'
+    AND status_main_id <> 0
+    AND (умови PLANNED)
+
+  UNION ALL
+
+  -- TODO
+  SELECT *
+  FROM base_select
+  WHERE :P1_TAB_MODE = 'TODO'
+    AND exec_user_tabno = (SELECT user_id FROM user_ctx)
+    AND NOT EXISTS (... TODO-логіка ...)
+
+  UNION ALL
+
+  -- SHIFT
+  SELECT *
+  FROM base_select
+  WHERE :P1_TAB_MODE = 'SHIFT'
+    AND status_main_id <> 0
+    AND (умови по зміні)
+
+  UNION ALL
+
+  -- PROBLEM
+  SELECT *
+  FROM base_select
+  WHERE :P1_TAB_MODE = 'PROBLEM'
+    AND status_main_id <> 0
+    AND (t.is_overdue = 1 OR t.is_incomplete = 1)
+
+  UNION ALL
+
+  -- ARCHIVE
+  SELECT *
+  FROM base_select
+  WHERE :P1_TAB_MODE = 'ARCHIVE'
+    AND status_main_id = 0
+)
+ORDER BY date_create DESC;
+```
+
+---
+
+## На що я би подивився в першу чергу на практиці
+
+Якщо хочеш **мінімум змін → максимум ефекту**, то порядок такий:
+
+1. 🟢 Прибрати/переписати `GROUP BY` з `tasks_with_access`.
+2. 🟢 Винести логіку `PROBLEM` (overdue/incomplete) в `V_TASKS_FULL` у вигляді прапорців.
+3. 🟢 Зробити `UNION ALL` по `:P1_TAB_MODE` замість великого OR.
+4. 🟢 Винести VIEWED_BY в CTE `viewed_agg`, як я показав, і просто приєднувати.
+
+Ці 4 кроки вже дуже відчутно зменшать час виконання, особливо якщо задач і history багато й усе це ходить по dblink.
+
+Якщо хочеш, можемо наступним кроком **взяти тільки один шматок** (наприклад, TODO або PROBLEM) і я перепишу його в форматі `UNION ALL` + CTE з конкретним працюючим SQL, який ти зможеш одразу поставити в APEX і тестово заміряти.

@@ -1,0 +1,217 @@
+Окей, рухаємось далі – тепер приберемо монстра `VIEWED_BY` з купою `SELECT ... FETCH FIRST ROW ONLY` і замінимо його на один акуратний CTE 💪
+
+### Ідея Step 2
+
+1. Розширюємо `user_ctx`, щоб там були:
+
+   * `substitution_mode` (0/1),
+   * `has_shift_role` (для поточного або “нового” користувача).
+2. Створюємо CTE `viewed_user`, який:
+
+   * бере **всі перегляди** для `user_ctx.user_id` з `TASK_VIEWED`,
+   * приєднує `PERSONAL` (us – хто переглянув, us1 – якщо є SUBSTITUTION_ID),
+   * враховує зміну, якщо є shift-role,
+   * формує HTML-рядок `viewed_html`.
+3. Створюємо `viewed_agg`, який:
+
+   * вибирає **по одному** перегляду на задачу (`ROW_NUMBER() OVER (...)`).
+4. У фінальному SELECT просто:
+
+   * `COALESCE(v.viewed_html, '<span ...>Не ознайомлено</span>') AS VIEWED_BY`.
+
+Жодних корельованих SELECT’ів у SELECT-блоці.
+
+---
+
+## 1. Оновлений `user_ctx`
+
+Додаємо `substitution_mode` і `has_shift_role`:
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    :PO_SUBSTITUTION_MODE AS substitution_mode,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO       END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION    END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT  END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT        END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK         END AS uchastok_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_HAS_SHIFT_ROLE ELSE :PO_CUR_HAS_SHIFT_ROLE  END AS has_shift_role
+  FROM dual
+),
+```
+
+(решта CTE з попереднього кроку – `tasks_with_access` з `is_overdue`, `is_incomplete` – лишаються як ми вже розписали.)
+
+---
+
+## 2. Новий CTE для переглядів: `viewed_user` + `viewed_agg`
+
+### 2.1. `viewed_user`: усі перегляди для поточного користувача
+
+```sql
+viewed_user AS (
+  SELECT
+    tv.task_id,
+    tv.date_viewed,
+    tv.substitution_id,
+    uc.substitution_mode,
+    uc.has_shift_role,
+
+    -- хто фактично переглянув (tv.USER_ID)
+    us.familia      AS viewer_fam,
+    us.imya         AS viewer_name,
+    us.otchestvo    AS viewer_pat,
+    us.spr_dolznost AS viewer_dol,
+    us.tseh_short   AS viewer_tseh,
+
+    -- кого заміщали (tv.SUBSTITUTION_ID), якщо є
+    us1.familia      AS sub_fam,
+    us1.imya         AS sub_name,
+    us1.otchestvo    AS sub_pat,
+    us1.spr_dolznost AS sub_dol,
+    us1.tseh_short   AS sub_tseh
+  FROM TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 tv
+  CROSS JOIN user_ctx uc
+  JOIN kbs.personal@TO_TASKTRACKER10 us
+    ON us.tab_no = tv.user_id
+   AND us.priznak IS NULL
+  LEFT JOIN kbs.personal@TO_TASKTRACKER10 us1
+    ON us1.tab_no = tv.substitution_id
+   AND us1.priznak IS NULL
+  WHERE tv.user_id = uc.user_id
+    -- логіка зміни: якщо у користувача є shift-role,
+    -- фільтруємо по вікну P0_SHIFT_*, інакше – показуємо всі перегляди
+    AND (
+      uc.has_shift_role = 'N'
+      OR uc.has_shift_role IS NULL
+      OR (
+        tv.date_viewed BETWEEN TO_DATE(:P0_SHIFT_START, 'DD.MM.YYYY HH24:MI')
+                          AND TO_DATE(:P0_SHIFT_END,   'DD.MM.YYYY HH24:MI')
+      )
+    )
+),
+
+-- 2.2. Готуємо HTML по кожному перегляду і беремо останній по задачі
+viewed_agg AS (
+  SELECT
+    task_id,
+    viewed_html
+  FROM (
+    SELECT
+      v.task_id,
+      v.date_viewed,
+      -- Формуємо HTML в залежності від режиму та SUBSTITUTION_ID
+      CASE
+        WHEN v.substitution_mode = 0 THEN
+          -- Звичайний режим: просто поточний користувач
+          '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+          v.viewer_fam || ' ' ||
+          SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+          SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+          v.viewer_dol || ', ' || v.viewer_tseh ||
+          ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+
+        WHEN v.substitution_mode = 1 THEN
+          -- Режим підміни
+          CASE
+            WHEN v.substitution_id IS NOT NULL THEN
+              -- Переглянув як "в.о." (є SUBSTITUTION_ID)
+              '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+              v.viewer_fam || ' ' ||
+              SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+              SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+              'в. о. ' || v.sub_dol || ', ' || v.sub_tseh ||
+              ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+            ELSE
+              -- Підміна ввімкнена, але SUBSTITUTION_ID немає – ведемо себе як звичайний режим
+              '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+              v.viewer_fam || ' ' ||
+              SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+              SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+              v.viewer_dol || ', ' || v.viewer_tseh ||
+              ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+          END
+      END AS viewed_html,
+      ROW_NUMBER() OVER (
+        PARTITION BY v.task_id
+        ORDER BY v.date_viewed DESC
+      ) AS rn
+    FROM viewed_user v
+  )
+  WHERE rn = 1
+),
+```
+
+👉 `viewed_agg` тепер має **один рядок на задачу** з уже готовим HTML.
+
+---
+
+## 3. Під’єднуємо `viewed_agg` у фінальному SELECT
+
+Тепер у фінальному блоці (тільки шматок; решта полів із `t.*` лишаємо як є):
+
+```sql
+SELECT
+  t.task_id,
+  TO_CHAR(t.planning_date_start, 'dd.mm.yyyy hh24:mi') AS planning_date_start,
+  t.unit_name,
+  t.task_description_html,
+  t.creator_info,
+  t.executor_info,
+  TO_CHAR(t.planning_date_end, 'dd.mm.yyyy hh24:mi')   AS planning_date_end,
+  t.actual_date_end_info,
+  t.status_name,
+  t.department_name,
+  t.note,
+  t.type_id,
+
+  -- ОЗНАЙОМЛЕННЯ (View)
+  COALESCE(
+    v.viewed_html,
+    '<span class="fa fa-circle text-muted" title="Не ознайомлено"></span> Не ознайомлено'
+  ) AS viewed_by,
+
+  t.status_id,
+  -- далі STATUS_LABEL_PROBLEM / PLANNED / SHIFT, ROW_CSS_CLASS, TASK_CODE як ми вже переписали вище...
+  ...
+FROM tasks_with_access t
+LEFT JOIN viewed_agg v
+       ON v.task_id = t.task_id
+ORDER BY t.date_create DESC;
+```
+
+І тут дуже важливий момент:
+
+* ми **повністю забираємо** старий величезний `CASE ... WHEN :PO_SUBSTITUTION_MODE ...` з кількома `SELECT ... FROM TASK_VIEWED` в середині;
+* уся логіка рендерингу `VIEWED_BY` тепер в одному місці (`viewed_user / viewed_agg`), виконується один раз по всьому набору задач.
+
+---
+
+## 4. Що ми вже маємо після Step 1 + Step 2
+
+1. **`is_overdue` та `is_incomplete`** – рахуються один раз в `tasks_with_access`, а далі використовується всюди (фільтри + іконки з проблемами/планом/зміною).
+2. **`VIEWED_BY`**:
+
+   * один прохід по `TASK_VIEWED` + `PERSONAL`;
+   * логіка зміни та субституції в одному CTE;
+   * жодних корельованих субзапитів у SELECT.
+3. План запиту стає суттєво простіший, менше remote-викликів, менше повторів.
+
+---
+
+## 5. Наступний логічний крок (Step 3)
+
+Якщо готовий йти далі, пропоную наступним кроком:
+
+* **розвалити великий OR по `:P1_TAB_MODE` на `UNION ALL`**:
+
+  * окремий SELECT для `PLANNED`,
+  * окремий для `TODO`,
+  * окремий для `SHIFT`,
+  * окремий для `PROBLEM`,
+  * окремий для `ARCHIVE`.
+
+Це дозволить оптимізатору будувати **різні плани** під різні режими, не тягнути зайві JOIN/EXISTS там, де вони не потрібні.
+
+Якщо ок, у наступному кроці покажу каркас з `UNION ALL` для всіх вкладок на основі вже готових CTE (`user_ctx`, `tasks_with_access`, `viewed_agg`).

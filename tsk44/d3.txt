@@ -1,0 +1,424 @@
+Окей, зібрав усе в **один великий запит** з CTE, де вже зашиті:
+
+* `subtasks_html` – список `<li>` по підзавданнях
+* `creator_info` – повний HTML-блок *"Створено / Видано"* (stages_id = 2)
+* `executor_info` – повний HTML-блок *"Виконавець / Виконано / Зафіксовано керівником"* (stages_id = 4)
+* `actual_end` – фактична дата завершення (stages_id = 6)
+* `status_calc` – обчислення `status_id` і `status_name` з твоєю логікою `13 → 15`, якщо всі executor’и відпрацювали
+* `viewed_today` – хто ознайомився сьогодні
+
+> ⚠️ Можуть бути дрібні відмінності в назвах полів (`SORT_ORDER`, `STATUS_ID` тощо) — я поставив найбільш логічні варіанти. Якщо щось не співпаде зі схемою, просто підправиш ім’я колонки.
+
+---
+
+## Готовий варіант запиту
+
+```sql
+WITH
+-- 1. HTML-список підзавдань
+subtasks_html AS (
+  SELECT
+    s.task_id,
+    LISTAGG('<li>' || s.subtask_content || '</li>', '')
+      WITHIN GROUP (ORDER BY s.subtask_order) AS subtasks_html
+  FROM TaskTracker.TASK_SUBTASKS@TO_TASKTRACKER10 s
+  GROUP BY s.task_id
+),
+
+/* ======== CREATOR_INFO (stages_id = 2) ======== */
+
+creator_sign AS (
+  SELECT
+    h.signright_id,
+    h.signer_by,
+    h.signer_date,
+    h.sdate,
+    us.familia      AS signer_familia,
+    us.imya         AS signer_imya,
+    us.otchestvo    AS signer_otchestvo,
+    us.spr_dolznost AS signer_dolznost,
+    us.tseh_short   AS signer_tseh_short,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.signright_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+  JOIN KBS.Personal@TO_TASKTRACKER10 us
+    ON us.tab_no = h.signer_by
+   AND us.priznak IS NULL
+),
+
+creator_info AS (
+  SELECT
+    sr.task_id,
+
+    '<span class="task_creator">' ||
+    '<span class="exctr-ttl">Створено:</span><br/>' ||
+
+    -- Блок "хто створив" (USER_TABNO + посада + підрозділ)
+    RTRIM(
+      CASE
+        WHEN sr.user_tabno IS NOT NULL THEN
+          u2.familia || ' ' ||
+          SUBSTR(u2.imya, 1, 1) || '. ' ||
+          SUBSTR(u2.otchestvo, 1, 1) || '. ' ||
+          ', ' || u2.spr_dolznost || ', ' || u2.tseh_short || ', '
+        ELSE
+          ''
+      END
+      ||
+      NVL(bb.name, '')
+      ||
+      CASE
+        WHEN bb.name IS NOT NULL AND dep.short_name IS NOT NULL
+        THEN ', '
+        ELSE ''
+      END
+      ||
+      NVL(dep.short_name, '')
+    , ', ') ||   -- обрізаємо зайву кому
+    '</span><br/>' ||
+
+    -- Блок "Видано:"
+    CASE
+      WHEN sr.user_tabno IS NOT NULL THEN
+        CASE
+          WHEN cs.signer_by = sr.user_tabno THEN
+            -- той самий користувач
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+          ELSE
+            -- інший підписант
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya, 1, 1) || '. ' ||
+            SUBSTR(cs.signer_otchestvo, 1, 1) || '. ' ||
+            cs.signer_dolznost || ' ' ||
+            cs.signer_tseh_short || ' ' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+        END
+      ELSE
+        CASE
+          WHEN cs.signer_by IS NOT NULL THEN
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya, 1, 1) || '. ' ||
+            SUBSTR(cs.signer_otchestvo, 1, 1) || '. ' ||
+            cs.signer_dolznost || ' ' ||
+            cs.signer_tseh_short || ' ' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+          ELSE
+            NULL
+        END
+    END ||
+
+    '</span>' AS creator_info_html
+
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+  LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos1
+         ON pos1.kod = sr.position_id 
+  LEFT JOIN kbs.spr_dolznost_base@TO_TASKTRACKER10 bb
+         ON bb.id = pos1.id_base
+  LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep
+         ON dep.id = sr.department_id
+  LEFT JOIN kbs.personal@TO_TASKTRACKER10 u2
+         ON u2.tab_no = sr.user_tabno
+        AND u2.priznak IS NULL
+  LEFT JOIN creator_sign cs
+         ON cs.signright_id = sr.id
+        AND cs.rn = 1
+  WHERE sr.stages_id = 2
+),
+
+/* ======== EXECUTOR_INFO (stages_id = 4) ======== */
+
+executor_sign AS (
+  SELECT
+    h.signright_id,
+    h.signer_by,
+    h.signer_date,
+    h.sdate,
+    h.mark_by_chief,
+    h.chief_position,
+    -- виконавець
+    us.familia      AS exec_familia,
+    us.imya         AS exec_imya,
+    us.otchestvo    AS exec_otchestvo,
+    us.spr_dolznost AS exec_dolznost,
+    us.tseh_short   AS exec_tseh_short,
+    -- керівник
+    uc.familia      AS chief_familia,
+    uc.imya         AS chief_imya,
+    uc.otchestvo    AS chief_otchestvo,
+    uc.spr_dolznost AS chief_dolznost,
+    uc.tseh_short   AS chief_tseh_short,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.signright_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+  JOIN KBS.Personal@TO_TASKTRACKER10 us
+    ON us.tab_no = h.signer_by
+   AND us.priznak IS NULL
+  LEFT JOIN KBS.Personal@TO_TASKTRACKER10 uc
+    ON uc.tab_no = h.mark_by_chief
+   AND uc.priznak IS NULL
+),
+
+executor_info AS (
+  SELECT
+    sr2.task_id,
+
+    LISTAGG(
+      '<span class="trk_creator exctr-titl-delim">' ||
+
+      -- Номер виконавця (якщо є)
+      CASE
+        WHEN sr2.sort_order IS NOT NULL THEN
+          '<span class="trk-creator-number">' ||
+          sr2.sort_order || '.</span> '
+        ELSE
+          ''
+      END ||
+
+      -- Основний текст: ПІБ + посада + підрозділ
+      RTRIM(
+        CASE
+          WHEN sr2.user_tabno IS NOT NULL THEN
+            u3.familia || ' ' ||
+            SUBSTR(u3.imya, 1, 1) || '. ' ||
+            SUBSTR(u3.otchestvo, 1, 1) || '. ' ||
+            u3.spr_dolznost || ' ' ||
+            u3.tseh_short
+          ELSE
+            ''
+        END
+        ||
+        CASE
+          WHEN sr2.user_tabno IS NOT NULL
+           AND (pos2.name IS NOT NULL OR dep.short_name IS NOT NULL)
+          THEN ', '
+          ELSE ''
+        END
+        ||
+        NVL(pos2.name, '')
+        ||
+        CASE
+          WHEN pos2.name IS NOT NULL AND dep.short_name IS NOT NULL
+          THEN ', '
+          ELSE ''
+        END
+        ||
+        NVL(dep.short_name, '')
+      , ', ')
+      || '</span>' ||
+
+      -- Блок "виконано/зафіксовано"
+      CASE
+        WHEN es.mark_by_chief IS NOT NULL
+         AND es.chief_position IS NOT NULL THEN
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Зафіксовано керівником:</span><br />' ||
+          es.chief_familia || ' ' ||
+          SUBSTR(es.chief_imya, 1, 1) || '. ' ||
+          SUBSTR(es.chief_otchestvo, 1, 1) || '. ' ||
+          es.chief_dolznost || ' ' || es.chief_tseh_short ||
+          '<br/><strong>Виконано: </strong>' ||
+          es.exec_familia || ' ' ||
+          SUBSTR(es.exec_imya, 1, 1) || '. ' ||
+          SUBSTR(es.exec_otchestvo, 1, 1) || '. ' ||
+          es.exec_dolznost || ', ' || es.exec_tseh_short || ', ' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+
+        WHEN sr2.user_tabno IS NOT NULL
+         AND es.signer_by = sr2.user_tabno THEN
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Виконано:</span><br />' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+
+        WHEN es.signer_by IS NOT NULL THEN
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Виконано:</span><br />' ||
+          es.exec_familia || ' ' ||
+          SUBSTR(es.exec_imya, 1, 1) || '. ' ||
+          SUBSTR(es.exec_otchestvo, 1, 1) || '. ' ||
+          es.exec_dolznost || ' ' || es.exec_tseh_short || ' ' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+        ELSE
+          ''
+      END
+    , ' ') WITHIN GROUP (ORDER BY sr2.id) AS executor_info_html
+
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr2
+  LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos2
+         ON pos2.kod = sr2.position_id
+  LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep
+         ON dep.id = sr2.department_id
+  LEFT JOIN KBS.Personal@TO_TASKTRACKER10 u3
+         ON u3.tab_no = sr2.user_tabno
+        AND u3.priznak IS NULL
+  LEFT JOIN executor_sign es
+         ON es.signright_id = sr2.id
+        AND es.rn = 1
+  WHERE sr2.stages_id = 4
+  GROUP BY sr2.task_id
+),
+
+/* ======== Фактична дата завершення (stage 6) ======== */
+
+actual_end AS (
+  SELECT
+    sr3.task_id,
+    MAX(h.signer_date) AS actual_date_end
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr3
+  JOIN TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+    ON h.signright_id = sr3.id
+  WHERE sr3.stages_id = 6
+  GROUP BY sr3.task_id
+),
+
+/* ======== Статуси (історія + спецлогіка 13 -> 15) ======== */
+
+status_hist AS (
+  SELECT
+    r.task_id,
+    h.new_status_id,
+    s.name AS new_status_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.task_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+  JOIN TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+    ON r.id = h.signright_id
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = h.new_status_id
+  WHERE h.new_status_id IS NOT NULL
+),
+
+stage4_not_signed AS (
+  SELECT
+    r2.task_id,
+    COUNT(*) AS not_signed_cnt
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r2
+  WHERE r2.stages_id = 4
+    AND NOT EXISTS (
+      SELECT 1
+      FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h2
+      WHERE h2.signright_id = r2.id
+        AND h2.new_status_id IS NOT NULL
+    )
+  GROUP BY r2.task_id
+),
+
+status_calc AS (
+  SELECT
+    t.id AS task_id,
+    CASE
+      WHEN NVL(sn.not_signed_cnt, 0) = 0
+           AND NVL(sh.new_status_id, -1) = 13
+      THEN 15
+      ELSE NVL(sh.new_status_id, t.status_id)
+    END AS status_id,
+    CASE
+      WHEN NVL(sn.not_signed_cnt, 0) = 0
+           AND NVL(sh.new_status_id, -1) = 13
+      THEN s15.name
+      ELSE NVL(sh.new_status_name, st.name)
+    END AS status_name
+  FROM TaskTracker.TASKS@TO_TASKTRACKER10 t
+  LEFT JOIN status_hist sh
+    ON sh.task_id = t.id
+   AND sh.rn = 1
+  LEFT JOIN stage4_not_signed sn
+    ON sn.task_id = t.id
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 st
+    ON st.id = t.status_id
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s15
+    ON s15.id = 15
+),
+
+/* ======== Ознайомлений сьогодні ======== */
+
+viewed_today AS (
+  SELECT
+    tv.task_id,
+    (us.familia || ' ' ||
+     SUBSTR(us.imya, 1, 1) || '. ' ||
+     SUBSTR(us.otchestvo, 1, 1) || '. ' ||
+     ', ' || us.spr_dolznost || ', ' || us.tseh_short ||
+     ' (' || TO_CHAR(tv.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+    ) AS viewed_by,
+    ROW_NUMBER() OVER (
+      PARTITION BY tv.task_id
+      ORDER BY tv.date_viewed DESC
+    ) AS rn
+  FROM TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 tv
+  JOIN KBS.personal@TO_TASKTRACKER10 us
+    ON us.tab_no = tv.user_id
+   AND us.priznak IS NULL
+  WHERE TRUNC(tv.date_viewed) = TRUNC(SYSDATE)
+)
+
+SELECT
+  t.id AS task_id,
+  t.planning_date_start,
+  u.name AS unit_name,
+
+  CASE
+    WHEN t.type_id = 1 THEN t.task_content
+    ELSE st_html.subtasks_html
+  END AS task_description_html,
+
+  ci.creator_info_html  AS creator_info,
+  ei.executor_info_html AS executor_info,
+
+  t.planning_date_end,
+  ae.actual_date_end    AS actual_date_end_info,
+  ae.actual_date_end    AS actual_date_end,
+
+  sc.status_name,
+  sc.status_id,
+
+  dep.short_name AS department_name,
+  t.note,
+  t.type_id,
+
+  vt.viewed_by,
+
+  t.page_list_id,
+  t.task_code
+
+FROM TaskTracker.TASKS@TO_TASKTRACKER10 t
+LEFT JOIN TaskTracker.DICT_UNIT@TO_TASKTRACKER10 u
+       ON u.id = t.unit_id
+LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep
+       ON dep.id = t.department_id
+LEFT JOIN subtasks_html  st_html ON st_html.task_id = t.id
+LEFT JOIN creator_info   ci      ON ci.task_id  = t.id
+LEFT JOIN executor_info  ei      ON ei.task_id  = t.id
+LEFT JOIN actual_end     ae      ON ae.task_id  = t.id
+LEFT JOIN status_calc    sc      ON sc.task_id  = t.id
+LEFT JOIN viewed_today   vt      ON vt.task_id  = t.id
+                                 AND vt.rn = 1
+ORDER BY t.date_create DESC;
+```
+
+---
+
+Як далі з цим працювати:
+
+1. Скопіюй запит у View/SQL Developer.
+2. Якщо вилетять помилки типу `ORA-00904: "SORT_ORDER": invalid identifier` — це просто назви колонок, які не співпали зі схемою. Замінюєш їх на реальні (`ORDER_NUM`, `SEQ`, тощо).
+3. Коли все виконається — можна вже дрібно полірувати HTML (класи, `<br/>`, жирність тощо).
+
+Якщо хочеш, можу окремо пройтись тільки по блоку статусів і перевірити зразками даних, чи повертає саме ті статуси, що ти очікуєш (наприклад, описати тест-кейси: таска з останнім статусом 13, таска з підписаними/непідписаними виконавцями тощо).

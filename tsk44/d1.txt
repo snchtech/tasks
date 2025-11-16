@@ -1,0 +1,257 @@
+Супер, що ти це виніс в один запит – тут і справді є що “почистити” 😊
+Зараз головна проблема не в синтаксисі, а в **структурі**:
+
+* купа **корельованих підзапитів у SELECT**
+* **одні й ті самі таблиці** (SIGNATURERIGHTS, SIGNATUREHISTORY, PERSONAL, DICT_STATUS) підключаються по кілька разів
+* усе це ще й по **database link’ах**, тобто кожен такий підзапит = зайвий мережевий раунд.
+
+Нижче покажу, **як це згорнути в CTE** (WITH) та уникнути повторних JOIN’ів. Код буде не 1:1 з твоїм HTML, але структура оптимальна — ти зможеш перенести свою розмітку всередину заготовок.
+
+---
+
+## 1. Основні ідеї оптимізації
+
+1. **SUBTASKS** – один `LISTAGG` по `TASK_ID` → більше не робимо підзапит у CASE.
+2. **CREATOR_INFO (STAGES_ID = 2)** – окремий CTE по SIGNATURERIGHTS + SIGNATUREHISTORY + PERSONAL.
+3. **EXECUTOR_INFO (STAGES_ID = 4)** – окремий CTE з `LISTAGG` по виконавцях.
+4. **Фактична дата завершення (STAGES_ID = 6)** – один CTE `actual_end`.
+5. **STATUS_ID + STATUS_NAME** – один CTE `status_calc`, який обчислює і id, і name, замість двох величезних CASE у основному SELECT.
+6. **VIEWED_BY** – один CTE `viewed_today` з `ROW_NUMBER()`, замість корельованого підзапиту.
+
+---
+
+## 2. Приблизно переписаний запит (структурно оптимізований)
+
+> ⚠️ УВАГА:
+>
+> * Таблиці й лінки я лишив такі, як у тебе (`@To_Tasktracker10`).
+> * Всю детальну HTML-логіку всередині `CREATOR_INFO_HTML` та `EXECUTOR_INFO_HTML` я сильно скоротив і залишив коментарі `/* ... */` – сюди просто перенеси свої CONCAT-вирази.
+> * Логіку “спец-статусу 15, якщо останній статус 13 і виконавці не відпрацьовані” я залишив, але стиснув.
+
+```sql
+WITH
+-- 1. Опис підзавдань у вигляді <li>...</li>
+subtasks_html AS (
+  SELECT
+    s.task_id,
+    LISTAGG('<li>' || s.subtask_content || '</li>', '')
+      WITHIN GROUP (ORDER BY s.subtask_order) AS subtasks_html
+  FROM TaskTracker.TASK_SUBTASKS@To_Tasktracker10 s
+  GROUP BY s.task_id
+),
+
+-- 2. Інформація про "хто видав" (stages_id = 2) по кожному TASK_ID
+creator_info AS (
+  SELECT
+    sr.task_id,
+    /* ТУТ ПЕРЕНОСИШ СВІЙ ВЕЛИКИЙ CONCAT ДЛЯ CREATOR_INFO */
+    '<span class="task_creator"> ... </span>' AS creator_info_html
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr
+  LEFT JOIN kbs.spr_dolznost@To_Tasktracker10 pos1
+         ON pos1.kod = sr.position_id
+  LEFT JOIN kbs.spr_dolznost_base@To_Tasktracker10 bb
+         ON pos1.id_base = bb.id
+  LEFT JOIN kbs.spr_department@To_Tasktracker10 dep
+         ON dep.id = sr.department_id
+  LEFT JOIN kbs.personal@To_Tasktracker10 u2
+         ON u2.tab_no = sr.user_tabno
+        AND u2.priznak IS NULL
+  /* Якщо треба підтягувати SIGNATUREHISTORY – робиш тут ще один LEFT JOIN */
+  LEFT JOIN TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+         ON h.signright_id = sr.id
+  WHERE sr.stages_id = 2
+    -- якщо на задачу може бути кілька записів – беремо перший за якимось правилом
+),
+
+-- 3. Інформація про виконавців (stages_id = 4) – агреговано по TASK_ID
+executor_info AS (
+  SELECT
+    sr2.task_id,
+    LISTAGG(
+      /* ТУТ ПЕРЕНОСИШ СВІЙ CONCAT ДЛЯ ОДНОГО ВИКОНАВЦЯ:
+         '<span class="trk_creator">...' || ... || '</span>'
+       */
+      '<span class="trk_creator"> ... </span>',
+      ' '
+    ) WITHIN GROUP (ORDER BY sr2.id) AS executor_info_html
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr2
+  LEFT JOIN kbs.spr_dolznost@To_Tasktracker10 pos2
+         ON pos2.kod = sr2.position_id
+  LEFT JOIN kbs.spr_department@To_Tasktracker10 dep
+         ON dep.id = sr2.department_id
+  LEFT JOIN kbs.personal@To_Tasktracker10 u3
+         ON u3.tab_no = sr2.user_tabno
+        AND u3.priznak IS NULL
+  /* Якщо треба виводити "Виконано" з SIGNATUREHISTORY – теж приєднуєш тут h */
+  LEFT JOIN TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+         ON h.signright_id = sr2.id
+  WHERE sr2.stages_id = 4
+  GROUP BY sr2.task_id
+),
+
+-- 4. Фактична дата завершення (stages_id = 6)
+actual_end AS (
+  SELECT
+    sr3.task_id,
+    MAX(h.signer_date) AS actual_date_end
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr3
+  JOIN TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+    ON h.signright_id = sr3.id
+  WHERE sr3.stages_id = 6
+  GROUP BY sr3.task_id
+),
+
+-- 5. Історія статусів по кожному TASK_ID (останній статус)
+status_hist AS (
+  SELECT
+    r.task_id,
+    h.new_status_id,
+    s.name AS new_status_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.task_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+  JOIN TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 r
+    ON r.id = h.signright_id
+  LEFT JOIN TaskTracker.DICT_STATUS@To_Tasktracker10 s
+    ON s.id = h.new_status_id
+  WHERE h.new_status_id IS NOT NULL
+),
+
+-- 6. Чи всі виконавці 4-ї стадії відпрацювали (для спеца 15 / 13)
+stage4_not_signed AS (
+  SELECT
+    r2.task_id,
+    COUNT(*) AS not_signed_cnt
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 r2
+  WHERE r2.stages_id = 4
+    AND NOT EXISTS (
+      SELECT 1
+      FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h2
+      WHERE h2.signright_id = r2.id
+        AND h2.new_status_id IS NOT NULL
+    )
+  GROUP BY r2.task_id
+),
+
+-- 7. Розрахунок статусу (id + name) з урахуванням твоєї логіки "13 -> 15"
+status_calc AS (
+  SELECT
+    t.id AS task_id,
+    CASE
+      WHEN NVL(sn.not_signed_cnt, 0) = 0
+           AND NVL(sh.new_status_id, -1) = 13
+      THEN 15                -- спеціальний перехід 13 -> 15
+      ELSE NVL(sh.new_status_id, t.status_id)
+    END AS status_id,
+    CASE
+      WHEN NVL(sn.not_signed_cnt, 0) = 0
+           AND NVL(sh.new_status_id, -1) = 13
+      THEN s15.name          -- назва статусу 15
+      ELSE NVL(sh.new_status_name, st.name)
+    END AS status_name
+  FROM TaskTracker.TASKS@To_Tasktracker10 t
+  LEFT JOIN status_hist sh
+    ON sh.task_id = t.id
+   AND sh.rn = 1
+  LEFT JOIN stage4_not_signed sn
+    ON sn.task_id = t.id
+  LEFT JOIN TaskTracker.DICT_STATUS@To_Tasktracker10 st
+    ON st.id = t.status_id
+  LEFT JOIN TaskTracker.DICT_STATUS@To_Tasktracker10 s15
+    ON s15.id = 15
+),
+
+-- 8. Хто "ознайомлений" сьогодні
+viewed_today AS (
+  SELECT
+    tv.task_id,
+    (us.familia || ' ' || SUBSTR(us.imya, 1, 1) || '. ' ||
+     SUBSTR(us.otchestvo, 1, 1) || '. ' ||
+     ', ' || us.spr_dolznost || ', ' || us.tseh_short ||
+     ' (' || TO_CHAR(tv.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+    ) AS viewed_by,
+    ROW_NUMBER() OVER (
+      PARTITION BY tv.task_id
+      ORDER BY tv.date_viewed DESC
+    ) AS rn
+  FROM TaskTracker.TASK_VIEWED@To_Tasktracker10 tv
+  JOIN KBS.personal@To_Tasktracker10 us
+    ON us.tab_no = tv.user_id
+   AND us.priznak IS NULL
+  WHERE TRUNC(tv.date_viewed) = TRUNC(SYSDATE)
+)
+
+SELECT
+  t.id AS task_id,
+  t.planning_date_start,
+  u.name AS unit_name,
+
+  -- Зміст завдання (текст або список підзавдань)
+  CASE
+    WHEN t.type_id = 1 THEN t.task_content
+    ELSE st_html.subtasks_html
+  END AS task_description_html,
+
+  -- Хто видав
+  ci.creator_info_html AS creator_info,
+
+  -- Виконавець(і)
+  ei.executor_info_html AS executor_info,
+
+  -- Планова дата завершення
+  t.planning_date_end,
+
+  -- Фактична дата завершення (із CTE)
+  ae.actual_date_end,
+  
+  -- Статус (name / id з одного місця)
+  sc.status_name,
+  sc.status_id,
+
+  dep.short_name AS department_name,
+  t.note,
+  t.type_id,
+  t.page_list_id,
+  t.task_code,
+
+  -- Ознайомлений сьогодні
+  vt.viewed_by
+
+FROM TaskTracker.TASKS@To_Tasktracker10 t
+LEFT JOIN TaskTracker.DICT_UNIT@To_Tasktracker10 u
+       ON u.id = t.unit_id
+LEFT JOIN kbs.spr_department@To_Tasktracker10 dep
+       ON dep.id = t.department_id
+LEFT JOIN subtasks_html st_html
+       ON st_html.task_id = t.id
+LEFT JOIN creator_info ci
+       ON ci.task_id = t.id
+LEFT JOIN executor_info ei
+       ON ei.task_id = t.id
+LEFT JOIN actual_end ae
+       ON ae.task_id = t.id
+LEFT JOIN status_calc sc
+       ON sc.task_id = t.id
+LEFT JOIN viewed_today vt
+       ON vt.task_id = t.id
+      AND vt.rn = 1
+ORDER BY t.date_create DESC;
+```
+
+---
+
+## 3. Що ти реально виграєш
+
+1. **Кожна велика таблиця через dblink підключається один раз у CTE**, а не по 10 разів у корельованих підзапитах.
+2. **Логіка статусу** в одному місці (`status_calc`), і ти її не дублюєш (і для `status_name`, і для `status_id`).
+3. **HTML-конкатенація** стає читабельнішою — усе для CREATOR і EXECUTOR в окремих блоках, а не в середині страшного SELECT’а.
+4. Легше **дебажити**: можна запускати окремо `SELECT * FROM status_calc`, `SELECT * FROM executor_info` і дивитися, що не так.
+
+---
+
+Якщо хочеш, наступним кроком можу:
+
+* окремо винести **тільки логіку статусів** і довести її до 100% відповідності твоєму CASE;
+* або **разом пройтися по HTML-блоках** (CREATOR/EXECUTOR) і перенести їх у CTE так, щоб усе було 1:1 з твоїм текстом.

@@ -1,0 +1,239 @@
+Окей, фінішний бос — **access control** 🕹️
+Тут зробимо найкорисніше: винесемо всю логіку `task_access_control + signaturerights` в один-єдиний CTE, а в `tasks_with_access` залишимо тільки JOIN по `task_id`.
+
+Я покажу структуру, а всередину умов ти зможеш вставити свою існуючу логіку 1:1 (ті ж access_level 1/2/3), просто акуратніше.
+
+---
+
+## 1. Що ми хочемо отримати
+
+Замість такого в `tasks_with_access`:
+
+```sql
+WHERE EXISTS (
+  SELECT 1 FROM task_access_control ac
+  JOIN task_access_level_type al ON ...
+  WHERE (... купа OR, AND, EXISTS, ROWNUM=1 ...)
+)
+```
+
+ми робимо:
+
+```sql
+task_access AS (           -- один CTE
+  SELECT DISTINCT task_id
+  FROM ( ... union all по access_level ... )
+),
+
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    ... is_overdue, is_incomplete ...
+  FROM V_TASKS_FULL t
+  JOIN task_access ta ON ta.task_id = t.task_id   -- просто JOIN
+  ...
+)
+```
+
+Тобто:
+
+* всю тяжку логіку вирішуємо **один раз** у `task_access`;
+* `tasks_with_access` більше не містить EXISTS з dblink-таблицями.
+
+---
+
+## 2. CTE `task_access`: доступ користувача до задач
+
+Я одразу пишу в форматі, максимально близькому до того, що ти вже мав, але без синтаксичних “дір”:
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    :PO_SUBSTITUTION_MODE AS substitution_mode,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO       END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION    END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT  END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT        END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK         END AS uchastok_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_HAS_SHIFT_ROLE ELSE :PO_CUR_HAS_SHIFT_ROLE  END AS has_shift_role
+  FROM dual
+),
+
+/* === 1) ACCESS LEVEL 1 =====================================
+   al.access_level = 1
+   Типова логіка: доступ або за user_id, або за position_id,
+   з можливим обмеженням по unit.
+=========================================================== */
+
+access_lvl1 AS (
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 1
+    AND (
+         ac.user_id     = uc.user_id
+      OR ac.position_id = uc.position_id
+    )
+    AND (
+      uc.unit_id IS NULL
+      OR (uc.unit_id IS NOT NULL AND t.unit_id = uc.unit_id)
+    )
+),
+
+/* === 2) ACCESS LEVEL 2 =====================================
+   al.access_level = 2
+   Логіка: (position/department/unit/uchastok) + (user_id опціонально)
+   + відповідність t.department_id, t.unit_id, t.uchastok_id
+=========================================================== */
+
+access_lvl2 AS (
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 2
+    -- фільтри по рівню
+    AND (ac.position_id   IS NULL OR ac.position_id   = uc.position_id)
+    AND (ac.department_id IS NULL OR ac.department_id = uc.department_id)
+    AND (ac.unit_id       IS NULL OR ac.unit_id       = uc.unit_id)
+    AND (ac.uchastok      IS NULL OR ac.uchastok      = uc.uchastok_id)
+    -- додатковий user_id (якщо заданий)
+    AND (ac.user_id IS NULL OR ac.user_id = uc.user_id)
+    -- перевірка по самій задачі (department/unit/uchastok)
+    AND t.department_id = uc.department_id
+    AND (
+      uc.unit_id IS NULL OR (uc.unit_id IS NOT NULL AND t.unit_id = uc.unit_id)
+    )
+    AND (
+      uc.uchastok_id IS NULL OR (uc.uchastok_id IS NOT NULL AND t.uchastok_id = uc.uchastok_id)
+    )
+),
+
+/* === 3) ACCESS LEVEL 3 =====================================
+   al.access_level = 3
+   Логіка: або прямий доступ по user_id,
+           або через підписи (SIGNATURERIGHTS)
+=========================================================== */
+
+access_lvl3 AS (
+  -- 3.1. Прямий доступ, якщо al=3 і ac.user_id = uc.user_id
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 3
+    AND ac.user_id = uc.user_id
+
+  UNION ALL
+
+  -- 3.2. Доступ через SIGNATURERIGHTS (user/position/dep/unit/uchastok)
+  SELECT DISTINCT
+    sr.task_id
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+  CROSS JOIN user_ctx uc
+  WHERE
+        sr.user_tabno   = uc.user_id
+     OR (
+          sr.position_id   = uc.position_id
+      AND sr.department_id = uc.department_id
+      AND (sr.unit_id    IS NULL OR sr.unit_id    = uc.unit_id)
+      AND (sr.uchastok   IS NULL OR sr.uchastok   = uc.uchastok_id)
+        )
+),
+
+/* === 4) Об'єднуємо всі рівні доступу ===================== */
+
+task_access AS (
+  SELECT DISTINCT task_id
+  FROM (
+    SELECT task_id FROM access_lvl1
+    UNION ALL
+    SELECT task_id FROM access_lvl2
+    UNION ALL
+    SELECT task_id FROM access_lvl3
+  )
+),
+```
+
+> 🔁 Всередині кожної секції ти можеш **точно відтворити свою поточну логіку** (умови з твого старого `EXISTS`). Я задав типову структуру, але якщо в тебе є додаткові нюанси для al=1/2/3 – просто додай їх в `WHERE`.
+
+---
+
+## 3. Оновлюємо `tasks_with_access` під цей CTE
+
+Тепер `tasks_with_access` спрощується до:
+
+```sql
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    CASE
+      WHEN t.planning_date_end < SYSDATE AND t.actual_date_end IS NULL THEN 1
+      ELSE 0
+    END AS is_overdue,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+        WHERE d.page_list_id    = t.page_list_id
+          AND d.parent_stage_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+            WHERE r.task_id   = t.task_id
+              AND r.stages_id = d.id
+          )
+      ) THEN 1
+      ELSE 0
+    END AS is_incomplete
+  FROM V_TASKS_FULL t
+  JOIN task_access ta
+    ON ta.task_id = t.task_id    -- ← доступ визначено вище
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = t.status_id
+),
+```
+
+> `user_ctx` тут уже не потрібен напряму — він був використаний у CTE `access_lvlX`.
+> Далі йдуть вже наші `viewed_user`, `viewed_agg`, `base_tasks`, `planned_tab`, `todo_tab`, ... як ми описали в попередньому кроці.
+
+---
+
+## 4. Що це дає по факту
+
+1. **Access Control більше не живе в WHERE кожної задачі**
+   → Одна чітка точка входу (`task_access`), один набір JOIN’ів.
+
+2. **Немає `ROWNUM = 1` всередині здоровенного EXISTS**
+   → Оптимізатор бачить нормальні предикати, може використати індекси.
+
+3. **Кожен access_level має свою чисту гілку**, замість однієї купи OR:
+
+   * простіше читати й відладжувати;
+   * легше розширювати новими рівнями, якщо доведеться.
+
+4. В поєднанні з попередніми кроками (прапорці `is_overdue / is_incomplete`, `viewed_agg`, `UNION ALL` по вкладках) ти отримуєш:
+
+   * мінімум корельованих підзапитів;
+   * мінімум повторів ходів по dblink;
+   * структурований, модульний SQL, де кожен CTE робить свою маленьку чітку справу.
+
+---
+
+Якщо хочеш, далі можемо зробити ще один маленький “профайлінг”-крок:
+я можу підказати, **які індекси на TaskTracker-таблицях** (особливо `TASK_ACCESS_CONTROL`, `SIGNATURERIGHTS`, `TASK_VIEWED`) варто перевірити/додати під цей новий запит, щоб добити виконання до максимально комфортного часу.

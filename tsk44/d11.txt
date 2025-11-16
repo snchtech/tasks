@@ -1,0 +1,208 @@
+Класна задумка, це дуже “юзер-френдлі” фільтр 👌
+Давай зробимо це максимально акуратно й по-кроках.
+
+### Загальна ідея
+
+* Є головний звіт журналу (SQL з усіма нашими CTE).
+* Якщо **користувач має access level = 1**, над звітом показуємо **Checkbox Group** з підрозділами.
+* За замовчуванням: **усі підрозділи, які є в звіті, вибрані, крім ID = 65**.
+* При зміні чекбоксів – **рефрешимо звіт**, він фільтрується по `DEPARTMENT_ID`.
+
+---
+
+## 1. Підготуємо дані: потрібен `DEPARTMENT_ID` у головному запиті
+
+У твоєму великому запиті ми використовуємо `DEPARTMENT_NAME`. Для фільтра нам потрібен **id**.
+Додай у `tasks_with_access` і відповідно в `base_tasks`:
+
+```sql
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    t.department_id,          -- ← якщо ще не було
+    ...
+),
+
+base_tasks AS (
+  SELECT
+    t.task_id,
+    ...
+    t.department_id,
+    t.department_name,
+    ...
+  FROM tasks_with_access t
+  LEFT JOIN viewed_agg v ON v.task_id = t.task_id
+),
+```
+
+І в самому фінальному SELECT:
+
+```sql
+SELECT
+  task_id,
+  ...
+  department_name,
+  department_id,
+  ...
+FROM (
+  SELECT * FROM planned_tab
+  UNION ALL
+  ...
+)
+WHERE (
+  :P1_DEPT_FILTER IS NULL
+  OR department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P1_DEPT_FILTER, ':'))
+     )
+)
+ORDER BY date_create DESC;
+```
+
+> 🔹 Якщо у тебе стара версія APEX без `apex_string.split`, можна використати `apex_util.string_to_table`.
+
+---
+
+## 2. Створюємо Checkbox Group item для підрозділів
+
+### 2.1. Item
+
+1. На цій же сторінці (де твій журнал) створи **Page Item**:
+
+   * Name: `P1_DEPT_FILTER`
+   * Type: **Checkbox Group**
+   * Location: Region над звітом (або в тому ж регіоні в позиції “Above Report”).
+
+2. **List of Values** → Type: `SQL Query`
+   Приклад LOV (беремо всі підрозділи, що реально є в звіті):
+
+   ```sql
+   SELECT DISTINCT
+          b.department_name AS display_value,
+          b.department_id   AS return_value
+   FROM base_tasks b
+   ORDER BY b.department_name
+   ```
+
+   Якщо `base_tasks` як CTE недоступний напряму в LOV, можна взяти з джерела даних, на якому базується звіт (наприклад `V_TASKS_FULL`):
+
+   ```sql
+   SELECT DISTINCT
+          t.department_name AS display_value,
+          t.department_id   AS return_value
+   FROM V_TASKS_FULL t
+   ORDER BY t.department_name
+   ```
+
+---
+
+## 3. Default value: усі підрозділи, крім ID = 65
+
+Щоб при завантаженні були вибрані **всі**, крім `65`, у `P1_DEPT_FILTER` ставимо **Default** типу `SQL Query`:
+
+```sql
+SELECT LISTAGG(department_id, ':') WITHIN GROUP (ORDER BY department_id)
+FROM (
+  SELECT DISTINCT t.department_id
+  FROM V_TASKS_FULL t
+  WHERE t.department_id <> 65
+)
+```
+
+* **Type**: SQL Query (return value must be VARCHAR2)
+* Це збере `1:2:3:10:...` – формат, який checkbox group розуміє.
+
+> Якщо в тебе свій view/таблиця з підрозділами, від якої залежить звіт – можеш взяти `DICT_DEPARTMENT` або іншу таблицю, головне, щоб збігалися `department_id`.
+
+---
+
+## 4. Показувати Checkbox Group тільки при access level = 1
+
+Тут є два варіанти, залежно від того, як ти знаєш рівень доступу користувача.
+
+### Варіант А. У тебе є item / змінна з access level
+
+Наприклад, `:P0_ACCESS_LEVEL` або `:PO_CUR_ACCESS_LEVEL`.
+Тоді на item `P1_DEPT_FILTER` ставиш **Condition**:
+
+* Type: **Value of Item in Expression 1 = Expression 2**
+* Expression 1: `P0_ACCESS_LEVEL`
+* Expression 2: `1`
+
+Або:
+
+* Type: **PL/SQL Expression**
+* Expression: `:P0_ACCESS_LEVEL = 1`
+
+### Варіант Б. Порахувати access level в APEX
+
+Якщо access level визначається функцією (наприклад, `task_security.get_access_level(:APP_USER)`), створюєш **hidden item** `P1_ACCESS_LEVEL`:
+
+* Source Type: `SQL Query` / `PL/SQL Expression`
+* Наприклад:
+
+  ```sql
+  SELECT task_security.get_access_level(:APP_USER) FROM dual
+  ```
+
+І для `P1_DEPT_FILTER` ставиш умову відображення: `:P1_ACCESS_LEVEL = 1`.
+
+---
+
+## 5. Зв’язати фільтр з основним звітом
+
+Ми вже додали у фінальний SELECT:
+
+```sql
+WHERE (
+  :P1_DEPT_FILTER IS NULL
+  OR department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P1_DEPT_FILTER, ':'))
+     )
+)
+```
+
+Цього достатньо, щоб:
+
+* при зміні `P1_DEPT_FILTER` змінювалась сесійна змінна,
+* і при рефреші регіону – звіт перерахувався.
+
+---
+
+## 6. Dynamic Action на зміну checkbox’ів
+
+Щоб не робити Submit сторінки, а просто обновити звіт:
+
+1. Створи **Dynamic Action**:
+
+   * Event: `Change`
+   * Selection Type: `Item(s)`
+   * Item(s): `P1_DEPT_FILTER`
+
+2. True Action:
+
+   * Action: **Refresh**
+   * Affected Elements: твоїй регіон зі звітом (Region).
+
+В результаті:
+
+* користувач клікає/розклікає підрозділи;
+* DA спрацьовує → Region Refresh;
+* фільтр у WHERE використовує нові значення `:P1_DEPT_FILTER`.
+
+---
+
+## Коротко по логіці
+
+* **Access level = 1** → показуємо `P1_DEPT_FILTER`.
+* LOV: всі підрозділи, які реально є в журналі.
+* Default: **всі department_id, окрім 65**, через `LISTAGG`.
+* Основний SQL-звіт містить `department_id` і фільтр `IN (…split(:P1_DEPT_FILTER)…)`.
+* Dynamic Action на `Change` рефрешить звіт.
+
+Якщо хочеш, наступним кроком можу:
+
+* або виписати конкретний фрагмент твого *фінального* SQL з уже вставленим `WHERE (... department_id filter ...)`;
+* або допомогти придумати аналогічний фільтр по `unit` чи `page_list_id`, якщо тобі зайде цей підхід.

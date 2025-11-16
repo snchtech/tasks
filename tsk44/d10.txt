@@ -1,0 +1,84 @@
+Супер, це якраз просто додати 👍
+
+Тобі потрібно **розширити CTE `access_lvl3`** ще однією гілкою `UNION ALL`, яка підтягує всі задачі, де поточний користувач є автором (`TASKS.CREATOR_ID`).
+
+Я покажу тільки оновлений фрагмент `access_lvl3` з урахуванням того фінального коду, який ми вже зібрали.
+
+---
+
+### Оновлений `access_lvl3`
+
+```sql
+access_lvl3 AS (
+  -- 3.1. Прямий доступ по user_id через ACL (task_access_control, level = 3)
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 3
+    AND ac.user_id = uc.user_id
+
+  UNION ALL
+
+  -- 3.2. Доступ через SIGNATURERIGHTS (user/position/dep/unit/uchastok)
+  SELECT DISTINCT
+    sr.task_id
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+  CROSS JOIN user_ctx uc
+  WHERE
+        sr.user_tabno   = uc.user_id
+     OR (
+          sr.position_id   = uc.position_id
+      AND sr.department_id = uc.department_id
+      AND (sr.unit_id    IS NULL OR sr.unit_id    = uc.unit_id)
+      AND (sr.uchastok   IS NULL OR sr.uchastok   = uc.uchastok_id)
+        )
+
+  UNION ALL
+
+  -- 3.3. Доступ як АВТОР завдання (creator_id)
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.TASKS@TO_TASKTRACKER10 t
+  CROSS JOIN user_ctx uc
+  WHERE t.creator_id = uc.user_id
+),
+```
+
+> 🔎 Логіка:
+> *для access level 3* тепер вважаємо, що користувач має доступ до задач:
+>
+> * якщо його явно вказано в `task_access_control` (al = 3),
+> * або він фігурує в `SIGNATURERIGHTS`,
+> * **або** він є `CREATOR_ID` у `TASKS`.
+
+Далі все залишається як було:
+
+```sql
+task_access AS (
+  SELECT DISTINCT task_id
+  FROM (
+    SELECT task_id FROM access_lvl1
+    UNION ALL
+    SELECT task_id FROM access_lvl2
+    UNION ALL
+    SELECT task_id FROM access_lvl3
+  )
+),
+```
+
+і решта CTE (`tasks_with_access`, `viewed_agg`, вкладки `planned_tab`/`todo_tab`/...) працює без змін — просто в `task_access` з’явилося більше `task_id` саме для автора.
+
+---
+
+Якщо хочеш, наступним кроком можемо окремо додати в сам звіт колонку типу:
+
+```sql
+CASE WHEN t.creator_id = (SELECT user_id FROM user_ctx) THEN 1 ELSE 0 END AS is_author
+```
+
+щоб, наприклад, підсвічувати “свої” задачі або показувати додаткові кнопки в APEX.

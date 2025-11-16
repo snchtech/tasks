@@ -1,0 +1,308 @@
+Окей, давай реально **крок 1** зробимо до кінця і відчуємо профіт, а не просто теорію 😊
+
+**Що робимо зараз (Step 1):**
+
+1. В `tasks_with_access` один раз рахуємо:
+
+   * `is_overdue` – протерміноване завдання;
+   * `is_incomplete` – “недозаповнене завдання”.
+2. Переписуємо:
+
+   * фільтр для `:P1_TAB_MODE = 'PROBLEM'`;
+   * колонку `STATUS_LABEL_PROBLEM`;
+   * колонку `STATUS_LABEL_PLANNED`;
+   * частину `STATUS_LABEL_SHIFT` – де були ті самі `EXISTS`.
+3. При цьому:
+
+   * **логіку доступу (task_access_control)** ми поки не чіпаємо – просто переносимо її, як є;
+   * `VIEWED_BY` і `TODO`/`SHIFT`-фільтри поки залишимо — це буде **Step 2**.
+
+---
+
+## 1. Оновлений CTE `user_ctx` (просто акуратний варіант)
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO       END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION    END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT  END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT        END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK         END AS uchastok_id
+  FROM dual
+),
+```
+
+---
+
+## 2. Оновлений `tasks_with_access` з прапорцями `is_overdue` та `is_incomplete`
+
+Тут головне: **один раз** рахуємо дорогою `EXISTS` по `DICT_APP_CONFIRM_LIST` + `SIGNATURERIGHTS`, а далі використовуємо ці прапорці всюди.
+
+```sql
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    -- протерміноване (планова дата закінчення минула, факт відсутній)
+    CASE
+      WHEN t.planning_date_end < SYSDATE AND t.actual_date_end IS NULL THEN 1
+      ELSE 0
+    END AS is_overdue,
+    -- недозаповнене завдання (немає всіх стадій з DICT_APP_CONFIRM_LIST)
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+        WHERE d.page_list_id    = t.page_list_id
+          AND d.parent_stage_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+            WHERE r.task_id  = t.task_id
+              AND r.stages_id = d.id
+          )
+      )
+      THEN 1
+      ELSE 0
+    END AS is_incomplete
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+         ON s.id = t.status_id
+  -- якщо потрібно JOIN signaturerights для інших умов – залишаєш
+  /* LEFT JOIN TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+         ON r.task_id = t.task_id */
+  WHERE
+    -- ТУТ ЗАЛИШАЄШ ТВІЙ ВЕЛИКИЙ БЛОК EXISTS() ДЛЯ ACCESS_CONTROL 1:1
+    EXISTS (
+      SELECT 1
+      FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+      JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+        ON al.id = ac.access_level_id
+      WHERE
+        (
+          -- === твоя логіка access_level = 1, 2, 3 (без змін) ===
+          -- використовуємо uc.user_id, uc.position_id, uc.department_id, uc.unit_id, uc.uchastok_id
+          -- і t.task_id, t.department_id, t.unit_id, t.uchastok_id
+          -- просто акуратно перенеси сюди свій код
+        )
+        AND ROWNUM = 1
+    )
+),
+```
+
+> 🔴 Важливо: я не переписую тут твій access-control (бо він і так складний) – ти просто **копіюєш свій блок EXISTS** всередину цього `EXISTS (...)` і виправляєш синтаксис.
+
+---
+
+## 3. Фільтр по `:P1_TAB_MODE = 'PROBLEM'` через прапорці
+
+Замість:
+
+```sql
+OR (:P1_TAB_MODE = 'PROBLEM' AND s.STATUS_MAIN_ID <> 0
+AND (
+  (t.PLANNING_DATE_END < SYSDATE AND t.ACTUAL_DATE_END IS NULL) 
+  OR EXISTS (тут здоровенний EXISTS ...)
+)
+)
+```
+
+тепер:
+
+```sql
+OR (
+  :P1_TAB_MODE = 'PROBLEM'
+  AND t.status_main_id <> 0
+  AND (t.is_overdue = 1 OR t.is_incomplete = 1)
+)
+```
+
+Тобто:
+
+```sql
+AND (
+  (:P1_TAB_MODE = 'PLANNED' AND (... старі умови, але вже можна теж трохи спростити ...))
+  OR (:P1_TAB_MODE = 'TODO'    AND (...))
+  OR (:P1_TAB_MODE = 'SHIFT'   AND (...))
+  OR (:P1_TAB_MODE = 'PROBLEM' AND t.status_main_id <> 0
+                               AND (t.is_overdue = 1 OR t.is_incomplete = 1))
+  OR (:P1_TAB_MODE = 'ARCHIVE' AND t.status_main_id = 0)
+)
+```
+
+---
+
+## 4. Переписуємо `STATUS_LABEL_PROBLEM` без EXISTS
+
+Було (скорочено):
+
+```sql
+CASE
+  WHEN :P1_TAB_MODE = 'PROBLEM' THEN
+    CASE
+      WHEN (t.PLANNING_DATE_END < SYSDATE AND t.ACTUAL_DATE_END IS NULL)
+           OR EXISTS (... недозаповнене ...)
+      THEN
+        CASE
+          WHEN (обидві умови) THEN '<іконка overdue>' || '<іконка incomplete>'
+          WHEN (тільки overdue) THEN '<іконка overdue>'
+          WHEN (тільки incomplete) THEN '<іконка incomplete>'
+        END
+    END
+  ELSE NULL
+END AS STATUS_LABEL_PROBLEM
+```
+
+Стає:
+
+```sql
+CASE
+  WHEN :P1_TAB_MODE = 'PROBLEM' THEN
+    CASE
+      WHEN t.is_overdue = 1 AND t.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване завдання"></span>' ||
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+      WHEN t.is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване завдання"></span>'
+      WHEN t.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+      ELSE
+        NULL
+    END
+  ELSE
+    NULL
+END AS STATUS_LABEL_PROBLEM,
+```
+
+Жодного `EXISTS` більше в цій колонці 🔥
+
+---
+
+## 5. Переписуємо `STATUS_LABEL_PLANNED`
+
+Твоя логіка там — комбо:
+
+* “нове завдання” (status_id = 10),
+* “в роботі” (status_id in 12,13),
+* “протерміноване”,
+* “недозаповнене”.
+
+Було з повтором EXISTS, стане так:
+
+```sql
+CASE
+  WHEN :P1_TAB_MODE = 'PLANNED' THEN
+    (
+      CASE
+        WHEN t.status_id = 10 THEN
+          '<span class="t-Icon fa fa-tag" style="color:green;" title="Нове завдання"></span>'
+        ELSE ''
+      END ||
+      CASE
+        WHEN t.status_id IN (12, 13) THEN
+          '<span class="t-Icon fa fa-wrench" style="color:blue;" title="В роботі"></span>'
+        ELSE ''
+      END ||
+      CASE
+        WHEN t.is_overdue = 1 THEN
+          '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване завдання"></span>'
+        ELSE ''
+      END ||
+      CASE
+        WHEN t.is_incomplete = 1 THEN
+          '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+        ELSE ''
+      END
+    )
+  ELSE
+    NULL
+END AS STATUS_LABEL_PLANNED,
+```
+
+---
+
+## 6. Переписуємо частину `STATUS_LABEL_SHIFT`
+
+У SHIFT режимі в тебе теж є:
+
+* іконки “відкрити/закрити на зміні” → їх лишаємо як є (бо це прості BETWEEN);
+* “нове” / “в роботі” → по status_id;
+* “протерміноване” / “недозаповнене” → раніше через ті самі EXISTS, тепер через прапорці.
+
+Скорочена версія:
+
+```sql
+CASE
+  WHEN :P1_TAB_MODE = 'SHIFT' THEN
+    (
+      -- Відкрити на зміні
+      CASE
+        WHEN t.planning_date_start BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                      AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+        THEN '<span class="t-Icon fa fa-play-circle" style="color:green;" title="Відкрити на зміні"></span>'
+        ELSE ''
+      END ||
+      -- Закрити на зміні
+      CASE
+        WHEN t.planning_date_end BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+        THEN '<span class="t-Icon fa fa-stop-circle" style="color:red;" title="Закрити на зміні"></span>'
+        ELSE ''
+      END ||
+      -- Нове
+      CASE
+        WHEN t.status_id = 10 THEN
+          '<span class="t-Icon fa fa-tag" style="color:green;" title="Нове завдання"></span>'
+        ELSE ''
+      END ||
+      -- В роботі
+      CASE
+        WHEN t.status_id IN (12, 13) THEN
+          '<span class="t-Icon fa fa-wrench" style="color:blue;" title="В роботі"></span>'
+        ELSE ''
+      END ||
+      -- Протерміноване
+      CASE
+        WHEN t.is_overdue = 1 THEN
+          '<span class="t-Icon fa fa-clock-o" style="color:darkred;" title="Протерміноване завдання"></span>'
+        ELSE ''
+      END ||
+      -- Недозаповнене
+      CASE
+        WHEN t.is_incomplete = 1 THEN
+          '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+        ELSE ''
+      END
+    )
+  ELSE
+    NULL
+END AS STATUS_LABEL_SHIFT,
+```
+
+---
+
+## 7. Що ти отримуєш вже зараз
+
+Після цього кроку:
+
+* **всі повтори EXISTS по DICT_APP_CONFIRM_LIST + SIGNATURERIGHTS зникли** з SELECT і WHERE для `PROBLEM`/іконок;
+* уся “важка” логіка:
+
+  * один раз рахується в `tasks_with_access` (прапорці `is_overdue`, `is_incomplete`);
+  * далі в будь-яких колонках/фільтрах ти працюєш з простими `= 1 / = 0`;
+* план стає простіший, менше remote-викликів, менше повторних проходів по тих самих таблицях.
+
+---
+
+## Далі (Step 2)
+
+Наступним кроком логічно:
+
+1. **VIEWED_BY** → винести в CTE `viewed_agg` замість купи SELECT’ів у CASE.
+2. Розбити великий блок по `:P1_TAB_MODE` на `UNION ALL` (щоб для кожного режиму був свій план).
+
+Але на цьому кроці в тебе вже буде відчутне спрощення й прискорення саме за рахунок “проблемних” EXISTS.
+
+Як захочеш — беремо наступною серією `VIEWED_BY` і зробимо один акуратний CTE під поточного користувача замість 4 різних підзапитів у SELECT.

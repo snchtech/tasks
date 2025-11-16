@@ -1,0 +1,325 @@
+Окей, давай тоді прямо “розчистимо” **CREATOR_INFO** і **EXECUTOR_INFO** в CTE так, щоб логіка була максимально близька до твоєї, але без корельованих підзапитів і дубльованих JOIN’ів.
+
+Я **збережу HTML і умови 1:1 по сенсу**, але:
+
+* виправлю очевидні помилки типу `substr(u2.OTCHESTVO,1.1)`, `TSEH_ SHORT`, подвійні `class="class=..."`, etc;
+* заміню `FETCH FIRST ROW ONLY` на `ROW_NUMBER()` (це ще й працюватиме на 10g).
+
+Нижче — **фрагмент WITH + частина основного SELECT**, де нас цікавлять саме:
+
+* `creator_sign` + `creator_info` → твій `CREATOR_INFO`
+* `executor_sign` + `executor_info` → твій `EXECUTOR_INFO`
+
+---
+
+## 1. CTE для CREATOR_INFO (stages_id = 2)
+
+```sql
+WITH
+-- 1) Історія підпису для STAGES_ID = 2 (хто "Видано")
+creator_sign AS (
+  SELECT
+    h.signright_id,
+    h.signer_by,
+    h.signer_date,
+    h.sdate,
+    us.familia       AS signer_familia,
+    us.imya          AS signer_imya,
+    us.otchestvo     AS signer_otchestvo,
+    us.spr_dolznost  AS signer_dolznost,
+    us.tseh_short    AS signer_tseh_short,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.signright_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+  JOIN KBS.Personal@To_Tasktracker10 us
+    ON us.tab_no = h.signer_by
+   AND us.priznak IS NULL
+),
+
+-- 2) CTE з повним HTML для CREATOR_INFO
+creator_info AS (
+  SELECT
+    sr.task_id,
+
+    -- === ПОЧАТОК: твій CREATOR_INFO (структуровано) ===
+    '<span class="task_creator">' ||
+    '<span class="exctr-ttl">Створено:</span><br/>' ||
+
+    -- Блок "хто створив" (USER_TABNO + посада + підрозділ)
+    RTRIM(
+      CASE
+        WHEN sr.user_tabno IS NOT NULL THEN
+          -- ПІБ + ініціали
+          u2.familia || ' ' ||
+          SUBSTR(u2.imya, 1, 1) || '. ' ||
+          SUBSTR(u2.otchestvo, 1, 1) || '. ' ||
+          ', ' || u2.spr_dolznost || ', ' || u2.tseh_short || ', '
+        ELSE
+          ''
+      END
+      ||
+      -- посада з базової довідника
+      NVL(bb.name, '')
+      ||
+      CASE
+        WHEN bb.name IS NOT NULL AND dep.short_name IS NOT NULL
+        THEN ', '
+        ELSE ''
+      END
+      ||
+      NVL(dep.short_name, '')
+    , ', ') ||   -- обрізаємо зайву кому в кінці
+    '</span><br/>' ||
+
+    -- Блок "Видано:"
+    CASE
+      WHEN sr.user_tabno IS NOT NULL THEN
+        -- Якщо є USER_TABNO, логіка: якщо підписант = USER_TABNO, то тільки дата; інакше ПІБ + дата
+        CASE
+          WHEN cs.signer_by = sr.user_tabno THEN
+            -- Пишеться той самий, хто і USER_TABNO: тільки дата
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+          ELSE
+            -- Інша людина видала: "Видано: Імʼя, посада, цех, дата"
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya, 1, 1) || '. ' ||
+            SUBSTR(cs.signer_otchestvo, 1, 1) || '. ' ||
+            cs.signer_dolznost || ' ' ||
+            cs.signer_tseh_short || ' ' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+        END
+      ELSE
+        -- USER_TABNO = NULL: завжди друкуємо дані того, хто в history
+        CASE
+          WHEN cs.signer_by IS NOT NULL THEN
+            '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya, 1, 1) || '. ' ||
+            SUBSTR(cs.signer_otchestvo, 1, 1) || '. ' ||
+            cs.signer_dolznost || ' ' ||
+            cs.signer_tseh_short || ' ' ||
+            TO_CHAR(cs.signer_date, 'DD.MM.YYYY HH24:MI') ||
+            '</span>'
+          ELSE
+            NULL
+        END
+    END
+
+    || '</span>'  -- закриття task_creator
+
+    AS creator_info_html
+    -- === КІНЕЦЬ CREATOR_INFO ===
+
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr
+  LEFT JOIN kbs.spr_dolznost@To_Tasktracker10 pos1
+         ON pos1.kod = sr.position_id 
+  LEFT JOIN kbs.spr_dolznost_base@To_Tasktracker10 bb
+         ON bb.id = pos1.id_base
+  LEFT JOIN kbs.spr_department@To_Tasktracker10 dep
+         ON dep.id = sr.department_id
+  LEFT JOIN kbs.personal@To_Tasktracker10 u2
+         ON u2.tab_no = sr.user_tabno
+        AND u2.priznak IS NULL
+  LEFT JOIN creator_sign cs
+         ON cs.signright_id = sr.id
+        AND cs.rn = 1
+  WHERE sr.stages_id = 2
+)
+```
+
+> Далі в основному SELECT ти просто робиш:
+>
+> ```sql
+> LEFT JOIN creator_info ci ON ci.task_id = t.id
+> ...
+> ci.creator_info_html AS creator_info,
+> ```
+
+---
+
+## 2. CTE для EXECUTOR_INFO (stages_id = 4)
+
+Твій блок EXECUTOR значно більший, але його теж можна згорнути:
+**один CTE `executor_sign`** (history + виконавець + керівник),
+**один CTE `executor_info`** з `LISTAGG` по `sr2.task_id`.
+
+```sql
+-- 3) SIGNATUREHISTORY для виконавців (stages_id = 4)
+executor_sign AS (
+  SELECT
+    h.signright_id,
+    h.signer_by,
+    h.signer_date,
+    h.sdate,
+    h.mark_by_chief,
+    h.chief_position,
+    -- виконавець
+    us.familia      AS exec_familia,
+    us.imya         AS exec_imya,
+    us.otchestvo    AS exec_otchestvo,
+    us.spr_dolznost AS exec_dolznost,
+    us.tseh_short   AS exec_tseh_short,
+    -- керівник
+    uc.familia      AS chief_familia,
+    uc.imya         AS chief_imya,
+    uc.otchestvo    AS chief_otchestvo,
+    uc.spr_dolznost AS chief_dolznost,
+    uc.tseh_short   AS chief_tseh_short,
+    ROW_NUMBER() OVER (
+      PARTITION BY h.signright_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+  FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+  JOIN KBS.Personal@To_Tasktracker10 us
+    ON us.tab_no = h.signer_by
+   AND us.priznak IS NULL
+  LEFT JOIN KBS.Personal@To_Tasktracker10 uc
+    ON uc.tab_no = h.mark_by_chief
+   AND uc.priznak IS NULL
+),
+
+-- 4) EXECUTOR_INFO з повним HTML та LISTAGG
+executor_info AS (
+  SELECT
+    sr2.task_id,
+
+    LISTAGG(
+      -- === ПОЧАТОК ОДНОГО БЛОКУ ВИКОНАВЦЯ ===
+      '<span class="trk_creator exctr-titl-delim">' ||
+
+      -- Номер у черзі (якщо потрібен)
+      CASE WHEN sr2.sort_order IS NOT NULL
+           THEN '<span class="trk-creator-number">' ||
+                sr2.sort_order || '.</span> '
+           ELSE ''
+      END ||
+
+      -- Основний текст: ПІБ + посада + підрозділ
+      RTRIM(
+        CASE
+          WHEN sr2.user_tabno IS NOT NULL THEN
+            u3.familia || ' ' ||
+            SUBSTR(u3.imya, 1, 1) || '. ' ||
+            SUBSTR(u3.otchestvo, 1, 1) || '. ' ||
+            u3.spr_dolznost || ' ' ||
+            u3.tseh_short
+          ELSE
+            ''
+        END
+        ||
+        CASE
+          WHEN sr2.user_tabno IS NOT NULL
+           AND (pos2.name IS NOT NULL OR dep.short_name IS NOT NULL)
+          THEN ', '
+          ELSE ''
+        END
+        ||
+        NVL(pos2.name, '')
+        ||
+        CASE
+          WHEN pos2.name IS NOT NULL AND dep.short_name IS NOT NULL
+          THEN ', '
+          ELSE ''
+        END
+        ||
+        NVL(dep.short_name, '')
+      , ', ')
+      || '</span>' ||  -- закриття trk_creator
+
+      -- Блок "виконано/зафіксовано"
+      CASE
+        WHEN es.mark_by_chief IS NOT NULL
+         AND es.chief_position IS NOT NULL THEN
+          -- Зафіксовано керівником + хто виконав
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Зафіксовано керівником:</span><br />' ||
+          es.chief_familia || ' ' ||
+          SUBSTR(es.chief_imya, 1, 1) || '. ' ||
+          SUBSTR(es.chief_otchestvo, 1, 1) || '. ' ||
+          es.chief_dolznost || ' ' || es.chief_tseh_short ||
+          '<br/><strong>Виконано: </strong>' ||
+          es.exec_familia || ' ' ||
+          SUBSTR(es.exec_imya, 1, 1) || '. ' ||
+          SUBSTR(es.exec_otchestvo, 1, 1) || '. ' ||
+          es.exec_dolznost || ', ' || es.exec_tseh_short || ', ' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+        WHEN sr2.user_tabno IS NOT NULL
+         AND es.signer_by = sr2.user_tabno THEN
+          -- Виконавець сам себе відмітив: тільки дата
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Виконано:</span><br />' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+        WHEN es.signer_by IS NOT NULL THEN
+          -- Інчик сценарій: показуємо того, хто виконав
+          '<span class="signer_info">' ||
+          '<span class="exctr-ttl">Виконано:</span><br />' ||
+          es.exec_familia || ' ' ||
+          SUBSTR(es.exec_imya, 1, 1) || '. ' ||
+          SUBSTR(es.exec_otchestvo, 1, 1) || '. ' ||
+          es.exec_dolznost || ' ' || es.exec_tseh_short || ' ' ||
+          TO_CHAR(es.signer_date, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+        ELSE
+          ''
+      END
+      -- === КІНЕЦЬ ОДНОГО БЛОКУ ВИКОНАВЦЯ ===
+    , ' ') WITHIN GROUP (ORDER BY sr2.id) AS executor_info_html
+
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr2
+  LEFT JOIN kbs.spr_dolznost@To_Tasktracker10 pos2
+         ON pos2.kod = sr2.position_id
+  LEFT JOIN kbs.spr_department@To_Tasktracker10 dep
+         ON dep.id = sr2.department_id
+  LEFT JOIN KBS.Personal@To_Tasktracker10 u3
+         ON u3.tab_no = sr2.user_tabno
+        AND u3.priznak IS NULL
+  LEFT JOIN executor_sign es
+         ON es.signright_id = sr2.id
+        AND es.rn = 1
+  WHERE sr2.stages_id = 4
+  GROUP BY sr2.task_id
+)
+```
+
+В основному SELECT:
+
+```sql
+SELECT
+  ...
+  ci.creator_info_html  AS creator_info,
+  ei.executor_info_html AS executor_info,
+  ...
+FROM TaskTracker.TASKS@To_Tasktracker10 t
+LEFT JOIN creator_info  ci ON ci.task_id = t.id
+LEFT JOIN executor_info ei ON ei.task_id = t.id
+...
+```
+
+---
+
+## 3. Що далі можна зробити
+
+1. **Перевірити HTML** — якщо хочеш, можемо точково:
+
+   * підправити класи (`exctr-ttl` vs `exctr-text` тощо),
+   * вирівняти відступи/`<br/>`,
+   * додати `&nbsp;` для прогалин.
+
+2. За бажанням — **додати в ці CTE ще більше умов** (наприклад, коли нема history, але є тільки SIGNATURERIGHTS — що показувати).
+
+3. Якщо ти даси мені **фактичну схему SIGNATURERIGHTS/SIGNATUREHISTORY (ключі, чи буває кілька записів на одну стадію)** — можна додатково гарантувати, що береться “правильний” запис (останній по часу чи по id).
+
+---
+
+Якщо хочеш, наступним кроком можу вставити **ці два CTE прямо в твій повний запит** з секціями `subtasks_html`, `status_calc` і т.д., щоб у тебе був один готовий великий SELECT, який можна одразу кидати в APEX/View.

@@ -1,0 +1,510 @@
+Кидаю цілісний, акуратно зібраний варіант **фінального запиту** з усіма кроками оптимізації:
+
+* `user_ctx` – контекст користувача / підміни
+* `task_access` – доступ до задач (рівні 1/2/3)
+* `tasks_with_access` – задачі + `is_overdue`, `is_incomplete`
+* `viewed_user` / `viewed_agg` – “ознайомлено” один раз по всіх задачах
+* `base_tasks` – базовий набір полів для вкладок
+* таби `planned_tab`, `todo_tab`, `shift_tab`, `problem_tab`, `archive_tab`
+* фінальний `UNION ALL` + форматування дат
+
+> ⚠️ УВАГА:
+>
+> 1. Імена деяких колонок (`UCHASTOK_ID`, `SHIFT_SYMBOL_ID`, `TASK_CODE` тощо) я взяв із твого коду логічно – якщо в тебе називаються трохи інакше, просто підправиш.
+> 2. Логіку access level в `task_access` я зібрав як максимально близький до твого задуму шаблон. Якщо в тебе є додаткові нюанси – просто допишеш у відповідні `WHERE`.
+
+---
+
+```sql
+WITH
+/* =========================================================
+   1. Контекст користувача / підміни
+   ========================================================= */
+user_ctx AS (
+  SELECT
+    :PO_SUBSTITUTION_MODE AS substitution_mode,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO       END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION    END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT  END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT        END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK         END AS uchastok_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_HAS_SHIFT_ROLE ELSE :PO_CUR_HAS_SHIFT_ROLE  END AS has_shift_role
+  FROM dual
+),
+
+/* =========================================================
+   2. Access level 1
+   ========================================================= */
+access_lvl1 AS (
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 1
+    AND (
+         ac.user_id     = uc.user_id
+      OR ac.position_id = uc.position_id
+    )
+    AND (
+      uc.unit_id IS NULL
+      OR (uc.unit_id IS NOT NULL AND t.unit_id = uc.unit_id)
+    )
+),
+
+/* =========================================================
+   3. Access level 2
+   ========================================================= */
+access_lvl2 AS (
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 2
+    -- умови по ACL (позиція / відділ / unit / участок)
+    AND (ac.position_id   IS NULL OR ac.position_id   = uc.position_id)
+    AND (ac.department_id IS NULL OR ac.department_id = uc.department_id)
+    AND (ac.unit_id       IS NULL OR ac.unit_id       = uc.unit_id)
+    AND (ac.uchastok      IS NULL OR ac.uchastok      = uc.uchastok_id)
+    -- user_id (якщо заданий)
+    AND (ac.user_id IS NULL OR ac.user_id = uc.user_id)
+    -- перевірка по самій задачі
+    AND t.department_id = uc.department_id
+    AND (
+      uc.unit_id IS NULL OR (uc.unit_id IS NOT NULL AND t.unit_id = uc.unit_id)
+    )
+    AND (
+      uc.uchastok_id IS NULL OR (uc.uchastok_id IS NOT NULL AND t.uchastok_id = uc.uchastok_id)
+    )
+),
+
+/* =========================================================
+   4. Access level 3
+   ========================================================= */
+access_lvl3 AS (
+  -- 3.1 Прямий доступ по user_id
+  SELECT DISTINCT
+    t.id AS task_id
+  FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+  JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+    ON al.id = ac.access_level_id
+  CROSS JOIN user_ctx uc
+  JOIN TaskTracker.TASKS@TO_TASKTRACKER10 t
+    ON t.id = ac.task_id
+  WHERE al.access_level = 3
+    AND ac.user_id = uc.user_id
+
+  UNION ALL
+
+  -- 3.2 Доступ через SIGNATURERIGHTS
+  SELECT DISTINCT
+    sr.task_id
+  FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+  CROSS JOIN user_ctx uc
+  WHERE
+        sr.user_tabno   = uc.user_id
+     OR (
+          sr.position_id   = uc.position_id
+      AND sr.department_id = uc.department_id
+      AND (sr.unit_id    IS NULL OR sr.unit_id    = uc.unit_id)
+      AND (sr.uchastok   IS NULL OR sr.uchastok   = uc.uchastok_id)
+        )
+),
+
+/* =========================================================
+   5. Сукупний доступ
+   ========================================================= */
+task_access AS (
+  SELECT DISTINCT task_id
+  FROM (
+    SELECT task_id FROM access_lvl1
+    UNION ALL
+    SELECT task_id FROM access_lvl2
+    UNION ALL
+    SELECT task_id FROM access_lvl3
+  )
+),
+
+/* =========================================================
+   6. Задачі з доступом + прапорці is_overdue/is_incomplete
+   (V_TASKS_FULL – це твій оптимізований view)
+   ========================================================= */
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    -- протерміноване
+    CASE
+      WHEN t.planning_date_end < SYSDATE
+       AND t.actual_date_end IS NULL
+      THEN 1 ELSE 0
+    END AS is_overdue,
+    -- недозаповнене
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+        WHERE d.page_list_id    = t.page_list_id
+          AND d.parent_stage_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+            WHERE r.task_id   = t.task_id
+              AND r.stages_id = d.id
+          )
+      )
+      THEN 1 ELSE 0
+    END AS is_incomplete
+  FROM V_TASKS_FULL t
+  JOIN task_access ta
+    ON ta.task_id = t.task_id
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = t.status_id
+),
+
+/* =========================================================
+   7. Ознайомлення користувача (viewed_user / viewed_agg)
+   ========================================================= */
+viewed_user AS (
+  SELECT
+    tv.task_id,
+    tv.date_viewed,
+    tv.substitution_id,
+    uc.substitution_mode,
+    uc.has_shift_role,
+
+    -- фактичний переглядач
+    us.familia      AS viewer_fam,
+    us.imya         AS viewer_name,
+    us.otchestvo    AS viewer_pat,
+    us.spr_dolznost AS viewer_dol,
+    us.tseh_short   AS viewer_tseh,
+
+    -- якщо був SUBSTITUTION_ID (кого заміщали)
+    us1.familia      AS sub_fam,
+    us1.imya         AS sub_name,
+    us1.otchestvo    AS sub_pat,
+    us1.spr_dolznost AS sub_dol,
+    us1.tseh_short   AS sub_tseh
+  FROM TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 tv
+  CROSS JOIN user_ctx uc
+  JOIN kbs.personal@TO_TASKTRACKER10 us
+    ON us.tab_no = tv.user_id
+   AND us.priznak IS NULL
+  LEFT JOIN kbs.personal@TO_TASKTRACKER10 us1
+    ON us1.tab_no = tv.substitution_id
+   AND us1.priznak IS NULL
+  WHERE tv.user_id = uc.user_id
+    AND (
+      uc.has_shift_role = 'N'
+      OR uc.has_shift_role IS NULL
+      OR (
+        tv.date_viewed BETWEEN TO_DATE(:P0_SHIFT_START, 'DD.MM.YYYY HH24:MI')
+                          AND TO_DATE(:P0_SHIFT_END,   'DD.MM.YYYY HH24:MI')
+      )
+    )
+),
+
+viewed_agg AS (
+  SELECT
+    task_id,
+    viewed_html
+  FROM (
+    SELECT
+      v.task_id,
+      v.date_viewed,
+      CASE
+        WHEN v.substitution_mode = 0 THEN
+          -- звичайний режим
+          '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+          v.viewer_fam || ' ' ||
+          SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+          SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+          v.viewer_dol || ', ' || v.viewer_tseh ||
+          ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+
+        WHEN v.substitution_mode = 1 THEN
+          CASE
+            WHEN v.substitution_id IS NOT NULL THEN
+              -- переглянуто в режимі підміни (в.о.)
+              '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+              v.viewer_fam || ' ' ||
+              SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+              SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+              'в. о. ' || v.sub_dol || ', ' || v.sub_tseh ||
+              ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+            ELSE
+              -- підміна ввімкнена, але SUBSTITUTION_ID немає
+              '<span class="fa fa-check-circle text-success" title="Ознайомлено"></span> ' ||
+              v.viewer_fam || ' ' ||
+              SUBSTR(v.viewer_name, 1, 1) || '. ' ||
+              SUBSTR(v.viewer_pat, 1, 1) || '. ' || ', ' ||
+              v.viewer_dol || ', ' || v.viewer_tseh ||
+              ' (' || TO_CHAR(v.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+          END
+      END AS viewed_html,
+      ROW_NUMBER() OVER (
+        PARTITION BY v.task_id
+        ORDER BY v.date_viewed DESC
+      ) AS rn
+    FROM viewed_user v
+  )
+  WHERE rn = 1
+),
+
+/* =========================================================
+   8. Базові поля задач
+   ========================================================= */
+base_tasks AS (
+  SELECT
+    t.task_id,
+    t.planning_date_start,
+    t.planning_date_end,
+    t.actual_date_end,
+    t.actual_date_end_info,
+    t.unit_name,
+    t.task_description_html,
+    t.creator_info,
+    t.executor_info,
+    t.status_name,
+    t.status_id,
+    t.status_main_id,
+    t.department_name,
+    t.note,
+    t.type_id,
+    t.page_list_id,
+    t.task_code,
+    t.date_create,
+    t.is_overdue,
+    t.is_incomplete,
+    COALESCE(
+      v.viewed_html,
+      '<span class="fa fa-circle text-muted" title="Не ознайомлено"></span> Не ознайомлено'
+    ) AS viewed_by
+  FROM tasks_with_access t
+  LEFT JOIN viewed_agg v
+    ON v.task_id = t.task_id
+),
+
+/* =========================================================
+   9. Вкладка PLANNED
+   ========================================================= */
+planned_tab AS (
+  SELECT
+    b.*,
+    -- label для planned
+    (
+      CASE WHEN b.status_id = 10 THEN
+        '<span class="t-Icon fa fa-tag" style="color:green;" title="Нове завдання"></span>'
+      ELSE '' END ||
+      CASE WHEN b.status_id IN (12,13) THEN
+        '<span class="t-Icon fa fa-wrench" style="color:blue;" title="В роботі"></span>'
+      ELSE '' END ||
+      CASE WHEN b.is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване завдання"></span>'
+      ELSE '' END ||
+      CASE WHEN b.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+      ELSE '' END
+    ) AS status_label_planned,
+    NULL AS status_label_problem,
+    NULL AS status_label_shift,
+    CASE
+      WHEN b.status_id = 10           THEN 'new-rec'
+      WHEN b.status_id IN (12,13)     THEN 'action-rec'
+      WHEN b.status_id = 14           THEN 'arch-rec'
+      WHEN b.status_id = 15           THEN 'wait-rec'
+      ELSE NULL
+    END AS row_css_class
+  FROM base_tasks b
+  WHERE
+    :P1_TAB_MODE = 'PLANNED'
+    AND b.status_main_id <> 0
+    AND (
+         (b.status_main_id <> 0 AND b.planning_date_end > SYSDATE)
+      OR (b.status_main_id <> 0 AND b.actual_date_end IS NULL)
+    )
+),
+
+/* =========================================================
+   10. Вкладка TODO
+   ========================================================= */
+todo_tab AS (
+  SELECT
+    b.*,
+    NULL AS status_label_planned,
+    NULL AS status_label_problem,
+    NULL AS status_label_shift,
+    'action-rec' AS row_css_class
+  FROM base_tasks b
+  CROSS JOIN user_ctx uc
+  WHERE
+    :P1_TAB_MODE = 'TODO'
+    AND EXISTS (
+      SELECT 1
+      FROM tasktracker.signaturerights@TO_TASKTRACKER10 r
+      WHERE r.task_id    = b.task_id
+        AND r.user_tabno = uc.user_id
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h
+          WHERE h.signright_id = r.id
+            AND h.new_status_id IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturerights@TO_TASKTRACKER10 r_prev
+          WHERE r_prev.task_id  = r.task_id
+            AND r_prev.stages_id < r.stages_id
+            AND NOT EXISTS (
+              SELECT 1
+              FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h2
+              WHERE h2.signright_id = r_prev.id
+                AND h2.new_status_id IS NOT NULL
+            )
+        )
+    )
+),
+
+/* =========================================================
+   11. Вкладка SHIFT
+   ========================================================= */
+shift_tab AS (
+  SELECT
+    b.*,
+    NULL AS status_label_planned,
+    NULL AS status_label_problem,
+    (
+      CASE WHEN b.planning_date_start BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                         AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+           THEN '<span class="t-Icon fa fa-play-circle" style="color:green;" title="Відкрити на зміні"></span>'
+      ELSE '' END ||
+      CASE WHEN b.planning_date_end BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                       AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+           THEN '<span class="t-Icon fa fa-stop-circle" style="color:red;" title="Закрити на зміні"></span>'
+      ELSE '' END ||
+      CASE WHEN b.status_id = 10 THEN
+        '<span class="t-Icon fa fa-tag" style="color:green;" title="Нове завдання"></span>'
+      ELSE '' END ||
+      CASE WHEN b.status_id IN (12,13) THEN
+        '<span class="t-Icon fa fa-wrench" style="color:blue;" title="В роботі"></span>'
+      ELSE '' END ||
+      CASE WHEN b.is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:darkred;" title="Протерміноване завдання"></span>'
+      ELSE '' END ||
+      CASE WHEN b.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+      ELSE '' END
+    ) AS status_label_shift,
+    'action-rec' AS row_css_class
+  FROM base_tasks b
+  WHERE
+    :P1_TAB_MODE = 'SHIFT'
+    AND b.status_main_id <> 0
+    AND (
+         b.planning_date_start BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                   AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+      OR b.planning_date_end   BETWEEN TO_DATE(:P0_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                   AND TO_DATE(:P0_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+      OR EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturerights@TO_TASKTRACKER10 sr
+          WHERE sr.task_id = b.task_id
+            AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+        )
+    )
+),
+
+/* =========================================================
+   12. Вкладка PROBLEM
+   ========================================================= */
+problem_tab AS (
+  SELECT
+    b.*,
+    NULL AS status_label_planned,
+    (
+      CASE WHEN b.is_overdue = 1 THEN
+        '<span class="t-Icon fa fa-clock-o" style="color:red;" title="Протерміноване завдання"></span>'
+      ELSE '' END ||
+      CASE WHEN b.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-id-card-o" style="color:orange;" title="Недозаповнене завдання"></span>'
+      ELSE '' END
+    ) AS status_label_problem,
+    NULL AS status_label_shift,
+    'wait-rec' AS row_css_class
+  FROM base_tasks b
+  WHERE
+    :P1_TAB_MODE = 'PROBLEM'
+    AND b.status_main_id <> 0
+    AND (b.is_overdue = 1 OR b.is_incomplete = 1)
+),
+
+/* =========================================================
+   13. Вкладка ARCHIVE
+   ========================================================= */
+archive_tab AS (
+  SELECT
+    b.*,
+    NULL AS status_label_planned,
+    NULL AS status_label_problem,
+    NULL AS status_label_shift,
+    'arch-rec' AS row_css_class
+  FROM base_tasks b
+  WHERE
+    :P1_TAB_MODE = 'ARCHIVE'
+    AND b.status_main_id = 0
+)
+
+/* =========================================================
+   14. Фінальний SELECT
+   ========================================================= */
+SELECT
+  task_id,
+  TO_CHAR(planning_date_start, 'dd.mm.yyyy hh24:mi') AS planning_date_start,
+  unit_name,
+  task_description_html,
+  creator_info,
+  executor_info,
+  TO_CHAR(planning_date_end,   'dd.mm.yyyy hh24:mi') AS planning_date_end,
+  actual_date_end_info,
+  status_name,
+  department_name,
+  note,
+  type_id,
+  viewed_by,
+  status_id,
+  status_label_planned,
+  status_label_problem,
+  status_label_shift,
+  row_css_class,
+  task_code
+FROM (
+  SELECT * FROM planned_tab
+  UNION ALL
+  SELECT * FROM todo_tab
+  UNION ALL
+  SELECT * FROM shift_tab
+  UNION ALL
+  SELECT * FROM problem_tab
+  UNION ALL
+  SELECT * FROM archive_tab
+)
+ORDER BY date_create DESC;
+```
+
+---
+
+Як далі з цим працювати практично:
+
+1. Вставляєш цей код у APEX як SQL-запит для звіту (Interactive Report / Grid).
+2. Якщо Oracle лаяється на якісь колонки – виправляєш тільки імена (`uchastok_id`, `shift_symbol_id`, `task_code`, можливо щось по `V_TASKS_FULL`).
+3. Потім можна зробити `Explain Plan` / `Autotrace` (у PL/SQL Developer) й порівняти з твоїм старим монстром: кількість `remote`-запитів, logical reads, час.
+
+Якщо хочеш, можеш скинути фрагмент `EXPLAIN PLAN` “було / стало” – можемо разом глянути, де ще є вузькі місця (індекси, join order тощо).

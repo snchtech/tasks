@@ -1,0 +1,80 @@
+Ось **готовий, акуратний та максимально універсальний варіант VIEW**
+`TASK_TEMPLATES_V`, який автоматично підраховує **NEXT_RUN_DATE_CALC** через пакет
+`TASK_TEMPLATE_INST_PKG.get_next_run_date`.
+
+### ✅ Повністю готовий SQL-код VIEW
+
+```sql
+create or replace view TASK_TEMPLATES_V as
+select
+    t.id,
+    t.date_create,
+    t.task_content,
+    t.creator_id,
+    t.status_id,
+    t.department_id,
+    t.unit_id,
+    t.type_id,
+    t.page_list_id,
+    t.period_mode,
+    t.period_interval,
+    t.period_time,
+    t.weekly_days,
+    t.weekly_time,
+    t.period_start_date,
+    t.execution_term_days,
+    t.next_run_date as next_run_date_stored,
+    task_template_inst_pkg.get_next_run_date(
+        p_template_id => t.id,
+        p_from_date   => trunc(sysdate)
+    ) as next_run_date_calc,
+    t.date_update,
+    t.updator,
+    t.date_end
+from task_templates t;
+```
+
+---
+
+# ✔ Пояснення
+
+### У view ти отримуєш:
+
+| Колонка                | Опис                                                                  |
+| ---------------------- | --------------------------------------------------------------------- |
+| `NEXT_RUN_DATE_STORED` | те, що зараз лежить у таблиці (`task_templates.next_run_date`)        |
+| `NEXT_RUN_DATE_CALC`   | завжди **актуальний розрахунок** наступної дати запуску від `SYSDATE` |
+
+### Чому це зручно?
+
+* **Звіт APEX може використовувати тільки VIEW**, і показувати колонку `NEXT_RUN_DATE_CALC`.
+* Якщо хочеш — можеш показувати обидві: *“Наступний запуск (фактичний)”* і *“Що записано в таблиці”*.
+* VIEW абсолютно безпечна та швидка — викликає функцію лише для видимих рядків.
+
+---
+
+# ✔ Як використати у APEX?
+
+У Source Interactive Report / Classic Report:
+
+```sql
+select *
+from TASK_TEMPLATES_V
+```
+
+І у звіті просто відображаєш:
+
+* **NEXT_RUN_DATE_CALC** — основна колонка.
+* (опційно) NEXT_RUN_DATE_STORED — для контролю.
+
+---
+
+# ✔ Хочеш варіант з додатковими колонками?
+
+Наприклад:
+
+* `is_outdated_next_run_date` (коли записана дата < SYSDATE),
+* `next_run_date_diff_days`,
+* або автопрапорець "Потрібно оновити".
+
+Можу додати одразу в VIEW.
