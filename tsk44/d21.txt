@@ -1,0 +1,437 @@
+Ок, давай робити це системно й без поспіху 😊
+Ідея така: **один** запит рахує **усі вкладки** (`PLANNED / TODO / SHIFT / PROBLEM / ARCHIVE`), замість 5 окремих.
+
+Я покажу:
+
+1. Спільний `WITH` (контекст користувача + задачі з доступом).
+2. По черзі пропишемо умови для:
+
+   * `PLANNED`
+   * `PROBLEM`
+   * `TODO`
+   * `SHIFT`
+   * `ARCHIVE`
+3. Складемо все в один фінальний `SELECT` з `SUM(CASE ...)`.
+
+---
+
+## 1️⃣ Спільний каркас: `user_ctx` + `tasks_with_access_base`
+
+Тут **немає** ще `:P1_TAB_MODE`. Лише “які задачі користувач взагалі бачить”.
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID        ELSE :PO_CUR_USER_TABNO      END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID    ELSE :PO_CUR_USER_POSITION   END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID  ELSE :PO_CUR_USER_DEPARTMENT END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID        ELSE :PO_CUR_USER_UNIT       END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK       ELSE :PO_CUR_UCHASTOK        END AS uchastok_id
+  FROM dual
+),
+
+tasks_with_access_base AS (
+  SELECT DISTINCT
+    t.task_id,
+    t.planning_date_start,
+    t.planning_date_end,
+    t.actual_date_end,
+    t.page_list_id,
+    t.status_id,
+    s.status_main_id
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = t.status_id
+  WHERE
+    (
+      /* тут твоя логіка ACCESS CONTROL, але БЕЗ :P1_TAB_MODE */
+      EXISTS ( 
+        /* level 1 – адаптуй 1:1 зі старого запиту, тільки через EXISTS */
+      )
+      OR EXISTS (
+        /* level 2 */
+      )
+      OR EXISTS (
+        /* level 3 */
+      )
+      OR EXISTS (
+        /* доступ через SIGNATURERIGHTS */
+        SELECT 1
+        FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+        CROSS JOIN user_ctx uc2
+        WHERE sr.task_id = t.task_id
+          AND (
+               sr.user_tabno = uc2.user_id
+            OR (
+                 sr.position_id   = uc2.position_id
+             AND sr.department_id = uc2.department_id
+             AND (sr.unit_id   IS NULL OR sr.unit_id   = uc2.unit_id)
+             AND (sr.uchastok  IS NULL OR sr.uchastok  = uc2.uchastok_id)
+               )
+          )
+      )
+      OR EXISTS (
+        /* автор задачі */
+        SELECT 1
+        FROM user_ctx uc3
+        WHERE t.creator_id = uc3.user_id
+      )
+    )
+)
+```
+
+🔹 На цьому етапі ми маємо **всі задачі, до яких є доступ**, і мінімальний набір полів для умов вкладок.
+
+---
+
+## 2️⃣ PLANNED – умова в `CASE`
+
+Твоя стара логіка для вкладки `PLANNED` була:
+
+```sql
+:P1_TAB_MODE = 'PLANNED' AND
+(
+  (s.STATUS_MAIN_ID <> 0 AND t.PLANNING_DATE_END > SYSDATE)
+  OR (s.STATUS_MAIN_ID <> 0 AND t.ACTUAL_DATE_END IS NULL)
+)
+```
+
+Для лічильника робимо:
+
+```sql
+SUM(
+  CASE
+    WHEN status_main_id <> 0
+     AND (planning_date_end > SYSDATE OR actual_date_end IS NULL)
+    THEN 1 ELSE 0
+  END
+) AS cnt_planned
+```
+
+---
+
+## 3️⃣ PROBLEM – умова
+
+Стара логіка:
+
+```sql
+:P1_TAB_MODE = 'PROBLEM'
+AND s.STATUS_MAIN_ID <> 0
+AND (
+  (t.PLANNING_DATE_END < SYSDATE AND t.ACTUAL_DATE_END IS NULL) 
+  OR EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST d
+        WHERE d.PAGE_LIST_ID = t.PAGE_LIST_ID
+          AND d.PARENT_STAGE_ID IS NOT NULL 
+          AND NOT EXISTS (
+                SELECT 1
+                FROM TaskTracker.SIGNATURERIGHTS r
+                WHERE r.TASK_ID = t.TASK_ID
+                  AND r.STAGES_ID = d.ID
+          )
+    )
+)
+```
+
+Лічильник:
+
+```sql
+SUM(
+  CASE
+    WHEN status_main_id <> 0
+     AND (
+           (planning_date_end < SYSDATE AND actual_date_end IS NULL)
+        OR EXISTS (
+             SELECT 1
+             FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+             WHERE d.page_list_id     = page_list_id
+               AND d.parent_stage_id IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1
+                     FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r2
+                     WHERE r2.task_id   = task_id
+                       AND r2.stages_id = d.id
+                   )
+           )
+        )
+    THEN 1 ELSE 0
+  END
+) AS cnt_problem
+```
+
+---
+
+## 4️⃣ TODO – умова
+
+Стара логіка (спрощую до змісту):
+
+```sql
+:P1_TAB_MODE = 'TODO'
+AND r.user_tabno = uc.user_id
+AND NOT EXISTS (
+      SELECT 1 FROM signaturehistory h
+      WHERE h.signright_id = r.id
+        AND h.new_status_id IS NOT NULL
+)
+AND NOT EXISTS (
+      SELECT 1
+      FROM signaturerights r_prev
+      WHERE r_prev.task_id   = r.task_id
+        AND r_prev.stages_id < r.stages_id
+        AND NOT EXISTS (
+              SELECT 1
+              FROM signaturehistory h2
+              WHERE h2.signright_id = r_prev.id
+                AND h2.new_status_id IS NOT NULL
+        )
+)
+```
+
+У `COUNT` краще зробити через `EXISTS`, а не через приєднаний `r`. Ми можемо використати `user_ctx` всередині:
+
+```sql
+SUM(
+  CASE
+    WHEN EXISTS (
+           SELECT 1
+           FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+           CROSS JOIN user_ctx uc
+           WHERE r.task_id   = task_id
+             AND r.user_tabno = uc.user_id
+             -- немає запису про завершення по цьому signright
+             AND NOT EXISTS (
+                   SELECT 1
+                   FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h
+                   WHERE h.signright_id = r.id
+                     AND h.new_status_id IS NOT NULL
+                 )
+             -- всі попередні стадії підписані
+             AND NOT EXISTS (
+                   SELECT 1
+                   FROM tasktracker.signaturerights@TO_TASKTRACKER10 r_prev
+                   WHERE r_prev.task_id   = r.task_id
+                     AND r_prev.stages_id < r.stages_id
+                     AND NOT EXISTS (
+                           SELECT 1
+                           FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h2
+                           WHERE h2.signright_id = r_prev.id
+                             AND h2.new_status_id IS NOT NULL
+                         )
+                 )
+         )
+    THEN 1 ELSE 0
+  END
+) AS cnt_todo
+```
+
+🔹 Це 1:1 твоя логіка, тільки оформлена як `EXISTS` всередині `CASE`.
+
+---
+
+## 5️⃣ SHIFT – умова
+
+Стара логіка:
+
+```sql
+:P1_TAB_MODE = 'SHIFT'
+AND s.STATUS_MAIN_ID <> 0
+AND (
+     t.planning_date_start BETWEEN :PO_SHIFT_START AND :PO_SHIFT_END
+  OR t.planning_date_end   BETWEEN :PO_SHIFT_START AND :PO_SHIFT_END
+  OR EXISTS (
+        SELECT 1
+        FROM signaturerights sr
+        WHERE sr.task_id        = t.task_id
+          AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+     )
+)
+```
+
+Лічильник:
+
+```sql
+SUM(
+  CASE
+    WHEN status_main_id <> 0
+     AND (
+           planning_date_start BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                  AND TO_DATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+        OR planning_date_end   BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                  AND TO_DATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+        OR EXISTS (
+             SELECT 1
+             FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+             WHERE sr.task_id        = task_id
+               AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+           )
+        )
+    THEN 1 ELSE 0
+  END
+) AS cnt_shift
+```
+
+---
+
+## 6️⃣ ARCHIVE – умова
+
+Стара логіка:
+
+```sql
+:P1_TAB_MODE = 'ARCHIVE' AND s.STATUS_MAIN_ID = 0
+```
+
+Лічильник:
+
+```sql
+SUM(
+  CASE
+    WHEN status_main_id = 0
+    THEN 1 ELSE 0
+  END
+) AS cnt_archive
+```
+
+---
+
+## 7️⃣ Складаємо все разом: фінальний запит на лічильники
+
+От тепер можеш зібрати **один** SQL, який повертає **1 рядок з 5 колонками**:
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID        ELSE :PO_CUR_USER_TABNO      END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID    ELSE :PO_CUR_USER_POSITION   END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID  ELSE :PO_CUR_USER_DEPARTMENT END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID        ELSE :PO_CUR_USER_UNIT       END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK       ELSE :PO_CUR_UCHASTOK        END AS uchastok_id
+  FROM dual
+),
+
+tasks_with_access_base AS (
+  SELECT DISTINCT
+    t.task_id,
+    t.planning_date_start,
+    t.planning_date_end,
+    t.actual_date_end,
+    t.page_list_id,
+    t.status_id,
+    s.status_main_id
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = t.status_id
+  WHERE
+    (
+      /* тут вставляєш свою логіку ACCESS CONTROL з EXISTS,
+         без :P1_TAB_MODE, тільки "які задачі користувач бачить" */
+      1 = 1
+    )
+)
+
+SELECT
+  /* PLANNED */
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (planning_date_end > SYSDATE OR actual_date_end IS NULL)
+      THEN 1 ELSE 0
+    END
+  ) AS cnt_planned,
+
+  /* TODO */
+  SUM(
+    CASE
+      WHEN EXISTS (
+             SELECT 1
+             FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+             CROSS JOIN user_ctx uc
+             WHERE r.task_id    = task_id
+               AND r.user_tabno = uc.user_id
+               AND NOT EXISTS (
+                     SELECT 1
+                     FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h
+                     WHERE h.signright_id = r.id
+                       AND h.new_status_id IS NOT NULL
+                   )
+               AND NOT EXISTS (
+                     SELECT 1
+                     FROM tasktracker.signaturerights@TO_TASKTRACKER10 r_prev
+                     WHERE r_prev.task_id   = r.task_id
+                       AND r_prev.stages_id < r.stages_id
+                       AND NOT EXISTS (
+                             SELECT 1
+                             FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h2
+                             WHERE h2.signright_id = r_prev.id
+                               AND h2.new_status_id IS NOT NULL
+                           )
+                   )
+           )
+      THEN 1 ELSE 0
+    END
+  ) AS cnt_todo,
+
+  /* SHIFT */
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (
+             planning_date_start BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TO_DATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+          OR planning_date_end   BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TO_DATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI')
+          OR EXISTS (
+               SELECT 1
+               FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+               WHERE sr.task_id         = task_id
+                 AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+             )
+          )
+      THEN 1 ELSE 0
+    END
+  ) AS cnt_shift,
+
+  /* PROBLEM */
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (
+             (planning_date_end < SYSDATE AND actual_date_end IS NULL)
+          OR EXISTS (
+               SELECT 1
+               FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+               WHERE d.page_list_id     = page_list_id
+                 AND d.parent_stage_id IS NOT NULL
+                 AND NOT EXISTS (
+                       SELECT 1
+                       FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r2
+                       WHERE r2.task_id   = task_id
+                         AND r2.stages_id = d.id
+                     )
+             )
+          )
+      THEN 1 ELSE 0
+    END
+  ) AS cnt_problem,
+
+  /* ARCHIVE */
+  SUM(
+    CASE
+      WHEN status_main_id = 0
+      THEN 1 ELSE 0
+    END
+  ) AS cnt_archive
+
+FROM tasks_with_access_base;
+```
+
+---
+
+Далі ти вже вирішуєш, як це забирати в APEX:
+
+* або як окремий репорт з 1 рядком і 5 колонками + JS в бейджики вкладок,
+* або через PL/SQL process → 5 page item’ів (`P1_CNT_PLANNED` і т.д.), які вставляються в підписи табів.
+
+Якщо хочеш, наступним кроком можемо взяти **одну конкретну частину** (наприклад, тільки `TODO`) і ти на своєму середовищі перевіриш, що COUNT збігається з тим, що дає твій старий запит для вкладки `TODO`.

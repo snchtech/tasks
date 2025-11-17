@@ -1,0 +1,380 @@
+Супер, що ти дійшла й до шаблонів 💪
+Тут ситуація дуже схожа на `V_TASKS_FULL`: головний ворог швидкості – **десятки корельованих підзапитів на dblink для КОЖНОГО рядка**.
+
+Я зроблю так:
+
+1. Коротко покажу, *що саме* тут гальмує.
+2. Дам **зразок оптимізованої структури view** з `WITH`, щоб ти могла спокійно перенести свій HTML 1:1 усередину.
+
+---
+
+## 1. Що зараз гальмує
+
+У твоєму `V_TEMPLATE_FULL`:
+
+* Для **кожного шаблону**:
+
+  * підзапит на `TASK_TEMPLATE_SUBTASKS` (LISTAGG),
+  * підзапит на `SIGNATURERIGHTS` (creator, stage=2),
+  * всередині нього ще по одному підзапиту на `SIGNATUREHISTORY` (+ `KBS.PERSONAL`) з `FETCH FIRST ROW ONLY`,
+  * підзапит для EXECUTOR_INFO з `LISTAGG` по `SIGNATURERIGHTS` (stage=4), і там знову по одному підзапиту на `SIGNATUREHISTORY`,
+  * ще раз підзапити на `SIGNATUREHISTORY` для STATUS_NAME / STATUS_ID,
+  * ще один EXISTS для “недозаповнений шаблон” (DICT_APP_CONFIRM_LIST + SIGNATURERIGHTS),
+  * ORDER BY у view.
+
+Тобто в сумі – кілька **проходів по тих самих таблицях** через dblink (особливо SIGNATURERIGHTS/SIGNATUREHISTORY).
+
+---
+
+## 2. Принцип оптимізації
+
+Як і з задачами:
+
+* ОДИН раз читаємо кожну важку таблицю через CTE (`WITH`),
+* у CTE відразу агрегуємо по TEMPLATE_ID:
+
+  * субзавдання (LISTAGG),
+  * CREATOR_INFO (1 рядок на шаблон),
+  * EXECUTOR_INFO (1 рядок на шаблон),
+  * останній статус (STATUS_ID/NAME),
+  * прапорець `IS_INCOMPLETE`,
+  * PERIOD_INFO_HTML.
+* У фінальному `SELECT` просто робимо `LEFT JOIN` цих агрегатів.
+
+І **видаляємо** `ORDER BY` з view – сортування треба робити в APEX (ORDER BY в SQL-джерелі регіону).
+
+---
+
+## 3. Скелет оптимізованого `V_TEMPLATE_FULL`
+
+Нижче – робочий каркас. HTML всередині можна залишити твій, я тільки спрощую, щоб не займати 5 екранів тексту 😉
+
+Ти зможеш:
+
+* взяти цей каркас,
+* вставити свої фрагменти HTML у відповідні місця (`/* TODO HTML як у тебе */`).
+
+```sql
+CREATE OR REPLACE VIEW V_TEMPLATE_FULL AS
+WITH
+/* 1. База шаблонів */
+tmpl AS (
+  SELECT
+    tt.id              AS template_id,
+    tt.unit_id,
+    tt.department_id,
+    tt.page_list_id,
+    tt.type_id,
+    tt.period_mode,
+    tt.period_interval,
+    tt.period_time,
+    tt.weekly_time,
+    tt.period_start_date,
+    tt.execution_term_days,
+    tt.next_run_date,
+    tt.date_end,
+    tt.status_id,
+    tt.task_content,
+    u.name             AS unit_name,
+    st.name            AS base_status_name,
+    dep.short_name     AS department_name
+  FROM TaskTracker.TASK_TEMPLATES@To_Tasktracker10 tt
+  LEFT JOIN TaskTracker.DICT_UNIT@To_Tasktracker10   u   ON u.id = tt.unit_id
+  LEFT JOIN TaskTracker.DICT_STATUS@To_Tasktracker10 st  ON st.id = tt.status_id
+  LEFT JOIN TaskTracker.DEPART_CONFIRMLIST_V@To_Tasktracker10 dep
+         ON dep.id = tt.department_id
+),
+
+/* 2. Агрегований список підзавдань */
+subtasks_agg AS (
+  SELECT
+    sts.template_id,
+    LISTAGG(sts.subtask_content, ', ')
+      WITHIN GROUP (ORDER BY sts.subtask_order) AS subtasks_html
+  FROM TaskTracker.TASK_TEMPLATE_SUBTASKS@To_Tasktracker10 sts
+  GROUP BY sts.template_id
+),
+
+/* 3. Signaturerights для CREATOR (stage 2) */
+sr_creator AS (
+  SELECT
+    sr.task_id      AS template_id,
+    sr.id           AS signright_id,
+    sr.user_tabno,
+    sr.position_id,
+    sr.department_id
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr
+  WHERE sr.stages_id = 2
+),
+
+/* 4. Останній запис SIGNATUREHISTORY для кожного signright (CREATOR) */
+last_sign_creator AS (
+  SELECT *
+  FROM (
+    SELECT
+      h.signright_id,
+      h.signer_by,
+      h.signer_date,
+      h.sdate,
+      ROW_NUMBER() OVER (
+        PARTITION BY h.signright_id
+        ORDER BY h.sdate DESC, h.id DESC
+      ) AS rn
+    FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+    WHERE h.new_status_id IS NOT NULL
+  )
+  WHERE rn = 1
+),
+
+/* 5. Персонал для користувачів */
+pers AS (
+  SELECT p.tab_no,
+         p.familia,
+         p.imya,
+         p.otchestvo,
+         p.spr_dolznost,
+         p.tseh_short
+  FROM KBS.Personal@To_Tasktracker10 p
+  WHERE p.priznak IS NULL
+),
+
+/* 6. Блок CREATOR_INFO (1 HTML рядок на шаблон) */
+creator_info AS (
+  SELECT
+    c.template_id,
+    -- тут складаємо HTML один раз
+    '<span class="task_creator">' ||
+    '<span class="exctr-ttl">Створено:</span><br />' ||
+    RTRIM(
+      CASE
+        WHEN c.user_tabno IS NOT NULL THEN
+          (u2.familia || ' ' ||
+           SUBSTR(u2.imya, 1, 1) || '. ' ||
+           SUBSTR(u2.otchestvo, 1, 1) || '.')
+        ELSE ''
+      END
+      || CASE WHEN c.user_tabno IS NOT NULL AND u2.spr_dolznost IS NOT NULL
+              THEN ', <br />' ELSE '' END
+      || NVL(u2.spr_dolznost, ''),
+      ', '
+    ) ||
+    '</span><br />' ||
+    CASE
+      WHEN c.user_tabno IS NOT NULL THEN
+        '<span class="signer_info">' ||
+        '<span class="exctr-ttl">Видано:</span><br />' ||
+        TO_CHAR(ls.signer_date, 'DD.MM.YYYY HH24:MI') ||
+        '</span>'
+      ELSE
+        ''  -- якщо треба – можна додати альтернативний варіант
+    END AS creator_info_html
+  FROM sr_creator c
+  LEFT JOIN pers u2       ON u2.tab_no = c.user_tabno
+  LEFT JOIN last_sign_creator ls ON ls.signright_id = c.signright_id
+),
+
+/* 7. Signaturerights для EXECUTOR (stage 4) + останній підпис */
+sr_exec AS (
+  SELECT
+    sr.task_id      AS template_id,
+    sr.id           AS signright_id,
+    sr.user_tabno,
+    sr.position_id,
+    sr.department_id,
+    sr.sort_order
+  FROM TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 sr
+  WHERE sr.stages_id = 4
+),
+
+last_sign_exec AS (
+  SELECT *
+  FROM (
+    SELECT
+      h.signright_id,
+      h.signer_by,
+      h.signer_date,
+      ROW_NUMBER() OVER (
+        PARTITION BY h.signright_id
+        ORDER BY h.sdate DESC, h.id DESC
+      ) AS rn
+    FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+    WHERE h.new_status_id IS NOT NULL
+  )
+  WHERE rn = 1
+),
+
+/* 8. EXECUTOR_INFO – LISTAGG по шаблону */
+executor_info AS (
+  SELECT
+    e.template_id,
+    LISTAGG(
+      '<span class="task-creator exctr-ttl-delim">' ||
+      '<span class="task-creator-number">' || e.sort_order || '.</span> ' ||
+      NVL(u3.familia, '') || ' ' ||
+      SUBSTR(u3.imya, 1, 1) || '. ' ||
+      SUBSTR(u3.otchestvo, 1, 1) || '. ' ||
+      NVL(u3.spr_dolznost, '') || ' ' ||
+      NVL(u3.tseh_short, '') ||
+      '<br/>' ||
+      '<span class="signer_info"><span class="exctr-ttl">Виконано:</span><br />' ||
+      TO_CHAR(le.signer_date, 'DD.MM.YYYY HH24:MI') ||
+      '</span>' ||
+      '</span>',
+      ' '
+    ) WITHIN GROUP (ORDER BY e.sort_order) AS executor_info_html
+  FROM sr_exec e
+  LEFT JOIN pers u3       ON u3.tab_no = e.user_tabno
+  LEFT JOIN last_sign_exec le ON le.signright_id = e.signright_id
+  GROUP BY e.template_id
+),
+
+/* 9. Останній статус шаблону (STATUS_ID/NAME) */
+last_status AS (
+  SELECT *
+  FROM (
+    SELECT
+      r.task_id      AS template_id,
+      h.new_status_id,
+      s2.name        AS status_name,
+      ROW_NUMBER() OVER (
+        PARTITION BY r.task_id
+        ORDER BY h.sdate DESC, h.id DESC
+      ) AS rn
+    FROM TaskTracker.SIGNATUREHISTORY@To_Tasktracker10 h
+    JOIN TaskTracker.SIGNATURERIGHTS@To_Tasktracker10 r
+      ON r.id = h.signright_id
+    JOIN TaskTracker.DICT_STATUS@To_Tasktracker10 s2
+      ON s2.id = h.new_status_id
+    WHERE h.new_status_id IS NOT NULL
+  )
+  WHERE rn = 1
+),
+
+/* 10. Недозаповнений шаблон */
+incomplete_flag AS (
+  SELECT
+    tt.id AS template_id,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+        WHERE d.page_list_id     = tt.page_list_id
+          AND d.parent_stage_id IS NOT NULL
+          AND NOT EXISTS (
+                SELECT 1
+                FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+                WHERE r.task_id   = tt.id
+                  AND r.stages_id = d.id
+          )
+      )
+      THEN 1 ELSE 0
+    END AS is_incomplete
+  FROM TaskTracker.TASK_TEMPLATES@To_Tasktracker10 tt
+),
+
+/* 11. Текст PERIOD_INFO_HTML */
+period_info AS (
+  SELECT
+    tt.id AS template_id,
+    CASE
+      WHEN tt.period_mode = 1 THEN
+        '<b>Кожні </b>' || tt.period_interval || ' днів о ' ||
+        TO_CHAR(tt.period_time, 'HH24:MI') ||
+        ' починаючи з ' || TO_CHAR(tt.period_start_date, 'DD.MM.YYYY')
+      WHEN tt.period_mode = 2 THEN
+        -- тут можеш зробити LISTAGG по днях тижня як у тебе
+        '<b>Щотижня</b> ...'  -- TODO: вставити свій HTML
+      ELSE NULL
+    END AS period_info_html
+  FROM TaskTracker.TASK_TEMPLATES@To_Tasktracker10 tt
+)
+
+/* 12. Фінальний SELECT – один прохід по всіх CTE */
+SELECT
+  t.template_id,
+  t.unit_name,
+  /* 3. Зміст або список підзавдань */
+  CASE
+    WHEN t.type_id = 1 THEN t.task_content
+    ELSE sa.subtasks_html
+  END AS task_description_html,
+
+  ci.creator_info_html  AS creator_info,
+  ei.executor_info_html AS executor_info,
+
+  /* Статус (name/id) */
+  COALESCE(ls.status_name, t.base_status_name) AS status_name,
+  COALESCE(ls.new_status_id, t.status_id)      AS status_id,
+
+  t.department_name,
+
+  /* PERIOD_INFO_HTML */
+  pi.period_info_html,
+
+  /* Label з терміном */
+  CASE
+    WHEN t.execution_term_days IS NOT NULL THEN
+      t.execution_term_days || ' дн.'
+    ELSE NULL
+  END AS term_label,
+
+  TO_CHAR(t.next_run_date, 'DD.MM.YYYY HH24:MI') AS next_run_date,
+  TO_CHAR(t.date_end,     'DD.MM.YYYY')          AS date_end,
+
+  t.type_id,
+
+  /* HTML-іконки STATUS_LABEL_TEMPLATE */
+  (
+    CASE
+      WHEN inf.is_incomplete = 1 THEN
+        '<span class="t-Icon fa fa-exclamation-circle" ' ||
+        'style="color:darkorange" title="Недозаповнений шаблон"></span>'
+      ELSE ''
+    END ||
+    CASE
+      WHEN t.period_mode = 1 THEN
+        '<span class="t-Icon fa fa-retweet" ' ||
+        'style="color:#2d46e; padding-right: 5px;" ' ||
+        'title="Інтервальний режим"></span>'
+      WHEN t.period_mode = 2 THEN
+        '<span class="t-Icon fa fa-calendar-check-o" ' ||
+        'style="color:#38a8b; padding-right: 5px;" ' ||
+        'title="Щотижневий режим"></span>'
+      ELSE ''
+    END
+  ) AS status_label_template
+
+FROM tmpl t
+LEFT JOIN subtasks_agg   sa  ON sa.template_id   = t.template_id
+LEFT JOIN creator_info   ci  ON ci.template_id   = t.template_id
+LEFT JOIN executor_info  ei  ON ei.template_id   = t.template_id
+LEFT JOIN last_status    ls  ON ls.template_id   = t.template_id
+LEFT JOIN incomplete_flag inf ON inf.template_id = t.template_id
+LEFT JOIN period_info    pi  ON pi.template_id   = t.template_id;
+-- БЕЗ ORDER BY у view!
+```
+
+---
+
+## 4. Що дасть така оптимізація
+
+1. **`SIGNATUREHISTORY` і `SIGNATURERIGHTS` читаються кожен один раз**, з аналітичними функціями – замість десятків корельованих SELECT’ів.
+2. Усі dblink-звернення агреговані в CTE – менше мережевих round-trip’ів.
+3. **Немає ORDER BY** у view → без зайвого сорту кожного разу.
+4. Уся “важка” HTML-конкатенація робиться вже на агрегованих множинах (`GROUP BY template_id`), а не в корельованих підзапитах для кожного рядка.
+
+На практиці це дає дуже схожий ефект, як ти вже бачив з `V_TASKS_FULL`: замість декількох секунд – десяті частки секунди, за умови нормальних індексів:
+
+* `TASK_TEMPLATE_SUBTASKS(template_id, subtask_order)`
+* `SIGNATURERIGHTS(task_id, stages_id)`
+* `SIGNATUREHISTORY(signright_id, sdate, id, new_status_id)`
+* `DICT_APP_CONFIRM_LIST(page_list_id, parent_stage_id)`
+
+---
+
+Якщо хочеш, можемо наступним кроком **по одному** розібрати блоки:
+
+* спочатку тільки `TASK_DESCRIPTION_HTML + STATUS_ID/NAME`,
+* потім додати `CREATOR_INFO`,
+* потім `EXECUTOR_INFO`,
+  щоб ти могла перевіряти швидкість і коректність шматками, а не всім монстром одразу.

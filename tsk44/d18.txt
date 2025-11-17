@@ -1,0 +1,198 @@
+Так, ти абсолютно правильно зловив головну проблему 👏
+
+* `task_access_control` **не має `task_id`**, тобто це *правила доступу*, а не прив’язка до конкретних задач.
+* У моєму варіанті `access_lvl1 / lvl2 / lvl3` я їх невдало “склеїв” з `V_TASKS_FULL_2`, у тебе зараз теж у кожному рівні:
+
+```sql
+FROM V_TASKS_FULL_2 t
+CROSS JOIN user_ctx uc
+JOIN task_access_control ac ...
+```
+
+Це означає, що **view з задачами сканується 2–3 рази** + крос-продукт з ACL → маса рядків, потім це ще раз йде у `task_access`. Тому:
+
+> ✅ View окремо = 0.3 c
+> ❌ View + новий access control = довше, ніж старий код.
+
+---
+
+## 1. Ключова ідея оптимізації
+
+Для такої структури ACL (глобальні правила, без `task_id`) **не можна** ефективно “прикручувати” `task_access_control` через CTE, де вже є `V_TASKS_FULL_2`.
+
+Треба зробити навпаки:
+
+* **`V_TASKS_FULL_2` читаємо тільки ОДИН раз** — в CTE `tasks_with_access`.
+* Усі перевірки доступу (`access_level`, `SIGNATURERIGHTS`, `CREATOR_ID`) робимо через `EXISTS` у `WHERE`, як корельовані підзапити до маленьких таблиць (`task_access_control`, `signaturerights`), **без** повторних JOIN’ів до view.
+
+Тобто повертаємося до архітектури старого запиту, але з:
+
+1. новим швидким view,
+2. винесеним `user_ctx`,
+3. прапорцями `is_overdue` / `is_incomplete`,
+4. усією іншою оптимізацією (VIEWED_BY, UNION ALL по вкладках).
+
+---
+
+## 2. Як має виглядати `tasks_with_access` у твоїй ситуації
+
+Замість `access_lvl1 / lvl2 / lvl3` з `FROM V_TASKS_FULL_2` в кожному — робимо один CTE:
+
+```sql
+tasks_with_access AS (
+  SELECT DISTINCT
+    t.*,
+    s.status_main_id,
+    -- протерміноване
+    CASE
+      WHEN t.planning_date_end < SYSDATE
+       AND t.actual_date_end IS NULL
+      THEN 1 ELSE 0
+    END AS is_overdue,
+    -- недозаповнене
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+        WHERE d.page_list_id    = t.page_list_id
+          AND d.parent_stage_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+            WHERE r.task_id   = t.task_id
+              AND r.stages_id = d.id
+          )
+      )
+      THEN 1 ELSE 0
+    END AS is_incomplete
+  FROM V_TASKS_FULL_2 t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.id = t.status_id
+  WHERE
+    (
+      /* --- ACCESS LEVEL 1 ------------------------------------- */
+      EXISTS (
+        SELECT 1
+        FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+        JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+          ON al.id = ac.access_level_id
+        WHERE al.access_level = 1
+          AND (
+               ac.user_id     = uc.user_id
+            OR ac.position_id = uc.position_id
+          )
+          -- обмеження по юніту користувача
+          AND ( uc.unit_id IS NULL
+                OR t.unit_id = uc.unit_id )
+      )
+
+      OR
+
+      /* --- ACCESS LEVEL 2 ------------------------------------- */
+      EXISTS (
+        SELECT 1
+        FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+        JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+          ON al.id = ac.access_level_id
+        WHERE al.access_level = 2
+          -- фільтри з ACL
+          AND (ac.position_id   IS NULL OR ac.position_id   = uc.position_id)
+          AND (ac.department_id IS NULL OR ac.department_id = uc.department_id)
+          AND (ac.unit_id       IS NULL OR ac.unit_id       = uc.unit_id)
+          AND (ac.uchastok      IS NULL OR ac.uchastok      = uc.uchastok_id)
+          AND (ac.user_id       IS NULL OR ac.user_id       = uc.user_id)
+          -- перевірка по самій задачі
+          AND t.department_id = uc.department_id
+          AND (uc.unit_id      IS NULL OR t.unit_id      = uc.unit_id)
+          AND (uc.uchastok_id  IS NULL OR t.uchastok_id  = uc.uchastok_id)
+      )
+
+      OR
+
+      /* --- ACCESS LEVEL 3 ------------------------------------- */
+      EXISTS (
+        SELECT 1
+        FROM TaskTracker.task_access_control@TO_TASKTRACKER10 ac
+        JOIN TaskTracker.task_access_level_type@TO_TASKTRACKER10 al
+          ON al.id = ac.access_level_id
+        WHERE al.access_level = 3
+          AND ac.user_id = uc.user_id
+      )
+
+      OR
+
+      /* --- доступ через SIGNATURERIGHTS ----------------------- */
+      EXISTS (
+        SELECT 1
+        FROM tasktracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+        WHERE sr.task_id = t.task_id
+          AND (
+               sr.user_tabno = uc.user_id
+            OR (
+                 sr.position_id   = uc.position_id
+             AND sr.department_id = uc.department_id
+             AND (sr.unit_id   IS NULL OR sr.unit_id   = uc.unit_id)
+             AND (sr.uchastok  IS NULL OR sr.uchastok  = uc.uchastok_id)
+               )
+          )
+      )
+
+      OR
+
+      /* --- автор задачі ---------------------------------------- */
+      t.creator_id = uc.user_id
+    )
+)
+```
+
+> 🔹 Тут **`V_TASKS_FULL_2` використовується тільки один раз** (в `FROM`).
+> 🔹 Усі звернення до `task_access_control` / `SIGNATURERIGHTS` — лише в `EXISTS`, без додаткових JOIN’ів до view.
+> 🔹 Це повторює твою стару ідеологію доступів, але використовує вже оптимізований view і прапорці.
+
+Далі:
+
+* `viewed_agg`,
+* `base_tasks`,
+* `planned_tab / todo_tab / shift_tab / problem_tab / archive_tab`,
+* фінальний `UNION ALL` — залишаються такими, як ми вже побудували.
+
+---
+
+## 3. Чому так буде швидше, ніж теперішній варіант
+
+1. `V_TASKS_FULL_2` — важка частина (join’и, dblink’и) — читається **один раз**.
+
+2. Таблиці доступу (`task_access_control`, `task_access_level_type`, `SIGNATURERIGHTS`) зазвичай невеликі, їх можна легко перевіряти через `EXISTS` для кожного рядка. Oracle тут вміє добре оптимізувати, особливо якщо є індекси:
+
+   * `task_access_control(access_level_id, user_id, position_id, department_id, unit_id, uchastok)`
+   * `signaturerights(task_id, user_tabno, position_id, department_id, unit_id, uchastok)`
+
+3. Твоє поточне рішення з `access_lvl1/2/3` + `FROM V_TASKS_FULL_2` в кожному:
+
+   * фактично робить **кілька проходів** по view,
+   * будує великі проміжні множини (кроси ACL × tasks),
+   * а потім ще раз їх об’єднує в `task_access`.
+
+---
+
+## 4. Якщо хочеш ще радикальніше прискорення
+
+Те, що ти робиш з ACL — це по суті *статичні* правила для користувача (вони рідко міняються). Можна:
+
+* У **Pre-Header process** порахувати раз access level + допустимі department / unit / uchastok,
+* Записати їх у page items (`P0_ACCESS_LEVEL`, `P0_ALLOWED_DEPTS`, `P0_ALLOWED_UNITS`),
+* І в основному SQL **взагалі не ходити** до `task_access_control`, а просто користуватися цими item’ами в `WHERE`.
+
+Це вже “кешування” прав доступу на рівні сесії користувача — дає ще один рівень прискорення. Але це окремий, наступний крок.
+
+---
+
+## Підсумок
+
+* Те, що ти помітив про відсутність `task_id` у `task_access_control` — 100% правильно.
+* Через це CTE з `FROM V_TASKS_FULL_2` в `access_lvl1/2/3` дійсно логічно й технічно **перевантажують** запит.
+* Повертаємо завантаження задач в один CTE (`tasks_with_access`), а ACL/підписи/авторство — через `EXISTS` у `WHERE`.
+* Оптимізоване view + один прохід + менше дублікатів = реальний профіт від твоєї роботи з view.
+
+Якщо хочеш, можеш скинути свій теперішній фрагмент `tasks_with_access` у тексті (не фото), і я прямо на ньому покажу, як його перезаписати в один CTE з `EXISTS` 1:1 під твою точну логіку.

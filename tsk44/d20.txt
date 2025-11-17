@@ -1,0 +1,280 @@
+Так, тепер картина зрозуміла 👍
+Ти береш **той самий важкий запит**, просто викидаєш зайві `MODE` й рахуєш `COUNT(*)` для кожної вкладки окремо. Тому:
+
+* основний репорт = 1 важкий SQL
+* * 3–4 рази майже той самий SQL на лічильники
+    = сторінка реально вантажиться вдвічі довше.
+
+Тут JavaScript тебе не врятує, бо JS тільки **показує**, а не рахує. Оптимізувати треба **на рівні SQL**: щоб **одним проходом** по задачах отримати **всі лічильники**.
+
+---
+
+## Ідея: один запит, який рахує ВСІ вкладки одразу
+
+Беремо твій CTE `user_ctx` + `tasks_with_access`, **але без блоку з `:P1_TAB_MODE`**. На ньому один раз запускаємо агрегацію:
+
+```sql
+WITH user_ctx AS (
+  SELECT
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_USER_ID       ELSE :PO_CUR_USER_TABNO      END AS user_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_POSITION_ID   ELSE :PO_CUR_USER_POSITION   END AS position_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_DEPARTMENT_ID ELSE :PO_CUR_USER_DEPARTMENT END AS department_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UNIT_ID       ELSE :PO_CUR_USER_UNIT       END AS unit_id,
+    CASE WHEN :PO_SUBSTITUTION_MODE = 1 THEN :PO_NEW_UCHASTOK      ELSE :PO_CUR_UCHASTOK        END AS uchastok_id
+  FROM dual
+),
+
+tasks_with_access AS (
+  SELECT
+    t.TASK_ID,
+    t.PLANNING_DATE_START,
+    t.PLANNING_DATE_END,
+    t.ACTUAL_DATE_END,
+    t.PAGE_LIST_ID,
+    t.STATUS_ID,
+    s.STATUS_MAIN_ID,
+    r.USER_TABNO   AS r_user_tabno,
+    r.ID           AS r_id,
+    r.STAGES_ID    AS r_stages_id
+  FROM V_TASKS_FULL t
+  CROSS JOIN user_ctx uc
+  LEFT JOIN TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    ON s.ID = t.STATUS_ID
+  LEFT JOIN TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r
+    ON r.task_id = t.task_id
+  WHERE
+    /* тут твоя логіка ACCESS CONTROL з EXISTS по task_access_control + signaturerights,
+       але БЕЗ блоку з :P1_TAB_MODE – тільки "хто бачить які задачі" */
+    (
+      EXISTS ( ... level 1 ... )
+      OR EXISTS ( ... level 2 ... )
+      OR EXISTS ( ... level 3 ... )
+      OR EXISTS ( ... signaturerights ... )
+      OR t.CREATOR_ID = uc.user_id
+    )
+)
+
+/* === один рядок з усіма лічильниками === */
+SELECT
+  -- ПЛАНОВІ (PLANNED)
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (
+              (status_main_id <> 0 AND planning_date_end > SYSDATE)
+           OR (status_main_id <> 0 AND actual_date_end IS NULL)
+           )
+      THEN 1 ELSE 0
+    END
+  ) AS CNT_PLANNED,
+
+  -- TODO
+  SUM(
+    CASE
+      WHEN
+        /* умова TODO з твого WHERE */
+        r_user_tabno = (SELECT user_id FROM user_ctx)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h
+          WHERE h.signright_id = r_id
+            AND h.new_status_id IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tasktracker.signaturerights@TO_TASKTRACKER10 r_prev
+          WHERE r_prev.task_id   = task_id
+            AND r_prev.stages_id < r_stages_id
+            AND NOT EXISTS (
+              SELECT 1
+              FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h2
+              WHERE h2.signright_id = r_prev.id
+                AND h2.new_status_id IS NOT NULL
+            )
+        )
+      THEN 1 ELSE 0
+    END
+  ) AS CNT_TODO,
+
+  -- SHIFT
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (
+            (planning_date_start BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TO_DATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI'))
+         OR (planning_date_end   BETWEEN TO_DATE(:PO_SHIFT_START,'DD.MM.YYYY HH24:MI')
+                                    AND TODATE(:PO_SHIFT_END,  'DD.MM.YYYY HH24:MI'))
+         OR EXISTS (
+              SELECT 1
+              FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+              WHERE sr.task_id        = task_id
+                AND sr.shift_symbol_id = :PO_SHIFT_SYMBOL
+            )
+          )
+      THEN 1 ELSE 0
+    END
+  ) AS CNT_SHIFT,
+
+  -- PROBLEM
+  SUM(
+    CASE
+      WHEN status_main_id <> 0
+       AND (
+             (planning_date_end < SYSDATE AND actual_date_end IS NULL)
+          OR EXISTS (
+               SELECT 1
+               FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+               WHERE d.page_list_id     = page_list_id
+                 AND d.parent_stage_id IS NOT NULL
+                 AND NOT EXISTS (
+                       SELECT 1
+                       FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r2
+                       WHERE r2.task_id   = task_id
+                         AND r2.stages_id = d.id
+                     )
+             )
+           )
+      THEN 1 ELSE 0
+    END
+  ) AS CNT_PROBLEM,
+
+  -- ARCHIVE
+  SUM(
+    CASE
+      WHEN status_main_id = 0
+      THEN 1 ELSE 0
+    END
+  ) AS CNT_ARCHIVE
+
+FROM tasks_with_access;
+```
+
+> Суть:
+> 🔹 `tasks_with_access` рахує **тільки доступ** (один раз по `V_TASKS_FULL`).
+> 🔹 Фінальний SELECT робить **п’ять `SUM(CASE ...)`** – по логіці вкладок.
+> 🔹 Отримуєш **один рядок** з колонками `CNT_PLANNED`, `CNT_TODO`, `CNT_SHIFT`, `CNT_PROBLEM`, `CNT_ARCHIVE`.
+
+Тепер тобі не треба 4 окремі запити типу `... WHERE :P1_TAB_MODE = 'PLANNED'` / `= 'PROBLEM'` і т.д. – усе рахується одним проходом.
+
+---
+
+## Як це під’єднати в APEX
+
+### Варіант 1. Окремий “службовий” регіон + JS
+
+1. Створюєш новий регіон типу **Classic Report / SQL Report** з цим запитом.
+
+   * Static ID, наприклад: `R_TASK_COUNTERS`.
+   * Вихідні колонки: `CNT_PLANNED`, `CNT_TODO`, `CNT_SHIFT`, `CNT_PROBLEM`, `CNT_ARCHIVE`.
+   * Можна сховати його шаблоном або CSS (`display:none`).
+
+2. JS (наприклад, у `Function and Global Variable Declaration` сторінки):
+
+```js
+document.addEventListener("DOMContentLoaded", function () {
+  var $region = apex.jQuery("#R_TASK_COUNTERS");
+  if ($region.length === 0) return;
+
+  $region.on("apexafterrefresh", function () {
+    var $row = $region.find("tbody tr").first();
+    if ($row.length === 0) return;
+
+    var planned  = $row.find("td[headers='CNT_PLANNED']").text();
+    var todo     = $row.find("td[headers='CNT_TODO']").text();
+    var shift    = $row.find("td[headers='CNT_SHIFT']").text();
+    var problem  = $row.find("td[headers='CNT_PROBLEM']").text();
+    var archive  = $row.find("td[headers='CNT_ARCHIVE']").text();
+
+    apex.jQuery("#tab_planned .t-Tabs-badge").text(planned);
+    apex.jQuery("#tab_todo .t-Tabs-badge").text(todo);
+    apex.jQuery("#tab_shift .t-Tabs-badge").text(shift);
+    apex.jQuery("#tab_problem .t-Tabs-badge").text(problem);
+    apex.jQuery("#tab_archive .t-Tabs-badge").text(archive);
+  });
+});
+```
+
+> ID вкладок (`#tab_planned` і т.д.) – підставиш свої (Static ID табів або кнопок).
+
+Так ти маєш:
+
+* 1 важкий SQL для основного журналу;
+* 1 помірно важкий SQL для всіх лічильників;
+* JS — лише забирає числа і підставляє в бейджики.
+
+---
+
+### Варіант 2. Один PL/SQL процес і 5 page item’ів
+
+Якщо не хочеш гратися з JS:
+
+1. Створи 5 item’ів:
+   `P1_CNT_PLANNED`, `P1_CNT_TODO`, `P1_CNT_SHIFT`, `P1_CNT_PROBLEM`, `P1_CNT_ARCHIVE`.
+
+2. **Before Header Process**:
+
+```plsql
+DECLARE
+  l_planned  NUMBER;
+  l_todo     NUMBER;
+  l_shift    NUMBER;
+  l_problem  NUMBER;
+  l_archive  NUMBER;
+BEGIN
+  WITH user_ctx AS ( ... ),
+       tasks_with_access AS ( ... )
+  SELECT
+    /* той самий SELECT з SUM(CASE...) */
+    ...
+  INTO
+    l_planned,
+    l_todo,
+    l_shift,
+    l_problem,
+    l_archive
+  FROM tasks_with_access;
+
+  :P1_CNT_PLANNED  := l_planned;
+  :P1_CNT_TODO     := l_todo;
+  :P1_CNT_SHIFT    := l_shift;
+  :P1_CNT_PROBLEM  := l_problem;
+  :P1_CNT_ARCHIVE  := l_archive;
+END;
+```
+
+3. У шаблоні вкладок (Label) використовуєш ці item’и, напр.:
+
+```text
+Планові (&P1_CNT_PLANNED.)
+Проблемні (&P1_CNT_PROBLEM.)
+...
+```
+
+**Плюс:** без JS, все на сервері.
+**Мінус:** логіка `WITH user_ctx + tasks_with_access` дублюється з основним запитом (але вже не 4 рази, а один раз).
+
+---
+
+## Що це тобі дасть по часу
+
+Було:
+
+* 1 × важкий запит (журнал)
+* * 3–4 × майже такий самий (лічильники)
+
+→ 4–5 проходів по тяжкому `V_TASKS_FULL`.
+
+Стане:
+
+* 1 × важкий (журнал)
+* * 1 × легший агрегаційний (тільки мінімальні колонки, без HTML/LISTAGG)
+
+→ 2 проходи замість 4–5. На практиці це майже гарантовано дасть помітне прискорення сторінки.
+
+---
+
+Якщо хочеш, я можу окремо:
+
+* взяти **один конкретний MODE**, наприклад `PROBLEM`,
+* і виписати тобі `CASE WHEN ... THEN 1` з повністю вичищеним синтаксисом під твій новий `V_TASKS_FULL_2`, щоб ти по ньому вирівняв решту.
