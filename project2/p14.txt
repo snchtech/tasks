@@ -1,0 +1,83 @@
+Суть проблеми в тому, що APEX бачить **`P5_TAG_CODE` як “захищений” item**, а ти міняєш його значення під час роботи сторінки – звідси:
+
+> Session state protection violation … protected page item P5_TAG_CODE
+
+При цьому:
+
+* поле **disabled** → його значення **не надсилається в POST** при submit;
+* воно ще й, скоріш за все, має **Value Protected = Yes** або жорстку *Session State Protection*;
+* ти змінюєш його через `normalize_tag_code` (DA / процес), але APEX вважає, що змінити його “не можна”, бо користувач теоретично міг підмінити значення.
+
+Тому з цифрами інколи “прокатує”, а з HEX (де значення сильніше відрізняється від початкового) ти впираєшся в SSP.
+
+---
+
+## ✅ Як виправити
+
+### 1. Зроби поле **read-only**, а не disabled
+
+Для `P5_TAG_CODE`:
+
+1. В Page Designer відкрий item `P5_TAG_CODE`.
+2. **Settings / Appearance:**
+
+   * `Type` залиш Text Field **або** зроби `Display Only`.
+3. **Read Only:**
+
+   * `Read Only` → **Always** (або за умовою).
+4. **Не став “Disabled = Yes”**.
+   Disabled-поля в HTML *не відправляються* при submit, тому краще `Read Only`.
+
+> Read Only = користувач не може редагувати, але значення все одно йде в сесію/POST.
+
+---
+
+### 2. Вимкни захист, який тут зайвий
+
+Все, що “ламає” зміни item’a на рівні сесії, треба послабити:
+
+Для `P5_TAG_CODE`:
+
+* **Security → Session State Protection:**
+  постав **Unrestricted**.
+* **Security → Value Protected:**
+  постав **No**.
+
+`P5_TAG_CODE` – це якраз поле, яке **змінюється на сервері** на основі вводу з іншого item’а, тож його НЕ треба робити “protected” у тому сенсі, як APEX це розуміє.
+
+---
+
+### 3. Переконайся, що нормалізація йде через сервер
+
+DA, який заповнює `P5_TAG_CODE`, має бути типу:
+
+* **True Action:** Set Value
+* **Set Type:** PL/SQL Function Body
+* **PL/SQL Function Body:**
+
+  ```plsql
+  RETURN normalize_tag_code(:P5_TAG_CODE_INPUT);
+  ```
+* **Affected Items:** `P5_TAG_CODE`
+* **Items to Submit:** `P5_TAG_CODE_INPUT`
+
+Тоді:
+
+* `normalize_tag_code` виконується **на сервері**,
+* APEX виставляє **session state** для `P5_TAG_CODE`,
+* при submit це значення вже “легальне” з погляду SSP.
+
+---
+
+## 4. Якщо все одно хочеш захист
+
+Якщо тобі важливо, щоб значення `P5_TAG_CODE` **не могло бути підмінене з браузера**, то:
+
+* залиш `Read Only = Always`;
+* не використовуй JavaScript для прямої зміни `P5_TAG_CODE`;
+* змінюй його **тільки сервером**: через DA (PL/SQL Set Value) або процеси;
+* *і все одно* не став `Value Protected = Yes` для поля, яке змінюється в рамках тієї ж сторінки.
+
+---
+
+Якщо хочеш, можеш скинути короткий скрін/опис налаштувань item’а `P5_TAG_CODE` (Session State Protection, Value Protected, Read Only/Disabled), і я прямо по кожному прапорцю скажу, що куди виставити.
