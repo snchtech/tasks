@@ -1,0 +1,108 @@
+Так, давай це красиво доведемо до кінця й зробимо **дві фінальні частини для view** – для `start_consist` і `end_consist`, уже повністю узгоджені з нашою новою логікою.
+
+### ✅ 1. Хто ще має **початися** на зміні (`start_consist`)
+
+Логіка:
+
+* беремо тільки ті, що в статусі **"Дозволена"** → `ORDER_STATUS_ID = 3`;
+* або:
+
+  * **початок сьогодні і попадає в поточну зміну**,
+  * або **дата початку менша за сьогодні** (заявка “зависла” з попередніх днів).
+
+```sql
+CASE
+    WHEN tw.ORDER_STATUS_ID = 3   -- тільки "дозволені"
+         AND (
+               -- 1) плановий початок сьогодні і попадає в поточну зміну
+               (
+                   TRUNC(tw.ORDERSTART) = TRUNC(SYSDATE)
+                   AND (
+                       -- поточний час у зміні 07:00–14:59
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 7 AND 14
+                          AND TO_CHAR(tw.ORDERSTART,'HH24:MI') BETWEEN '07:00' AND '14:59'
+                       )
+                       OR
+                       -- поточний час у зміні 15:00–22:59
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 15 AND 22
+                          AND TO_CHAR(tw.ORDERSTART,'HH24:MI') BETWEEN '15:00' AND '22:59'
+                       )
+                       OR
+                       -- поточний час у нічній зміні 23:00–06:59
+                       ( (TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 23 AND 23
+                           OR TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 0 AND 6
+                          )
+                          AND (
+                                 TO_CHAR(tw.ORDERSTART,'HH24:MI') BETWEEN '23:00' AND '23:59'
+                              OR TO_CHAR(tw.ORDERSTART,'HH24:MI') BETWEEN '00:00' AND '06:59'
+                              )
+                       )
+                   )
+               )
+               -- 2) або заявка мала початися раніше, ніж сьогодні
+               OR TRUNC(tw.ORDERSTART) < TRUNC(SYSDATE)
+         )
+    THEN 'startshift'
+    ELSE NULL
+END AS start_consist,
+```
+
+---
+
+### ✅ 2. Хто ще має **завершитися** на зміні (`end_consist`)
+
+Логіка:
+
+* беремо тільки ті, що в статусі **"Відкрита"** → `ORDER_STATUS_ID = 4`;
+* або:
+
+  * **кінець сьогодні і попадає в поточну зміну**,
+  * або **дата завершення менша за сьогодні** (мали закінчитися раніше, але досі відкриті).
+
+```sql
+CASE
+    WHEN tw.ORDER_STATUS_ID = 4   -- тільки "відкриті", які ще треба закрити
+         AND (
+               -- 1) планове закінчення сьогодні і попадає в поточну зміну
+               (
+                   TRUNC(tw.ORDEREND) = TRUNC(SYSDATE)
+                   AND (
+                       -- поточний час у зміні 07:00–14:59
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 7 AND 14
+                          AND TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '07:00' AND '14:59'
+                       )
+                       OR
+                       -- поточний час у зміні 15:00–22:59
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 15 AND 22
+                          AND TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '15:00' AND '22:59'
+                       )
+                       OR
+                       -- поточний час у нічній зміні 23:00–06:59
+                       ( (TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 23 AND 23
+                           OR TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 0 AND 6
+                          )
+                          AND (
+                                 TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '23:00' AND '23:59'
+                              OR TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '00:00' AND '06:59'
+                              )
+                       )
+                   )
+               )
+               -- 2) або заявка мала закінчитися раніше, ніж сьогодні, але ще не закрита
+               OR TRUNC(tw.ORDEREND) < TRUNC(SYSDATE)
+         )
+    THEN 'endshift'
+    ELSE NULL
+END AS end_consist,
+```
+
+---
+
+Можеш просто **замінити** у своєму view старі `CASE ... AS start_consist` / `CASE ... AS end_consist` на ці варіанти — і тоді:
+
+* підсвітка в `view`,
+* вибірки типу
+  `SELECT SOURCE_ID ... WHERE ORDER_STATUS_ID = 3/4 AND (...shift...)`,
+* і наші функції `COUNT_ZORO_START_ON_SHIFT` / `COUNT_ZORO_END_ON_SHIFT`
+
+будуть працювати за **узгодженою логікою**.

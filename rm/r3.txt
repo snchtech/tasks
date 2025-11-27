@@ -1,0 +1,121 @@
+Так, давай тепер підтягнемо **функцію** до тієї ж логіки, що й для `start_consist`:
+
+> **Треба рахувати**:
+>
+> * всі наряди, які
+>   🔹 **попадають в поточну зміну по ORDERSTART**
+>   🔹 і мають статус **дозволена** (`ORDER_STATUS_ID = 3`)
+>
+> **А ТАКОЖ**
+>
+> * всі наряди, які
+>   🔹 **мають ORDERSTART раніше початку поточної зміни**
+>   🔹 і теж мають статус **дозволена** (`ORDER_STATUS_ID = 3`).
+
+Тобто:
+**статус тільки 3**,
+а по часу — `ORDERSTART` **або в межах зміни**, або **раніше її початку** (прострочені, але ще не відкриті/не закриті).
+
+---
+
+### Перебудована функція `COUNT_ZORO_START_ON_SHIFT`
+
+Я ще трохи почистив синтаксис, щоб воно нормально компілилось:
+
+```sql
+FUNCTION COUNT_ZORO_START_ON_SHIFT (
+    LC_DEP_ID  IN NUMBER DEFAULT NULL,
+    LC_UNIT_ID IN NUMBER DEFAULT NULL
+) RETURN NUMBER
+IS
+    v_count        NUMBER;
+    v_shift_start  DATE;
+    v_shift_end    DATE;
+    v_shift_number NUMBER;
+BEGIN
+    -- Визначаємо поточну зміну та її межі
+    IF (TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '23:00' AND '23:59')
+       OR (TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '00:00' AND '06:59')
+    THEN
+        v_shift_number := 1;
+        v_shift_start  := TRUNC(SYSDATE - 1) + INTERVAL '0 23:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE)     + INTERVAL '0 07:00:00' DAY TO SECOND;
+
+    ELSIF TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '07:00' AND '14:59' THEN
+        v_shift_number := 2;
+        v_shift_start  := TRUNC(SYSDATE) + INTERVAL '0 07:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE) + INTERVAL '0 15:00:00' DAY TO SECOND;
+
+    ELSIF TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '15:00' AND '22:59' THEN
+        v_shift_number := 3;
+        v_shift_start  := TRUNC(SYSDATE) + INTERVAL '0 15:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE) + INTERVAL '0 23:00:00' DAY TO SECOND;
+    ELSE
+        -- На всякий випадок, якщо раптом не попадаємо ні в один інтервал
+        RETURN 0;
+    END IF;
+
+    IF LC_DEP_ID IS NOT NULL THEN
+        SELECT COUNT(tw.ORDER_ID)
+          INTO v_count
+          FROM ASICS.ASICS_ZORO_INFO_V2_VIEW tw
+         WHERE
+               -- 1) статус тільки "Дозволена"
+               tw.ORDER_STATUS_ID = 3
+           AND (
+                   -- 2а) або початок в межах поточної зміни
+                   (tw.ORDERSTART BETWEEN v_shift_start AND v_shift_end)
+                   -- 2б) або початок був раніше початку цієї зміни
+                OR (tw.ORDERSTART < v_shift_start)
+               )
+           AND (tw.UNIT    = LC_UNIT_ID OR LC_UNIT_ID IS NULL)
+           AND (tw.CRDEPID = LC_DEP_ID  OR LC_DEP_ID  IS NULL)
+           AND tw.PermDepID IN (2, LC_DEP_ID);
+    ELSE
+        SELECT COUNT(tw.ORDER_ID)
+          INTO v_count
+          FROM ASICS.ASICS_ZORO_INFO_V2_VIEW tw
+         WHERE
+               tw.ORDER_STATUS_ID = 3
+           AND (
+                   (tw.ORDERSTART BETWEEN v_shift_start AND v_shift_end)
+                OR (tw.ORDERSTART < v_shift_start)
+               )
+           AND (tw.UNIT    = LC_UNIT_ID OR LC_UNIT_ID IS NULL)
+           AND (tw.CRDEPID = LC_DEP_ID  OR LC_DEP_ID  IS NULL)
+           AND tw.PermDepID = 2;
+    END IF;
+
+    RETURN v_count;
+END COUNT_ZORO_START_ON_SHIFT;
+```
+
+---
+
+### Що тут важливо
+
+1. **Статус**
+
+   ```sql
+   tw.ORDER_STATUS_ID = 3
+   ```
+
+   — беремо **тільки "дозволені"**, як ти й хотів.
+
+2. **Логіка часу**
+
+   ```sql
+   AND (
+         (tw.ORDERSTART BETWEEN v_shift_start AND v_shift_end)
+      OR (tw.ORDERSTART < v_shift_start)
+       )
+   ```
+
+   * якщо наряд **планово стартує в поточну зміну** → рахуємо;
+   * якщо мав стартувати **раніше початку зміни**, але ще дозволений → теж рахуємо (він завис і його треба відкрити).
+
+3. **Фільтри по підрозділу / unit** лишаються такими ж, як були.
+
+---
+
+Якщо хочеш, можу ще **синхронізувати цю логіку 1-в-1 з тим, що в `start_consist` у VIEW** (наприклад, через окрему функцію `IS_ON_CURRENT_SHIFT(p_date)`), щоб і view, і функція не жили своїм життям, а дивились на одну й ту саму бізнес-умову.

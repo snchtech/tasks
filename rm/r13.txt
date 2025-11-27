@@ -1,0 +1,89 @@
+Так, бажано **підправити і частину у view**, щоб вона відповідала тій самій логіці, що й функції:
+
+* **для відкриття на зміні** → статус **`Дозволена` (3)**
+* **для закриття на зміні** → статус **`Відкрита` (4)**
+
+Інакше у тебе лічильники (`COUNT_ZORO_*`) будуть рахувати одне, а підсвітка в `view` показувати інше.
+
+---
+
+### Оновлений фрагмент `end_consist` у view
+
+Було (логіка без статусу або з `<> 0`):
+
+```sql
+CASE
+    WHEN TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 7 AND 14
+         AND TO_CHAR(tw.ORDEREND, 'HH24:MI') BETWEEN '07:00' AND '14:59'
+         AND TRUNC(tw.ORDEREND) = TRUNC(SYSDATE)
+    THEN 'endshift'
+    ...
+    ELSE NULL
+END AS end_consist,
+```
+
+Або у варіанті, який я пропонував раніше, було щось типу:
+
+```sql
+CASE
+    WHEN tw.ORDER_STATUS_ID <> 0
+         AND (
+               (TRUNC(tw.ORDEREND) = TRUNC(SYSDATE) ... по зміні ...)
+            OR TRUNC(tw.ORDEREND) < TRUNC(SYSDATE)
+             )
+    THEN 'endshift'
+    ELSE NULL
+END AS end_consist,
+```
+
+Тепер краще зробити так (орієнтуємось на **статус «Відкрита» (4)**):
+
+```sql
+CASE
+    WHEN tw.ORDER_STATUS_ID = 4   -- тільки відкриті, які ще треба закрити
+         AND (
+               -- 1) планове закриття сьогодні і попадає в поточну зміну
+               (
+                   TRUNC(tw.ORDEREND) = TRUNC(SYSDATE)
+                   AND (
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 7 AND 14
+                          AND TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '07:00' AND '14:59'
+                       )
+                       OR
+                       (  TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 15 AND 22
+                          AND TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '15:00' AND '22:59'
+                       )
+                       OR
+                       ( (TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 23 AND 23
+                           OR TO_NUMBER(TO_CHAR(SYSDATE,'HH24')) BETWEEN 0 AND 6
+                          )
+                          AND ( TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '23:00' AND '23:59'
+                                OR TO_CHAR(tw.ORDEREND,'HH24:MI') BETWEEN '00:00' AND '06:59'
+                              )
+                       )
+                   )
+               )
+               -- 2) або мали закінчитися раніше, ніж сьогодні (прострочені, але ще відкриті)
+               OR TRUNC(tw.ORDEREND) < TRUNC(SYSDATE)
+         )
+    THEN 'endshift'
+    ELSE NULL
+END AS end_consist,
+```
+
+🔹 Ця логіка тепер узгоджена з:
+
+* запитом для вибірки тих, що треба закрити:
+
+  ```sql
+  SELECT SOURCE_ID
+  FROM TW.ASICS_ZORO_INFO_VIEW tw
+  WHERE tw.ORDER_STATUS_ID = 4
+    AND (tw.ORDEREND BETWEEN :SHIFT_START AND :SHIFT_END
+         OR tw.ORDEREND < :SHIFT_START);
+  ```
+* функцією `COUNT_ZORO_END_ON_SHIFT`, де ми теж перейшли на `ORDER_STATUS_ID = 4`.
+
+---
+
+Якщо хочеш, можу для повної симетрії виписати поруч обидва блоки — `start_consist` (для «дозволених») і `end_consist` (для «відкритих») у фінальному, вирівняному вигляді, щоб ти просто вставив у `view` і не ловив дрібні синтаксичні помилки.

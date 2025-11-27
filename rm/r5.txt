@@ -1,0 +1,167 @@
+Опишу спочатку **що ти вже побудував**, а потім покажу **як акуратно додати автора** й одночасно виправити дужки, щоб логіка відповідала тому, що ти хочеш.
+
+---
+
+## 1. Логіка поточного фрагмента (словами)
+
+Маємо умову (спрощено, без синтаксичних помилок):
+
+```sql
+al.access_level = 2
+AND (
+    (ac.position_id   IS NULL OR ac.position_id   = uc.position_id)
+AND (ac.department_id IS NULL OR ac.department_id = uc.department_id)
+AND (ac.unit_id       IS NULL OR ac.unit_id       = uc.unit_id)
+AND (ac.uchastok      IS NULL OR ac.uchastok      = uc.uchastok_id)
+)
+AND (ac.user_id IS NULL OR ac.user_id = uc.user_id)
+AND EXISTS (
+    SELECT 1
+    FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+    WHERE t1.ID = t.TASK_ID
+      AND t1.DEPARTMENT_ID = uc.department_id
+      AND (ac.unit_id    IS NULL OR (ac.unit_id    IS NOT NULL AND t1.UNIT_ID      = uc.unit_id))
+      AND (ac.uchastok   IS NULL OR (ac.uchastok   IS NOT NULL AND t1.UCHASTOK_ID  = uc.uchastok_id))
+)
+OR EXISTS (
+    SELECT 1
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+    WHERE sr.task_id = t.TASK_ID
+      AND (
+            (sr.USER_TABNO = uc.user_id)
+         OR (sr.POSITION_ID = uc.position_id
+             AND sr.DEPARTMENT_ID = uc.department_id
+             AND (sr.UNIT_ID IS NULL OR sr.UNIT_ID = uc.unit_id)
+            )
+        AND (sr.UCHASTOK IS NULL OR sr.UCHASTOK = uc.uchastok_id)
+      )
+)
+```
+
+### Як це читається логічно (з урахуванням пріоритетів AND / OR)
+
+Через те, що `OR` внизу **не взято в дужки**, Oracle інтерпретує це так:
+
+```sql
+(
+  al.access_level = 2
+  AND умови по ac/uc
+  AND EXISTS (по TASKS)
+)
+OR
+EXISTS (по SIGNATURERIGHTS)
+```
+
+Тобто зараз:
+
+1. **Перша гілка**:
+
+   * рівень доступу `al.access_level = 2`
+   * збіг по `position / department / unit / uchastok / user` з таблиці `ac` з поточним користувачем `uc`
+   * існує запис у `TASKS`, який відповідає `t.TASK_ID` і підрозділу/участку користувача
+
+2. **Друга гілка** (через `OR`) – **взагалі без перевірки `access_level`**:
+
+   * існує запис у `SIGNATURERIGHTS` для цього завдання
+   * або користувач явно вказаний як підписант (`sr.USER_TABNO = uc.user_id`),
+   * або у нього збігається `POSITION + DEPARTMENT (+ UNIT, + UCHASTOK)` з правами підпису.
+
+🔴 Тобто зараз **будь-який**, хто є в `SIGNATURERIGHTS`, попадає у view, **навіть якщо `access_level` ≠ 2** – це, скоріш за все, не те, що ти хочеш.
+
+---
+
+## 2. Що ти хочеш за бізнес-логікою
+
+Ти сам сформулював:
+
+1. **Показати всі записи підрозділу (з урахуванням участку, якщо є)** при умові `access_level = 2`.
+2. * **Записи, де користувач є в списку підписувачів** (`SIGNATURERIGHTS`) – також у контексті доступу 2.
+3. * **Записи, де користувач є автором** (`t.CREATOR_ID = uc.user_id`), теж при `access_level = 2`.
+
+Тобто базова конструкція мала б бути така:
+
+```sql
+al.access_level = 2
+AND (
+      умова по ACL (ac + uc + tasks)
+   OR умова по SIGNATURERIGHTS
+   OR умова "я автор"
+)
+```
+
+---
+
+## 3. Переписана умова з доданим автором
+
+Я зараз дам тобі SQL-фрагмент уже в нормальному вигляді, з дужками й новою умовою `t.CREATOR_ID = uc.user_id`:
+
+```sql
+al.access_level = 2
+AND (
+       -- 1) Доступ через ACL (позиція/підрозділ/unit/участок/користувач + факт, що задача з цього підрозділу/участку)
+       (
+            (ac.position_id   IS NULL OR ac.position_id   = uc.position_id)
+        AND (ac.department_id IS NULL OR ac.department_id = uc.department_id)
+        AND (ac.unit_id       IS NULL OR ac.unit_id       = uc.unit_id)
+        AND (ac.uchastok      IS NULL OR ac.uchastok      = uc.uchastok_id)
+        AND (ac.user_id       IS NULL OR ac.user_id       = uc.user_id)
+        AND EXISTS (
+                SELECT 1
+                FROM TaskTracker.TASKS@TO_TASKTRACKER10 t1
+                WHERE t1.ID             = t.TASK_ID
+                  AND t1.DEPARTMENT_ID  = uc.department_id
+                  AND (ac.unit_id    IS NULL OR (ac.unit_id    IS NOT NULL AND t1.UNIT_ID      = uc.unit_id))
+                  AND (ac.uchastok   IS NULL OR (ac.uchastok   IS NOT NULL AND t1.UCHASTOK_ID  = uc.uchastok_id))
+            )
+       )
+
+    OR -- 2) Користувач має права підпису по цій задачі
+
+       EXISTS (
+           SELECT 1
+           FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+           WHERE sr.task_id = t.TASK_ID
+             AND (
+                     sr.USER_TABNO = uc.user_id
+                  OR (
+                        sr.POSITION_ID   = uc.position_id
+                    AND sr.DEPARTMENT_ID = uc.department_id
+                    AND (sr.UNIT_ID IS NULL OR sr.UNIT_ID = uc.unit_id)
+                    AND (sr.UCHASTOK IS NULL OR sr.UCHASTOK = uc.uchastok_id)
+                  )
+                 )
+       )
+
+    OR -- 3) Користувач є автором задачі
+
+       t.CREATOR_ID = uc.user_id
+)
+```
+
+### Що тут відбувається:
+
+* `al.access_level = 2` — базова умова: працюємо тільки в контексті доступу 2.
+* Внутрішній блок у дужках `(...)` каже: **користувач бачить задачу, якщо виконується хоч одна з трьох умов**:
+
+  1. ✅ **Він входить у ACL (ac)** за принципом:
+
+     * або `position/department/unit/uchastok` не задані в ACL, або збігаються з користувачем;
+     * або `user_id` не заданий, або збігається;
+     * і є відповідний запис в `TASKS` з тим самим підрозділом/участком.
+  2. ✅ **Він є підписантом (SIGNATURERIGHTS)**:
+
+     * явно як `USER_TABNO`,
+     * або за комбінацією посада + підрозділ + unit + uchastok.
+  3. ✅ **Він автор задачі** – просто `t.CREATOR_ID = uc.user_id`.
+
+---
+
+## 4. Коротко: чи відповідає це твоєму опису?
+
+Так:
+
+* «всі записи підрозділу з врахуванням участку якщо є» → перший блок з `ac + tasks + uc`.
+* «+ записи де користувач є в списку підписувачів» → другий `EXISTS` по `SIGNATURERIGHTS`.
+* «+ всі записи при рівні доступу 2, де користувач є автором» → третя умова `t.CREATOR_ID = uc.user_id`.
+
+Якщо скинеш повний `FROM`/`JOIN` шматок `v_full_tasks`, можу ще раз проглянути структуру, щоб 100% узгодити по alias’ах і уникнути дрібних помилок типу `= =` чи `unit id`.

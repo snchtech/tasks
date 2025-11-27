@@ -1,0 +1,78 @@
+Тоді просто доводимо все до однієї логіки: **для завершення орієнтуємося на статус “відкрита” (`ORDER_STATUS_ID = 4`)**.
+
+Ось оновлена функція `COUNT_ZORO_END_ON_SHIFT` з цим урахуванням:
+
+```sql
+FUNCTION COUNT_ZORO_END_ON_SHIFT (
+    LC_DEP_ID  IN NUMBER DEFAULT NULL,
+    LC_UNIT_ID IN NUMBER DEFAULT NULL
+) RETURN NUMBER
+IS
+    v_count        NUMBER;
+    v_shift_start  DATE;
+    v_shift_end    DATE;
+    v_shift_number NUMBER;
+BEGIN
+    -- Визначаємо поточну зміну та її межі
+    IF (TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '23:00' AND '23:59')
+       OR (TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '00:00' AND '06:59')
+    THEN
+        v_shift_number := 1;
+        v_shift_start  := TRUNC(SYSDATE - 1) + INTERVAL '0 23:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE)     + INTERVAL '0 07:00:00' DAY TO SECOND;
+
+    ELSIF TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '07:00' AND '14:59' THEN
+        v_shift_number := 2;
+        v_shift_start  := TRUNC(SYSDATE) + INTERVAL '0 07:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE) + INTERVAL '0 15:00:00' DAY TO SECOND;
+
+    ELSIF TO_CHAR(SYSDATE, 'HH24:MI') BETWEEN '15:00' AND '22:59' THEN
+        v_shift_number := 3;
+        v_shift_start  := TRUNC(SYSDATE) + INTERVAL '0 15:00:00' DAY TO SECOND;
+        v_shift_end    := TRUNC(SYSDATE) + INTERVAL '0 23:00:00' DAY TO SECOND;
+    ELSE
+        RETURN 0;
+    END IF;
+
+    -- Рахуємо наряди, які мали б завершитися на цій зміні або раніше, але ще відкриті
+    IF LC_DEP_ID IS NOT NULL THEN
+        SELECT COUNT(tw.ORDER_ID)
+          INTO v_count
+          FROM ASICS.ASICS_ZORO_INFO_V2_VIEW tw
+         WHERE
+               -- тільки відкриті
+               tw.ORDER_STATUS_ID = 4
+           AND (
+                   -- закінчення в межах поточної зміни
+                   (tw.ORDEREND BETWEEN v_shift_start AND v_shift_end)
+                   -- або мали закінчитися раніше
+                OR (tw.ORDEREND < v_shift_start)
+               )
+           AND (tw.UNIT    = LC_UNIT_ID OR LC_UNIT_ID IS NULL)
+           AND (tw.CRDEPID = LC_DEP_ID  OR LC_DEP_ID  IS NULL)
+           AND tw.PermDepID IN (2, LC_DEP_ID);
+    ELSE
+        SELECT COUNT(tw.ORDER_ID)
+          INTO v_count
+          FROM ASICS.ASICS_ZORO_INFO_V2_VIEW tw
+         WHERE
+               tw.ORDER_STATUS_ID = 4
+           AND (
+                   (tw.ORDEREND BETWEEN v_shift_start AND v_shift_end)
+                OR (tw.ORDEREND < v_shift_start)
+               )
+           AND (tw.UNIT    = LC_UNIT_ID OR LC_UNIT_ID IS NULL)
+           AND (tw.CRDEPID = LC_DEP_ID  OR LC_DEP_ID  IS NULL)
+           AND tw.PermDepID = 2;
+    END IF;
+
+    RETURN v_count;
+END COUNT_ZORO_END_ON_SHIFT;
+```
+
+Тепер:
+
+* для **початку** рахуємо задачі в статусі **“дозволена” (3)**;
+* для **завершення** — задачі в статусі **“відкрита” (4)**;
+* і в обох випадках враховуємо:
+  або в межах поточної зміни, або мали бути раніше, але ще не дійшли руками.

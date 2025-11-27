@@ -1,0 +1,151 @@
+Супер колонка, дуже корисна 👍
+Давай зробимо її акуратно й так, щоб потім легко було змінювати логіку.
+
+Ти хочеш:
+
+> «К-сть днів залишилось» – **кількість робочих днів до завершення завдання**,
+> без суботи (6) і неділі (7).
+
+Я запропоную варіант через маленьку функцію в БД + як її підключити в основний звіт.
+
+---
+
+## 1. Функція `WORKDAYS_BETWEEN` в схемі TaskTracker (або загальній)
+
+Логіка:
+
+* Рахує **робочі дні між двома датами включно**.
+* Вихідні – коли `TO_CHAR(date,'D') IN ('6','7')` (як ти й написала).
+* Якщо `p_end < p_start` – повертаємо 0.
+
+```sql
+CREATE OR REPLACE FUNCTION workdays_between (
+    p_start IN DATE,
+    p_end   IN DATE
+) RETURN NUMBER DETERMINISTIC IS
+    l_start DATE;
+    l_end   DATE;
+    l_cnt   NUMBER := 0;
+BEGIN
+    IF p_start IS NULL OR p_end IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    l_start := TRUNC(p_start);
+    l_end   := TRUNC(p_end);
+
+    IF l_end < l_start THEN
+        RETURN 0;
+    END IF;
+
+    WHILE l_start <= l_end LOOP
+        -- 6 = субота, 7 = неділя (твоя схема)
+        IF TO_CHAR(l_start,'D') NOT IN ('6','7') THEN
+            l_cnt := l_cnt + 1;
+        END IF;
+
+        l_start := l_start + 1;
+    END LOOP;
+
+    RETURN l_cnt;
+END;
+/
+```
+
+> Функція `DETERMINISTIC`, щоб Oracle міг її кешувати, якщо що.
+
+---
+
+## 2. Як саме рахувати «залишилось»
+
+Пропоную таку логіку:
+
+* Відлік **від сьогодні** (SYSDATE), але:
+
+  * якщо завдання стартує в майбутньому – рахуємо з `planning_date_start`;
+  * якщо вже в процесі – рахуємо з сьогодні.
+* Кінець – `planning_date_end`.
+* Якщо кінець уже минув → 0 днів.
+
+Отже, дата початку для відліку:
+
+```sql
+GREATEST(TRUNC(SYSDATE), TRUNC(t.PLANNING_DATE_START))
+```
+
+---
+
+## 3. Додаємо колонку в основний SQL (журнал завдань)
+
+У твоєму основному SELECT (там, де `SELECT t.TASK_ID, ...`) додаєш:
+
+```sql
+CASE
+    WHEN t.PLANNING_DATE_END IS NULL THEN NULL
+    ELSE workdays_between(
+           GREATEST(TRUNC(SYSDATE), TRUNC(t.PLANNING_DATE_START)),
+           TRUNC(t.PLANNING_DATE_END)
+         )
+END AS DAYS_LEFT
+```
+
+Наприклад:
+
+```sql
+SELECT
+    t.TASK_ID,
+    TO_CHAR(t.PLANNING_DATE_START, 'dd.mm.yyyy hh24:mi') AS PLANNING_DATE_START,
+    t.UNIT_NAME,
+    t.TASK_DESCRIPTION_HTML,
+    t.CREATOR_INFO,
+    t.EXECUTOR_INFO,
+    TO_CHAR(t.PLANNING_DATE_END, 'dd.mm.yyyy hh24:mi') AS PLANNING_DATE_END,
+    ...
+
+    CASE
+        WHEN t.PLANNING_DATE_END IS NULL THEN NULL
+        ELSE workdays_between(
+               GREATEST(TRUNC(SYSDATE), TRUNC(t.PLANNING_DATE_START)),
+               TRUNC(t.PLANNING_DATE_END)
+             )
+    END AS DAYS_LEFT,
+
+    t.STATUS_NAME,
+    t.DEPARTMENT_NAME,
+    ...
+FROM tasks_with_access t
+ORDER BY t.DATE_CREATE DESC;
+```
+
+---
+
+## 4. Налаштування в APEX
+
+1. У звіті (IR / Classic Report) з’явиться нова колонка `DAYS_LEFT`.
+2. Для неї:
+
+   * Header: **К-сть днів залишилось**
+   * Alignment: Right
+   * Тип колонки: Number (без Escape, бо там цифра, можна й залишити Escape = Yes).
+
+---
+
+## 5. Якщо тобі треба **повна тривалість** (загальна кількість робочих днів, а не «залишилось»)
+
+Можеш додати ще одну колонку:
+
+```sql
+CASE
+    WHEN t.PLANNING_DATE_START IS NULL OR t.PLANNING_DATE_END IS NULL THEN NULL
+    ELSE workdays_between(
+           TRUNC(t.PLANNING_DATE_START),
+           TRUNC(t.PLANNING_DATE_END)
+         )
+END AS TOTAL_WORK_DAYS
+```
+
+Тоді в одному звіті будеш бачити і «всього робочих днів», і «скільки залишилось».
+
+---
+
+Якщо скажеш, що хочеш рахувати інакше (наприклад, **завжди від planning_date_start**, а не від сьогодні) – просто підправимо 1 рядок у виразі з `GREATEST`.

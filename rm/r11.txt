@@ -1,0 +1,44 @@
+Так, для **тих, що треба завершити на зміні**, логіка буде дзеркальною до «почати», тільки працюємо з:
+
+* `ORDEREND`
+* статусом **«відкрита»** (логічно, бо завершувати треба саме відкриті, а не «дозволені»).
+
+Тобто беремо заявки, які:
+
+1. **Мають статус "відкрита"** (`ORDER_STATUS_ID = 4`)
+   і **час завершення попадає в поточну зміну**
+
+**АБО**
+
+2. **Мають статус "відкрита"**
+   і **час завершення менший за початок зміни** (мали завершитися раніше, але досі не закриті).
+
+---
+
+### Варіант, якщо SHIFT_START / SHIFT_END — це змінні / бійндинги
+
+```sql
+SELECT SOURCE_ID
+FROM TW.ASICS_ZORO_INFO_VIEW tw
+WHERE tw.ORDER_STATUS_ID = 4  -- тільки відкриті
+  AND (
+        -- 1) завершення в межах поточної зміни
+        (tw.ORDEREND BETWEEN :SHIFT_START AND :SHIFT_END)
+        -- 2) або мали б завершитися раніше, але ще відкриті
+     OR (tw.ORDEREND < :SHIFT_START)
+      );
+```
+
+### Якщо `SHIFT_START` / `SHIFT_END` — колонки у view
+
+```sql
+SELECT SOURCE_ID
+FROM TW.ASICS_ZORO_INFO_VIEW tw
+WHERE tw.ORDER_STATUS_ID = 4
+  AND (
+        (tw.ORDEREND BETWEEN tw.SHIFT_START AND tw.SHIFT_END)
+     OR (tw.ORDEREND < tw.SHIFT_START)
+      );
+```
+
+Якщо захочеш, можемо паралельно підчистити функцію `COUNT_ZORO_END_ON_SHIFT`, щоб вона теж орієнтувалась саме на `ORDER_STATUS_ID = 4`, а не просто `<> 0`.
