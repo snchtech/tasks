@@ -1,0 +1,114 @@
+Найпростіший і «правильний» для APEX варіант — **кнопка, яка робить повний reset Interactive Report до Primary Default Report**, де вже задано сортування по прихованій даті створення.
+
+---
+
+## 1. Налаштувати дефолтне сортування (якщо ще не зроблено)
+
+1. Відкрий сторінку з IR.
+2. У **Page Designer** вибери свій Interactive Report region.
+3. У вкладці **Attributes → Default Report**:
+
+   * Вкажи `Default Sort` = твій стовпчик `CREATED_DATE` (або який там у тебе) + напрям (DESC).
+   * Стовпчик може бути **Hidden**, сортування все одно працює.
+
+Або через сам звіт:
+
+* В Actions → **Format → Sort** вибери потрібну колонку та порядок.
+* Actions → **Report → Save report** → Save as *Primary Default* (для розробника).
+
+---
+
+## 2. Кнопка «Скинути до стандартного вигляду»
+
+Ця кнопка просто **перезавантажує сторінку з параметром RIR**, який скидає Interactive Report до Primary Default Report (тобто знову сортування по даті створення).
+
+### Кроки:
+
+1. На тій самій сторінці створи кнопку, наприклад `RESET_IR`, у Region Buttons (або у підзаголовку регіону).
+2. Властивості кнопки:
+
+* **Action**: *Redirect to Page in this Application*
+* **Target Page**: `&APP_PAGE_ID.`
+* **Request**: `RIR`
+* **Clear Cache**: `RP,RIR`
+  (RP — перезавантажити сторінку, RIR — скинути Interactive Report)
+
+У вигляді URL це було б щось типу:
+
+```text
+f?p=&APP_ID.:&APP_PAGE_ID.:&SESSION.::&DEBUG.:RP,RIR:
+```
+
+Після кліку:
+
+* усі сортування/фільтри/групування скидаються,
+* Interactive Report повертається до **дефолтного вигляду**, включно з сортуванням по прихованому стовпчику дати створення.
+
+> ✅ Це стандартний і стабільний механізм APEX, який завжди працює для IR.
+
+---
+
+## 3. Щоб кнопка показувалась тільки коли звіт змінений (опціонально)
+
+Якщо хочеш, щоб кнопка **не була видно, поки звіт у дефолтному стані**, можна зробити JS-перевірку.
+
+### 3.1. Підготовка
+
+* Задай **Static ID** для IR-регіону, наприклад: `TASKS_IR`.
+* Для кнопки `RESET_IR` задай **Static ID**: `BTN_RESET_IR`.
+* Додай CSS, щоб кнопка була прихована за замовчуванням:
+
+```css
+#BTN_RESET_IR {
+  display: none;
+}
+```
+
+(У Page → CSS → Inline або у shared CSS файлі.)
+
+### 3.2. Dynamic Action
+
+1. Створи **Dynamic Action**:
+
+   * **Event**: *After Refresh*
+   * **Selection Type**: Region
+   * **Region**: твій IR (`TASKS_IR`)
+
+2. True Action: **Execute JavaScript Code**, наприклад:
+
+```js
+var region = apex.region("TASKS_IR");
+
+// Отримуємо інформацію про поточний звіт (в тому числі order by)
+var current = region.call("getCurrentReport");
+
+// Тут вкажи те, як виглядає твій дефолтний ORDER BY
+// Наприклад, "CREATED_DATE DESC" — як воно зберігається в APEX
+var defaultOrderBy = "CREATED_DATE DESC";
+
+if (current && current.orderBy 
+    && current.orderBy.toUpperCase() !== defaultOrderBy.toUpperCase()) {
+    // Звіт відрізняється від дефолтного сортування => показуємо кнопку
+    $("#BTN_RESET_IR").show();
+} else {
+    // Дефолтне сортування => ховаємо кнопку
+    $("#BTN_RESET_IR").hide();
+}
+```
+
+> ⚠️ Точне значення `orderBy` (як APEX його зберігає) зручніше один раз подивитися у консолі браузера:
+>
+> ```js
+> apex.region("TASKS_IR").call("getCurrentReport");
+> ```
+>
+> і подивитися, що саме приходить у `orderBy`.
+
+---
+
+### Якщо коротко
+
+* **Кнопка з Request = `RIR` і Clear Cache = `RP,RIR`** — повертає Interactive Report до стандартного сортування по прихованій даті створення.
+* Якщо хочеш «красиво» — додай JS, який показує цю кнопку тільки коли користувач змінив сортування/налаштування звіту.
+
+Якщо скажеш ID сторінки та static_id регіону — можу прямо виписати готовий URL/настройки під твою сторінку.
