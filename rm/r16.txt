@@ -1,0 +1,106 @@
+Зрозумів — **мінімальні зміни**, залишаючи всю логіку як є.
+Тобто ми просто **додаємо підтримку префікса `EP_`**, не чіпаючи структуру функції.
+
+Ось так буде правильно і безпечно:
+
+---
+
+# ✅ **ОНОВЛЕНА ФУНКЦІЯ (мінімальні зміни в старий код)**
+
+```sql
+function GET_USER_ROLE_BY_CUSTOM_IDNTIFY (
+    LC_APP_ID     IN NUMBER,
+    LC_USER_LOGIN IN VARCHAR2,
+    LC_IDNT_TYPE  IN VARCHAR2
+)
+return NUMBER
+IS
+    l_curr_user_role_id NUMBER;
+    l_user_roles_list   VARCHAR2(4000);
+BEGIN
+
+    select LISTAGG(ROLE_STATIC_ID, ',') 
+           within group (order by ROLE_STATIC_ID)
+      into l_user_roles_list
+      from APEX_APPL_ACL_USER_ROLES t
+     where t.APPLICATION_ID = LC_APP_ID
+       and t.USER_NAME      = LC_USER_LOGIN
+       and t.ROLE_STATIC_ID LIKE LC_IDNT_TYPE || '_%' 
+       and ROWNUM = 1;
+
+    -- ===== СТАРА ЛОГІКА + ДОДАНО EP =====
+    IF SUBSTR(l_user_roles_list, 1, 1) = 'P' THEN
+        l_curr_user_role_id := TO_NUMBER(SUBSTR(l_user_roles_list, 3));
+
+    ELSIF SUBSTR(l_user_roles_list, 1, 1) = 'D' THEN
+        l_curr_user_role_id := TO_NUMBER(SUBSTR(l_user_roles_list, 3));
+
+    ELSIF SUBSTR(l_user_roles_list, 1, 1) = 'U' THEN
+        l_curr_user_role_id := TO_NUMBER(SUBSTR(l_user_roles_list, 3));
+
+    -- 🔥 ДОДАНО ПІДТРИМКУ EP_xxx
+    ELSIF SUBSTR(l_user_roles_list, 1, 2) = 'EP' THEN
+        -- для EP_5777 потрібно брати число після трьох символів (E P _)
+        l_curr_user_role_id := TO_NUMBER(SUBSTR(l_user_roles_list, 4));
+
+    ELSE
+        NULL;
+    END IF;
+
+    return l_curr_user_role_id;
+
+END GET_USER_ROLE_BY_CUSTOM_IDNTIFY;
+```
+
+---
+
+## 🟦 **Пояснення мінімальних змін**
+
+Ти нічого не змінюєш у принципі роботи функції — лише додаєш один новий блок:
+
+```sql
+ELSIF SUBSTR(l_user_roles_list, 1, 2) = 'EP' THEN
+    l_curr_user_role_id := TO_NUMBER(SUBSTR(l_user_roles_list, 4));
+```
+
+Чому `SUBSTR(..., 4)`?
+
+| Роль                                                                  | Позиція числа |
+| --------------------------------------------------------------------- | ------------- |
+| `P_10` → `'P' '_' 10` → число починається з **3-го символу**          |               |
+| `EP_5777` → `'E' 'P' '_' 5777` → число починається з **4-го символу** |               |
+
+Тому таке рішення ідеально вписується у стару логіку.
+
+---
+
+## 🟩 **Як робити редирект на різні сторінки залежно від ролі**
+
+У процесі **Before Header** на головній сторінці іншого додатку:
+
+```plsql
+DECLARE
+    l_role NUMBER;
+BEGIN
+    l_role := GET_USER_ROLE_BY_CUSTOM_IDNTIFY(118, :APP_USER, 'EP');
+
+    IF l_role = 23445 THEN
+        apex_util.redirect_url(apex_page.get_url(
+            p_application => :APP_ID,
+            p_page        => 3
+        ));
+
+    ELSIF l_role = 5777 THEN
+        apex_util.redirect_url(apex_page.get_url(
+            p_application => :APP_ID,
+            p_page        => 4
+        ));
+    END IF;
+END;
+```
+
+Якщо сторінки знаходяться в додатку 118 — змінюєш `p_application`.
+
+---
+
+Якщо хочеш — можу зробити універсальну логіку, яка автоматично редиректить усіх EP_xxxx на сторінку xxxx (якщо треба).
