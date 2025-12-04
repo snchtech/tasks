@@ -1,0 +1,99 @@
+Так, ти абсолютно правий – `apex_util.current_user_in_role` **немає**. Це я переплутав з іншими утилітами APEX 🙈
+
+Давай виправимо.
+
+---
+
+## 1. Правильна `has_role` через `APEX_APPL_ACL_USER_ROLES`
+
+Якщо ти використовуєш стандартний **Access Control** в APEX (а в тебе якраз є таблиця `APEX_APPL_ACL_USER_ROLES`), то функцію `has_role` можна зробити так:
+
+```sql
+FUNCTION has_role(p_role_static_id IN VARCHAR2) RETURN BOOLEAN IS
+    l_dummy NUMBER;
+BEGIN
+    SELECT 1
+      INTO l_dummy
+      FROM apex_appl_acl_user_roles r
+     WHERE r.application_id = TO_NUMBER(v('APP_ID'))
+       AND r.user_name      = v('APP_USER')
+       AND r.role_static_id = p_role_static_id;
+
+    RETURN TRUE;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RETURN FALSE;
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END has_role;
+```
+
+Тут:
+
+* `v('APP_ID')` – поточний аплікейшн,
+* `v('APP_USER')` – поточний користувач,
+* `p_role_static_id` – `'EDITOR'`, `'CHIEF_EDITOR'` тощо.
+
+Якщо хочеш прив’язувати ролі не до `APP_USER`, а до свого `P0_CUR_USER_ID` (id з таблиці USERS), тоді треба робити join з твоєю USERS-таблицею і там вже співставляти логін.
+
+---
+
+## 2. Варіант: обгорнути твою існуючу функцію `GET_USER_ROLE_BY_CUSTOM_IDNTIFY`
+
+Ти вже маєш свою функцію для ролей. Тоді `has_role` можна зробити як **тонкий wrapper**:
+
+```sql
+FUNCTION has_role(p_role_static_id IN VARCHAR2) RETURN BOOLEAN IS
+    l_role_id NUMBER;
+BEGIN
+    l_role_id := GET_USER_ROLE_BY_CUSTOM_IDNTIFY(
+                   LC_APP_ID    => TO_NUMBER(v('APP_ID')),
+                   LC_USER_LOGIN=> v('APP_USER'),
+                   LC_IDNT_TYPE => p_role_static_id
+                 );
+
+    RETURN l_role_id IS NOT NULL; -- або > 0, залежно від того, що повертає твоя функція
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END has_role;
+```
+
+Якщо твоя `GET_USER_ROLE_BY_CUSTOM_IDNTIFY` приймає шаблон типу `'EDITOR%'`, то для `has_role('EDITOR')` ти можеш всередині додати `|| '%'`, або просто на рівні виклику:
+
+```sql
+l_is_editor       := has_role('EDITOR%');
+l_is_chief_editor := has_role('CHIEF_EDITOR%');
+```
+
+---
+
+## 3. Вписуємо це в наш пакет
+
+Тепер у `auth_task_pkg` просто замінюєш стару версію `has_role` на одну з цих (я рекомендую варіант через `APEX_APPL_ACL_USER_ROLES`, якщо він у тебе і так використовується):
+
+```sql
+FUNCTION has_role(p_role_static_id IN VARCHAR2) RETURN BOOLEAN IS
+    l_dummy NUMBER;
+BEGIN
+    SELECT 1
+      INTO l_dummy
+      FROM apex_appl_acl_user_roles r
+     WHERE r.application_id = TO_NUMBER(v('APP_ID'))
+       AND r.user_name      = v('APP_USER')
+       AND r.role_static_id = p_role_static_id;
+
+    RETURN TRUE;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RETURN FALSE;
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END has_role;
+```
+
+І вся інша логіка в `can_edit_task`, `can_edit_template`, `can_create_task` лишається такою, як ми описали раніше.
+
+---
+
+Якщо даси приклад тіла твоєї `GET_USER_ROLE_BY_CUSTOM_IDNTIFY`, можу прямо під неї підлаштувати фінальний варіант `has_role`, щоб ти майже нічого в старому коді не чіпав.

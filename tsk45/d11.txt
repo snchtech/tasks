@@ -1,0 +1,81 @@
+Так, так можна зробити **тільки через refresh регіону**, без перезавантаження всієї сторінки.
+Схема така:
+
+1. Кнопка / посилання → Dynamic Action.
+2. True Action №1: **Execute PL/SQL Code** → викликаємо `APEX_IR.RESET_REPORT` (або `APEX_INTERACTIVE_REPORT.RESET_REPORT`).
+3. True Action №2: **Refresh** → твій IR-регіон.
+
+---
+
+## 1. Підготовка
+
+1. Дай Interactive Report’у **Static ID**, наприклад: `TASKS_IR`.
+2. Створи кнопку `Reset` (або іконку) всередині цього ж регіону чи десь поруч.
+
+---
+
+## 2. Dynamic Action на кнопку
+
+### Крок 1. Створюємо DA
+
+* **Event**: Click
+* **Selection type**: Button
+* **Button**: твоя кнопка reset
+
+### True Action 1 – Execute PL/SQL Code
+
+Тип: **Execute Server-side Code** / **Execute PL/SQL Code**
+(залежно від версії APEX)
+
+Код:
+
+```plsql
+DECLARE
+    l_region_id apex_application_page_regions.region_id%TYPE;
+BEGIN
+    -- Знаходимо region_id по static_id
+    SELECT region_id
+      INTO l_region_id
+      FROM apex_application_page_regions
+     WHERE application_id = :APP_ID
+       AND page_id        = :APP_PAGE_ID
+       AND static_id      = 'TASKS_IR'; -- твій Static ID IR
+
+    -- Скидаємо Interactive Report до Primary Default
+    apex_ir.reset_report(
+        p_page_id   => :APP_PAGE_ID,
+        p_region_id => l_region_id,
+        p_report_id => NULL  -- останній переглянутий / дефолтний
+    );
+    -- у новіших версіях можна apex_interactive_report.reset_report(...)
+END;
+```
+
+**Items to Submit**: можна нічого не додавати, якщо `APP_ID/APP_PAGE_ID` стандартні.
+
+> ⚠️ Ця процедура не тільки "чистить сортування", а **повністю скидає налаштування звіту** до default: фільтри, breaks, highlights, control break’и й т.д. – аналог `RIR`, але без reload сторінки.
+
+---
+
+### True Action 2 – Refresh
+
+Другий true-action в тому ж DA:
+
+* **Action**: *Refresh*
+* **Selection Type**: Region
+* **Region**: твій IR (`TASKS_IR`)
+
+Порядок дій:
+
+1. Спочатку виконується PL/SQL (reset),
+2. Потім APEX робить **AJAX refresh** регіону → звіт показується в дефолтному вигляді, без повного reload сторінки.
+
+---
+
+## 3. Відповідь на твоє питання «Чи можна?»
+
+> *«Чи є якийсь підхід, який би дозволяв спочатку скинути сортування а потім перезавантажити регіон, без перезавантаження всієї сторінки?»*
+
+✅ Так: **Dynamic Action з Execute PL/SQL (APEX_IR.RESET_REPORT) + Refresh Region** – це саме той підхід, який ти бачиш на скріні з блогу, тільки обгорнутий у DA замість submit всієї сторінки.
+
+Якщо захочеш — можу допомогти адаптувати цей код під конкретне ім’я твоєї кнопки/регіону.

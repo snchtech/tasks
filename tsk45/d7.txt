@@ -1,0 +1,300 @@
+Супер задача, це якраз те, де APEX-авторизаційні схеми бриліантово заходять 💎
+Зробимо **одну функцію в пакеті**, а далі її просто підв’яжеш до кнопок / сторінок.
+
+---
+
+## 0. Логіка, яку закодовуємо
+
+Користувач **може редагувати** завдання / шаблон, якщо виконується хоча б одна з умов:
+
+1. **Звичайний редактор (EDITOR)**
+
+   * має роль `EDITOR` **і**
+   * (є автором завдання: `created_by = cur_user_id`
+     **або** є виконавцем у `SIGNATURERIGHTS` для цього `task_id` з `stage = 2`).
+
+2. **Головний редактор (CHIEF_EDITOR)**
+
+   * має роль `CHIEF_EDITOR`
+   * і `TASKS.DEPARTMENT_ID = :P0_CUR_DEPARTMENT_ID`.
+
+3. **Заміщення**
+
+   * якщо `:P0_SUBSTITUTION_MODE = 1` → беремо `:P0_NEW_USER_ID`,
+   * якщо `:P0_SUBSTITUTION_MODE = 0` → беремо `:P0_CUR_USER_ID`.
+
+---
+
+## 1. Пакет, який все це перевіряє
+
+Назву умовно `auth_task_pkg` (можеш вставити у свій існуючий `auth_pkg`).
+
+### 1.1. Функція перевірки ролі
+
+Якщо ти використовуєш APEX Access Control (ACL), можна так:
+
+```sql
+CREATE OR REPLACE PACKAGE auth_task_pkg AS
+  FUNCTION has_role(p_role_static_id IN VARCHAR2) RETURN BOOLEAN;
+  FUNCTION get_effective_user_id RETURN NUMBER;
+  FUNCTION can_edit_task (p_task_id IN NUMBER) RETURN BOOLEAN;
+  FUNCTION can_create_task RETURN BOOLEAN;
+  FUNCTION can_edit_template (p_template_id IN NUMBER) RETURN BOOLEAN;
+END auth_task_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY auth_task_pkg AS
+
+  FUNCTION has_role(p_role_static_id IN VARCHAR2) RETURN BOOLEAN IS
+  BEGIN
+    RETURN apex_util.current_user_in_role(p_role_static_id => p_role_static_id);
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN FALSE;
+  END has_role;
+```
+
+> Якщо ти раніше читав ролі з `APEX_APPL_ACL_USER_ROLES`, можеш замість `apex_util.current_user_in_role` використати свій SELECT.
+
+### 1.2. Функція для визначення «активного» користувача (заміщення)
+
+```sql
+  FUNCTION get_effective_user_id RETURN NUMBER IS
+    l_user_id NUMBER;
+  BEGIN
+    IF NVL(:P0_SUBSTITUTION_MODE, 0) = 1 THEN
+      l_user_id := :P0_NEW_USER_ID;
+    ELSE
+      l_user_id := :P0_CUR_USER_ID;
+    END IF;
+
+    RETURN l_user_id;
+  END get_effective_user_id;
+```
+
+### 1.3. Основна функція `can_edit_task`
+
+```sql
+  FUNCTION can_edit_task (p_task_id IN NUMBER) RETURN BOOLEAN IS
+    l_user_id          NUMBER;
+    l_is_editor        BOOLEAN;
+    l_is_chief_editor  BOOLEAN;
+    l_task_department  TASKS.DEPARTMENT_ID%TYPE;
+    l_created_by       TASKS.CREATED_BY%TYPE;
+    l_cnt              PLS_INTEGER;
+  BEGIN
+    -- Хто зараз «дійсний» користувач (з урахуванням заміщення)
+    l_user_id := get_effective_user_id;
+
+    -- Якщо користувач взагалі не визначений
+    IF l_user_id IS NULL THEN
+      RETURN FALSE;
+    END IF;
+
+    -- Ролі
+    l_is_editor       := has_role('EDITOR');
+    l_is_chief_editor := has_role('CHIEF_EDITOR');
+
+    IF NOT (l_is_editor OR l_is_chief_editor) THEN
+      RETURN FALSE;
+    END IF;
+
+    -- Отримати департамент і автора завдання
+    BEGIN
+      SELECT t.DEPARTMENT_ID,
+             t.CREATED_BY
+        INTO l_task_department,
+             l_created_by
+        FROM TASKS t
+       WHERE t.ID = p_task_id;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        RETURN FALSE;
+    END;
+
+    -- 1) Право CHIEF_EDITOR: будь-яке завдання в своєму департаменті
+    IF l_is_chief_editor
+       AND l_task_department = :P0_CUR_DEPARTMENT_ID THEN
+      RETURN TRUE;
+    END IF;
+
+    -- 2) Право EDITOR тільки по своїх завданнях / маршрутах
+
+    -- 2.1. Якщо він автор
+    IF l_is_editor AND l_created_by = l_user_id THEN
+      RETURN TRUE;
+    END IF;
+
+    -- 2.2. Якщо він виконавець з stage = 2 у SIGNATURERIGHTS
+    IF l_is_editor THEN
+      SELECT COUNT(*)
+        INTO l_cnt
+        FROM SIGNATURERIGHTS s
+       WHERE s.TASK_ID = p_task_id
+         AND s.USER_ID = l_user_id
+         AND s.STAGE   = 2; -- можна додати AND s.IS_ACTIVE = 1, якщо є
+
+      IF l_cnt > 0 THEN
+        RETURN TRUE;
+      END IF;
+    END IF;
+
+    RETURN FALSE;
+  END can_edit_task;
+```
+
+### 1.4. Дозвіл на створення (завдань / шаблонів)
+
+Тут логіка проста: **створювати** можна, якщо EDITOR або CHIEF_EDITOR:
+
+```sql
+  FUNCTION can_create_task RETURN BOOLEAN IS
+  BEGIN
+    RETURN has_role('EDITOR') OR has_role('CHIEF_EDITOR');
+  END can_create_task;
+```
+
+### 1.5. Функція для шаблонів
+
+Аналогічна до `TASKS`, тільки таблиця `TASK_TEMPLATES`:
+
+```sql
+  FUNCTION can_edit_template (p_template_id IN NUMBER) RETURN BOOLEAN IS
+    l_user_id          NUMBER;
+    l_is_editor        BOOLEAN;
+    l_is_chief_editor  BOOLEAN;
+    l_t_department     TASK_TEMPLATES.DEPARTMENT_ID%TYPE;
+    l_created_by       TASK_TEMPLATES.CREATED_BY%TYPE;
+  BEGIN
+    l_user_id := get_effective_user_id;
+
+    IF l_user_id IS NULL THEN
+      RETURN FALSE;
+    END IF;
+
+    l_is_editor       := has_role('EDITOR');
+    l_is_chief_editor := has_role('CHIEF_EDITOR');
+
+    IF NOT (l_is_editor OR l_is_chief_editor) THEN
+      RETURN FALSE;
+    END IF;
+
+    BEGIN
+      SELECT t.DEPARTMENT_ID,
+             t.CREATED_BY
+        INTO l_t_department,
+             l_created_by
+        FROM TASK_TEMPLATES t
+       WHERE t.ID = p_template_id;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        RETURN FALSE;
+    END;
+
+    -- CHIEF_EDITOR по департаменту
+    IF l_is_chief_editor
+       AND l_t_department = :P0_CUR_DEPARTMENT_ID THEN
+      RETURN TRUE;
+    END IF;
+
+    -- EDITOR і автор шаблону
+    IF l_is_editor AND l_created_by = l_user_id THEN
+      RETURN TRUE;
+    END IF;
+
+    RETURN FALSE;
+  END can_edit_template;
+
+END auth_task_pkg;
+/
+```
+
+---
+
+## 2. Як підв’язати це в APEX
+
+### 2.1. Перевірка при відкритті завдання (task_id)
+
+Припустімо, на сторінці картки завдання є item `P6_TASK_ID`.
+
+### Варіант А — **Authorization Scheme**
+
+1. **Shared Components → Security → Authorization Schemes → Create**
+2. Тип: **PL/SQL Function returning Boolean**
+3. Код, наприклад:
+
+```sql
+RETURN auth_task_pkg.can_edit_task(:P6_TASK_ID);
+```
+
+4. Назва схеми: `CAN_EDIT_TASK`.
+
+Тепер:
+
+* для кнопок **«Редагувати завдання»**, **«Редагувати виконавців»**:
+
+  * у властивості **Authorization Scheme** поставити `CAN_EDIT_TASK`.
+
+👉 APEX сам при рендері сторінки викликає цю функцію, і кнопки будуть показані / приховані.
+
+Аналогічно:
+
+* `CAN_EDIT_TEMPLATE` зі строкою:
+
+```sql
+RETURN auth_task_pkg.can_edit_template(:P7_TEMPLATE_ID);
+```
+
+і використовуєш це для сторінок шаблонів.
+
+### 2.2. Перевірка права створення
+
+Для кнопок **«Створити завдання»**, **«Створити шаблон»**:
+
+* робиш окрему Authorization Scheme `CAN_CREATE_TASK` з PL/SQL:
+
+```sql
+RETURN auth_task_pkg.can_create_task;
+```
+
+* і ставиш її для відповідних кнопок/сторінок.
+
+---
+
+## 3. Облік `P0_SUBSTITUTION_MODE` та `P0_NEW_USER_ID`
+
+Це ти вже заклав у функцію `get_effective_user_id`:
+
+* `:P0_SUBSTITUTION_MODE = 1` → беремо `:P0_NEW_USER_ID`;
+* `:P0_SUBSTITUTION_MODE = 0` → беремо `:P0_CUR_USER_ID`.
+
+Головне:
+
+* щоб ці **Page 0 items** були в сесії (вони ж у тебе вже використовуються в інших місцях — все ок),
+* і щоб вони були **session state aware** (Default / Computation / передаються з логіки входу).
+
+---
+
+## 4. Підсумовую
+
+1. **Створюємо пакет `auth_task_pkg`** із функціями:
+
+   * `has_role`,
+   * `get_effective_user_id`,
+   * `can_edit_task(p_task_id)`,
+   * `can_edit_template(p_template_id)`,
+   * `can_create_task`.
+2. **На сторінках завдань/шаблонів** робимо Authorization Schemes:
+
+   * `CAN_EDIT_TASK` → `auth_task_pkg.can_edit_task(:P6_TASK_ID);`
+   * `CAN_EDIT_TEMPLATE` → `auth_task_pkg.can_edit_template(:P7_TEMPLATE_ID);`
+   * `CAN_CREATE_TASK` → `auth_task_pkg.can_create_task;`
+3. У властивостях **кнопок редагування** ставимо відповідну Authorization Scheme.
+4. Логіка автоматично враховує:
+
+   * роль `EDITOR`,
+   * роль `CHIEF_EDITOR`,
+   * автора (`CREATED_BY`),
+   * виконавця в `SIGNATURERIGHTS` зі `STAGE = 2`,
+   * заміщення (`P0_SUBSTITUTION_MODE`, `P0_NEW_USER_ID`).
+
+Якщо хочеш, у наступному кроці можу адаптувати код під твою реальну функцію отримання ролей (з таблиці `APEX_APPL_ACL_USER_ROLES` чи твоєї `GET_USER_ROLE_BY_CUSTOM_IDNTIFY`).
