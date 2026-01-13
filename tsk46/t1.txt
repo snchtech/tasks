@@ -1,0 +1,409 @@
+клас, я підготував точкові “патчі”, щоб у твоєму `confirm_cart_pkg` з’явилась підтримка:
+
+* чекбокса “Out-of-Order” (OOO) для **stage = 4**, якщо там ≥ 3 записів у `SIGNATURERIGHTS`;
+* логіки показу кнопки “підписати” для **stage 4** поза порядком (за умови ролі: посада+відділ **або** ПІБ (tabno) **або** shift_id);
+* збереження існуючої поведінки “по порядку” для інших stage.
+
+> **Що міняємо коротко:**
+>
+> 1. додаємо кілька helper-функцій у body;
+> 2. трохи розширюємо параметри `render_substage_rows(...)`;
+> 3. розширюємо `render(...)`: показуємо чекбокс OOO для stage 4 і передаємо `p_task_id`;
+> 4. у рендері рядка, якщо stage=4 — використовуємо нову перевірку `can_sign_stage4(...)`, інакше — твою поточну `has_role(...)`.
+
+---
+
+## 1) ДОДАЙ (у body пакета, **після блоку утиліт** — перед «ЕТАПИ/ПІДЕТАПИ» або відразу після твоїх role-функцій)
+
+```plsql
+  ------------------------------------------------------------------------------
+  -- Out-of-order (OOO) для stage 4: helpers
+  ------------------------------------------------------------------------------
+
+  -- Чи ввімкнено позапорядкові відмітки для stage 4 (на сторінці має бути item, напр. P6_OOO4 = Y/N)
+  function ooo_enabled_stage4 return boolean is
+  begin
+    return (upper(nvl(v('P6_OOO4'),'N')) = 'Y');
+  end;
+
+  -- Чи існує хоч одна відмітка для вказаного SIGNRIGHT_ID
+  function has_hist(p_signright_id in number) return boolean is
+    l_dummy number;
+  begin
+    select 1 into l_dummy
+      from tasktracker.signaturehistory@to_tasktracker10 h
+     where h.signright_id = p_signright_id
+       and rownum = 1;
+    return true;
+  exception when no_data_found then
+    return false;
+  end;
+
+  -- Мінімальний (за SORT_ORDER,ID) не підписаний SIGNRIGHT у межах даного stage/task (для "по порядку")
+  function min_pending_sr_id(p_task_id in number, p_stage_id in number) return number is
+    l_id number;
+  begin
+    select x.id
+      into l_id
+      from (
+        select sr.id, sr.sort_order
+          from tasktracker.signaturerights@to_tasktracker10 sr
+         where sr.task_id   = p_task_id
+           and sr.stages_id = p_stage_id
+           and not exists (
+                 select 1
+                   from tasktracker.signaturehistory@to_tasktracker10 h
+                  where h.signright_id = sr.id
+               )
+         order by sr.sort_order, sr.id
+      ) x
+     where rownum = 1;
+    return l_id;
+  exception when no_data_found then
+    return null;
+  end;
+
+  -- Рольова відповідність: (posada+department) OR (tabno) OR (shift_id)
+  function role_match_for_sr(
+    p_sr_id            in number,
+    p_ctx_position_id  in number,
+    p_ctx_department_id in number,
+    p_ctx_tabno        in number,
+    p_ctx_shift_id     in number
+  ) return boolean
+  is
+    l_pos   number;
+    l_dep   number;
+    l_tab   number;
+    l_shift number;
+  begin
+    select position_id, department_id, user_tabno, shift_symbolid
+      into l_pos, l_dep, l_tab, l_shift
+      from tasktracker.signaturerights@to_tasktracker10
+     where id = p_sr_id;
+
+    if l_pos is not null and l_dep is not null
+       and l_pos = p_ctx_position_id
+       and l_dep = p_ctx_department_id
+    then
+      return true;
+    end if;
+
+    if l_tab is not null and l_tab = p_ctx_tabno then
+      return true;
+    end if;
+
+    if l_shift is not null and p_ctx_shift_id is not null
+       and l_shift = p_ctx_shift_id
+    then
+      return true;
+    end if;
+
+    return false;
+  end;
+
+  -- Чи можна підписувати для stage 4 (з урахуванням OOO і ролі)
+  function can_sign_stage4(
+    p_task_id          in number,
+    p_sr_id            in number,
+    p_ctx_position_id  in number,
+    p_ctx_department_id in number,
+    p_ctx_tabno        in number,
+    p_ctx_shift_id     in number
+  ) return boolean
+  is
+    l_min_pending number;
+  begin
+    if ooo_enabled_stage4 then
+      -- поза порядком: дозволити будь-який ще не підписаний, якщо роль підходить
+      if has_hist(p_sr_id) then
+        return false;
+      end if;
+      return role_match_for_sr(
+               p_sr_id,
+               p_ctx_position_id, p_ctx_department_id, p_ctx_tabno, p_ctx_shift_id
+             );
+    else
+      -- за замовчуванням: лише мінімальний не підписаний у stage 4 + роль
+      l_min_pending := min_pending_sr_id(p_task_id, 4);
+      return (l_min_pending is not null
+              and l_min_pending = p_sr_id
+              and role_match_for_sr(
+                    p_sr_id,
+                    p_ctx_position_id, p_ctx_department_id, p_ctx_tabno, p_ctx_shift_id
+                  ));
+    end if;
+  end;
+```
+
+> Якщо у тебе немає page-item для shift, зроби його (напр. `P6_SHIFT_ID`) і передавай у `render(...)`.
+
+---
+
+## 2) ЗМІНИ СИГНАТУРУ `render_substage_rows(...)` (додамо `p_task_id`, `p_stage_no`, `p_ctx_shift_id`)
+
+### Було (фрагмент підпису):
+
+```plsql
+procedure render_substage_rows(
+  p_buf                in out nocopy clob,
+  p_app_id             in number,
+  p_app_user           in varchar2,
+  p_page_list_id       in number,
+  p_stage_id           in number,
+  p_stage_no           in number,
+  p_substage_id        in number,
+  p_substage_title     in varchar2,
+  p_substage_btn_text  in varchar2,
+  p_substage_after_text in varchar2,
+  p_ctx_position_id    in number,
+  p_ctx_department_id  in number,
+  p_ctx_tabno          in number,
+  p_substitution_mode  in number,
+  p_new_roles          in varchar2,
+  p_stage_for_subtask  in number
+)
+```
+
+### Треба (додали `p_task_id`, `p_ctx_shift_id`):
+
+```plsql
+procedure render_substage_rows(
+  p_buf                 in out nocopy clob,
+  p_app_id              in number,
+  p_app_user            in varchar2,
+  p_page_list_id        in number,
+  p_stage_id            in number,
+  p_stage_no            in number,
+  p_substage_id         in number,
+  p_substage_title      in varchar2,
+  p_substage_btn_text   in varchar2,
+  p_substage_after_text in varchar2,
+  p_ctx_position_id     in number,
+  p_ctx_department_id   in number,
+  p_ctx_tabno           in number,
+  p_ctx_shift_id        in number,     -- НОВЕ
+  p_substitution_mode   in number,
+  p_new_roles           in varchar2,
+  p_stage_for_subtask   in number,
+  p_task_id             in number      -- НОВЕ
+)
+```
+
+> Не забудь віддзеркалити цю зміну у **виклику** з `render(...)` (див. розділ 3 нижче).
+
+---
+
+## 3) У ТІЛІ `render_substage_rows(...)`: заміни блок показу кнопки
+
+Знайди місце, де ти зараз вирішуєш, показувати кнопку/“очікує” (після трьох порожніх колонок «дата/час», «PIB», «коментар»). Заміни **весь** `declare ... begin ... end;` де обчислюється `l_role_ok` — на наступне:
+
+```plsql
+        append(p_buf, '<div class="c-cart-signer-mark">');
+
+        declare
+          l_role_ok boolean;
+          l_can     boolean;
+        begin
+          -- Для stage 4 — своя логіка (з OOO). Для інших stage — як було (has_role)
+          if p_stage_no = 4 then
+            l_can := can_sign_stage4(
+                       p_task_id          => p_task_id,
+                       p_sr_id            => l_signature_id,
+                       p_ctx_position_id  => p_ctx_position_id,
+                       p_ctx_department_id=> p_ctx_department_id,
+                       p_ctx_tabno        => p_ctx_tabno,
+                       p_ctx_shift_id     => p_ctx_shift_id
+                     );
+
+            if l_can and l_count_cb = 0 then
+              append(p_buf,
+                '<button id="signature-btn" data-signature-id="'||l_signature_id||'" class="confirm-signature-button">'||
+                h(p_substage_btn_text)||'</button>');
+              l_count_cb := l_count_cb + 1;
+            elsif l_can and l_count_cb > 0 then
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+            elsif (not l_can) and l_count_cb = 0 then
+              append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+              l_count_cb := l_count_cb + 1;
+            else
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+            end if;
+
+          else
+            -- старий шлях (по порядку) для інших stage
+            l_role_ok := has_role(
+              p_list_position_id   => l_list_position_id,
+              p_list_department_id => l_list_department_id,
+              p_list_unit_id       => l_list_unit_id,
+              p_list_tab_no        => l_list_tab_no,
+              p_ctx_position_id    => p_ctx_position_id,
+              p_ctx_department_id  => p_ctx_department_id,
+              p_ctx_tabno          => p_ctx_tabno,
+              p_substitution_mode  => p_substitution_mode,
+              p_new_roles          => p_new_roles,
+              p_app_id             => p_app_id,
+              p_app_user           => p_app_user
+            );
+
+            if l_role_ok and l_count_cb = 0 then
+              append(p_buf,
+                '<button id="signature-btn" data-signature-id="'||l_signature_id||'" class="confirm-signature-button">'||
+                h(p_substage_btn_text)||'</button>');
+              l_count_cb := l_count_cb + 1;
+            elsif l_role_ok and l_count_cb > 0 then
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+            elsif (not l_role_ok) and l_count_cb = 0 then
+              append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+              l_count_cb := l_count_cb + 1;
+            else
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+            end if;
+          end if;
+        end;
+
+        append(p_buf, '</div>'); -- .c-cart-signer-mark
+```
+
+---
+
+## 4) РОЗШИРИ `render(...)`: додай `p_task_id` і виведи чекбокс OOO для stage 4
+
+### (a) Зміни сигнатуру `render(...)` (і у **package spec**, якщо він є)
+
+```plsql
+  function render(
+    p_app_id             in number,
+    p_page_list_id       in number,
+    p_substitution_mode  in number,
+    p_cur_position_id    in number,
+    p_new_position_id    in number,
+    p_cur_tabno          in number,
+    p_new_tabno          in number,
+    p_cur_department_id  in number,
+    p_new_department_id  in number,
+    p_new_roles          in varchar2,
+    p_app_user           in varchar2,
+    p_p5_status_id       in number,
+    p_stage_for_subtask  in number,
+    p_task_id            in number,      -- НОВЕ
+    p_shift_id           in number       -- НОВЕ: якщо тримаєш його у сесії/айтемі
+  ) return clob
+```
+
+> Якщо не хочеш міняти spec/виклики — можеш у body читати `p_task_id` і `p_shift_id` напряму з page items (`v('P6_TASK_ID')`, `v('P6_SHIFT_ID')`). Але параметри явні — чистіше.
+
+### (b) Після рендера заголовка додай показ чекбокса OOO **(лише якщо stage 4 має ≥ 3 рядків SR)**:
+
+```plsql
+    -- показати OOO-перемикач для stage 4, якщо у stage 4 є >=3 записів
+    declare
+      l_cnt_stage4 number;
+    begin
+      select count(*)
+        into l_cnt_stage4
+        from tasktracker.signaturerights@to_tasktracker10 sr
+       where sr.task_id   = p_task_id
+         and sr.stages_id = 4;
+
+      if l_cnt_stage4 >= 3 then
+        append(l_buf,
+          '<div class="ooo4-switch">'||
+          '<label><input type="checkbox" id="ooo4" '||
+          case when ooo_enabled_stage4 then 'checked ' end||
+          'onchange="apex.item(''P6_OOO4'').setValue(this.checked?''Y'':''N'');'||
+          'apex.page.submit({request:''REFRESH_CART''});" /> '||
+          '<span>Відмічати етап 4 поза порядком</span></label>'||
+          '</div>'
+        );
+      end if;
+    end;
+```
+
+### (c) У виклику `render_substage_rows(...)` — передай нові аргументи
+
+Заміни твій виклик:
+
+```plsql
+          render_substage_rows(
+            p_buf                 => l_buf,
+            p_app_id              => p_app_id,
+            p_app_user            => p_app_user,
+            p_page_list_id        => p_page_list_id,
+            p_stage_id            => l_stage_id,
+            p_stage_no            => l_stage_no,
+            p_substage_id         => l_sub_id,
+            p_substage_title      => l_sub_title,
+            p_substage_btn_text   => l_btn_text,
+            p_substage_after_text => l_after_text,
+            p_ctx_position_id     => l_ctx_position_id,
+            p_ctx_department_id   => l_ctx_department_id,
+            p_ctx_tabno           => l_ctx_tabno,
+            p_substitution_mode   => p_substitution_mode,
+            p_new_roles           => p_new_roles,
+            p_stage_for_subtask   => p_stage_for_subtask
+          );
+```
+
+на:
+
+```plsql
+          render_substage_rows(
+            p_buf                 => l_buf,
+            p_app_id              => p_app_id,
+            p_app_user            => p_app_user,
+            p_page_list_id        => p_page_list_id,
+            p_stage_id            => l_stage_id,
+            p_stage_no            => l_stage_no,
+            p_substage_id         => l_sub_id,
+            p_substage_title      => l_sub_title,
+            p_substage_btn_text   => l_btn_text,
+            p_substage_after_text => l_after_text,
+            p_ctx_position_id     => l_ctx_position_id,
+            p_ctx_department_id   => l_ctx_department_id,
+            p_ctx_tabno           => l_ctx_tabno,
+            p_ctx_shift_id        => p_shift_id,          -- НОВЕ
+            p_substitution_mode   => p_substitution_mode,
+            p_new_roles           => p_new_roles,
+            p_stage_for_subtask   => p_stage_for_subtask,
+            p_task_id             => p_task_id            -- НОВЕ
+          );
+```
+
+---
+
+## 5) Щодо `OLD_SIGNHIST_ID`
+
+Це вставляється у **серверному процесі «Підписати»**, а не в пакеті рендера. Додай у процес:
+
+```plsql
+-- знайти попередній підпис у межах STAGE=4 (за потреби прибери фільтр за stage)
+select h.id
+  into l_prev_hist_id
+  from tasktracker.signaturehistory@to_tasktracker10 h
+ where h.signright_id in (
+         select sr.id
+           from tasktracker.signaturerights@to_tasktracker10 sr
+          where sr.task_id   = :P6_TASK_ID
+            and sr.stages_id = 4
+       )
+ order by h.sdate desc
+ fetch first 1 rows only;
+```
+
+і використовуй `l_prev_hist_id` у полі `OLD_SIGNHIST_ID` при `insert`.
+
+---
+
+### Примітки продуктивності
+
+* Індекси:
+
+  * `SIGNATURERIGHTS(task_id, stages_id, sort_order)`
+  * `SIGNATUREHISTORY(signright_id, sdate)`
+* Уникай подвійних звернень до БД у tight-loops: ми всі перевірки зробили локальними функціями з простими селектами по індексах.
+* Кнопка “OOO” перерендерює картку `request: 'REFRESH_CART'`; можеш зробити замість сабміту DA + Partial Refresh.
+
+---
+
+Якщо скинеш **package spec** і місце виклику `confirm_cart_pkg.render(...)` — піджену сигнатури/параметри рівно під твій рентайм (щоб нічого не поламати).
