@@ -1,0 +1,125 @@
+Ок, логіка тут проста: **у TASK_VIEWED ти зберігаєш (за потреби) “зріз” зміни в момент ознайомлення**, а в звіті просто красиво це показуєш.
+
+## 1) DDL: додати 3 колонки в `TASK_VIEWED`
+
+```sql
+alter table task_viewed add (
+  shift_id    number,
+  shift_start date,
+  shift_end   date
+);
+```
+
+(Якщо `P0_SHIFT_ID` у тебе varchar2 — тоді `shift_id varchar2(50)`.)
+
+---
+
+## 2) Як записувати shift-поля при ознайомленні
+
+### Варіант A (найчастіше): процес/PLSQL, де ти вставляєш `TASK_VIEWED`
+
+У місці, де ти робиш insert (або merge), просто прокинь значення з `P0_SHIFT_*`, але **лише якщо користувач має роль shift_personal** і значення заповнені.
+
+```plsql
+declare
+  l_is_shift_personal boolean := false;
+begin
+  -- перевірка ролі (підстав свою рольову перевірку)
+  l_is_shift_personal := apex_acl.has_user_role(
+                           p_application_id => :APP_ID,
+                           p_user_name      => :APP_USER,
+                           p_role_static_id => 'SHIFT_PERSONAL'
+                         );
+
+  merge into task_viewed tv
+  using (
+    select
+      :APP_USER_ID as user_id,
+      :P_TASK_ID   as task_id
+    from dual
+  ) src
+  on (tv.user_id = src.user_id and tv.task_id = src.task_id and nvl(tv.substitution_id, -1) = nvl(:P0_SUBSTITUTION_ID, -1))
+  when not matched then
+    insert (
+      id, user_id, task_id, date_viewed, substitution_id,
+      shift_id, shift_start, shift_end
+    )
+    values (
+      task_viewed_seq.nextval,
+      src.user_id,
+      src.task_id,
+      sysdate,
+      :P0_SUBSTITUTION_ID,
+      case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+           then :P0_SHIFT_ID end,
+      case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+           then :P0_SHIFT_START end,
+      case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+           then :P0_SHIFT_END end
+    )
+  when matched then
+    update set
+      tv.date_viewed = sysdate,
+      tv.shift_id    = case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+                            then :P0_SHIFT_ID else tv.shift_id end,
+      tv.shift_start = case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+                            then :P0_SHIFT_START else tv.shift_start end,
+      tv.shift_end   = case when l_is_shift_personal and :P0_SHIFT_ID is not null and :P0_SHIFT_START is not null and :P0_SHIFT_END is not null
+                            then :P0_SHIFT_END else tv.shift_end end;
+end;
+```
+
+> Якщо ти **не хочеш** перезаписувати shift-дані при повторному “ознайомленні”, то у `when matched then update` просто прибери 3 поля shift_* або оновлюй їх тільки коли вони NULL.
+
+---
+
+## 3) Як додати це в звіт “Ознайомлення”: SQL + колонка
+
+### 3.1. Додай у SELECT готовий текст “Зміна … з … по …”
+
+Приклад для Interactive Report / Classic Report:
+
+```sql
+select
+  tv.id,
+  tv.user_id,
+  tv.task_id,
+  tv.date_viewed,
+  tv.substitution_id,
+  tv.shift_id,
+  tv.shift_start,
+  tv.shift_end,
+  case
+    when tv.shift_id is not null
+     and tv.shift_start is not null
+     and tv.shift_end is not null
+    then
+      'Зміна ' || tv.shift_id ||
+      ' з ' || to_char(tv.shift_start, 'dd.mm.yyyy hh24:mi') ||
+      ' по ' || to_char(tv.shift_end,   'dd.mm.yyyy hh24:mi')
+  end as shift_info
+from task_viewed tv
+-- + твої join-и/фільтри
+;
+```
+
+### 3.2. В APEX додай колонку в звіт
+
+1. Відкрий **Report region** → **Source** → встав/онови SQL (як вище).
+2. У **Columns** з’явиться нова колонка `SHIFT_INFO`.
+3. Для `SHIFT_INFO`:
+
+   * **Type**: Plain Text (або Link — якщо треба)
+   * **Heading**: `Зміна`
+   * (Опційно) **Display as**: “Text Field” не треба, просто залиш як текст.
+4. Якщо хочеш показувати тільки коли є shift-дані — так і буде, бо `case ... end` дає `null`.
+
+---
+
+## 4) Якщо ти хочеш брати “Зміна …” не з таблиці, а з P0_… (лише для поточного перегляду)
+
+Можна і так, але тоді ти **не бачиш історію**, а бачиш “поточну зміну”. Якщо все ж треба — у SQL просто заміни `tv.shift_*` на `:P0_SHIFT_*` і перевірку ролі/заповненості. Але твій задум зберігати в `TASK_VIEWED` — правильніший.
+
+---
+
+Якщо скажеш, **який саме тип звіту** (IR чи Classic) і **як у тебе зберігається роль** (APEX ACL, своя таблиця ролей, `APEX_UTIL.GET_GROUPS_USER_BELONGS_TO`, тощо) — підставлю у код саме твою перевірку ролі.

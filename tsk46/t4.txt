@@ -1,0 +1,164 @@
+Супер, тоді під **IR + APEX ACL** робимо так.
+
+## 1) Додай колонки в `TASK_VIEWED`
+
+```sql
+alter table task_viewed add (
+  shift_id    number,
+  shift_start date,
+  shift_end   date
+);
+```
+
+---
+
+## 2) Запис shift-полів під час “Ознайомлений” (ACL роль `SHIFT_PERSONAL`)
+
+У процесі/PLSQL, де ти створюєш запис в `TASK_VIEWED`, додай перевірку ролі через `APEX_ACL.HAS_USER_ROLE` і прокинь `:P0_SHIFT_*`.
+
+> **Важливо:** `APEX_ACL.HAS_USER_ROLE` працює в межах app ACL. `p_user_name` = `:APP_USER`.
+
+```plsql
+declare
+  l_is_shift_personal boolean;
+begin
+  l_is_shift_personal :=
+    apex_acl.has_user_role(
+      p_application_id => :APP_ID,
+      p_user_name      => :APP_USER,
+      p_role_static_id => 'SHIFT_PERSONAL'
+    );
+
+  merge into task_viewed tv
+  using (
+    select
+      :APP_USER_ID as user_id,
+      :P_TASK_ID   as task_id
+    from dual
+  ) src
+  on (
+       tv.user_id = src.user_id
+   and tv.task_id = src.task_id
+   and nvl(tv.substitution_id, -1) = nvl(:P0_SUBSTITUTION_ID, -1)
+  )
+  when not matched then
+    insert (
+      id, user_id, task_id, date_viewed, substitution_id,
+      shift_id, shift_start, shift_end
+    )
+    values (
+      task_viewed_seq.nextval,
+      src.user_id,
+      src.task_id,
+      sysdate,
+      :P0_SUBSTITUTION_ID,
+      case
+        when l_is_shift_personal
+         and :P0_SHIFT_ID is not null
+         and :P0_SHIFT_START is not null
+         and :P0_SHIFT_END is not null
+        then :P0_SHIFT_ID
+      end,
+      case
+        when l_is_shift_personal
+         and :P0_SHIFT_ID is not null
+         and :P0_SHIFT_START is not null
+         and :P0_SHIFT_END is not null
+        then :P0_SHIFT_START
+      end,
+      case
+        when l_is_shift_personal
+         and :P0_SHIFT_ID is not null
+         and :P0_SHIFT_START is not null
+         and :P0_SHIFT_END is not null
+        then :P0_SHIFT_END
+      end
+    )
+  when matched then
+    update set
+      tv.date_viewed = sysdate
+      -- якщо хочеш ОНОВЛЮВАТИ shift-дані при повторному кліку:
+      , tv.shift_id = case
+          when l_is_shift_personal
+           and :P0_SHIFT_ID is not null
+           and :P0_SHIFT_START is not null
+           and :P0_SHIFT_END is not null
+          then :P0_SHIFT_ID else tv.shift_id
+        end
+      , tv.shift_start = case
+          when l_is_shift_personal
+           and :P0_SHIFT_ID is not null
+           and :P0_SHIFT_START is not null
+           and :P0_SHIFT_END is not null
+          then :P0_SHIFT_START else tv.shift_start
+        end
+      , tv.shift_end = case
+          when l_is_shift_personal
+           and :P0_SHIFT_ID is not null
+           and :P0_SHIFT_START is not null
+           and :P0_SHIFT_END is not null
+          then :P0_SHIFT_END else tv.shift_end
+        end;
+end;
+```
+
+> Якщо ти хочеш **не перезаписувати** shift-поля при повторному “ознайомленні”, просто прибери 3 рядки `tv.shift_* = ...` з блоку `when matched then update`.
+
+---
+
+## 3) Додай “Зміна … з … по …” в Interactive Report (IR)
+
+### 3.1. Онови SQL джерела IR (додай computed column)
+
+```sql
+select
+  tv.id,
+  tv.user_id,
+  tv.task_id,
+  tv.date_viewed,
+  tv.substitution_id,
+  tv.shift_id,
+  tv.shift_start,
+  tv.shift_end,
+  case
+    when tv.shift_id is not null
+     and tv.shift_start is not null
+     and tv.shift_end is not null
+    then
+      'Зміна ' || tv.shift_id ||
+      ' з ' || to_char(tv.shift_start, 'dd.mm.yyyy hh24:mi') ||
+      ' по ' || to_char(tv.shift_end,   'dd.mm.yyyy hh24:mi')
+  end as shift_info
+from task_viewed tv
+-- твої join/where
+;
+```
+
+### 3.2. Налаштування колонки в IR
+
+В APEX:
+
+1. Відкрий сторінку → твій **Interactive Report region**
+2. **Columns** → знайди `SHIFT_INFO`
+3. Встанови:
+
+   * **Heading**: `Зміна`
+   * **Escape Special Characters**: `Yes` (бо це звичайний текст)
+   * (Опційно) **Column Alignment**: Left
+4. (Опційно) сховай технічні колонки `SHIFT_ID/SHIFT_START/SHIFT_END`, якщо вони виводяться окремо:
+
+   * для кожної → **Type: Hidden** або **Display: No**
+
+---
+
+## 4) Маленький бонус (щоб виводилось “Зміна 1”, навіть якщо shift_id число)
+
+Якщо `shift_id` number — все ок. Якщо varchar2 — теж ок. Якщо хочеш завжди красиво:
+
+```sql
+'Зміна ' || to_char(tv.shift_id)
+```
+
+---
+
+Якщо напишеш, **де саме зберігаються `P0_SHIFT_ID/P0_SHIFT_START/P0_SHIFT_END`** (Application Items чи Page 0 items) і **який процес натискання** (DA + Ajax, або стандартний submit), я підкажу найчистіше місце, куди вставити цей `merge`.
