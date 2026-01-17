@@ -1,0 +1,280 @@
+окей, робимо “послідовно/паралельно” для **stage=4** так, щоб воно було кероване з маршруту і працювало в твоєму рендері картки.
+
+Я покажу мінімальні, але повні зміни: **DDL**, **сторінка маршруту (APEX)**, **пакет `confirm_cart_pkg`** і **виклик рендера**. Код можна вставляти одразу.
+
+---
+
+# 1) БД: нова колонка в `SIGNATURERIGHTS`
+
+> 0 = паралельно (за замовчуванням), 1 = послідовно
+
+```sql
+alter table TaskTracker.SIGNATURERIGHTS
+  add STAGE4_MODE number(1) default 0 not null;
+
+create index IX_SR_TASK_STAGE_MODE
+  on TaskTracker.SIGNATURERIGHTS (TASK_ID, STAGES_ID, STAGE4_MODE);
+```
+
+> Якщо ти хочеш керувати **по кожному запису SR**, залишай значення різними. Якщо керуєш **на рівні всього блока stage 4 для завдання**, просто став однаково для всіх SR з `STAGES_ID=4` цього `TASK_ID`.
+
+---
+
+# 2) Сторінка “Маршрут відміток” (створення/редагування)
+
+## 2.1 Item
+
+* Додай checkbox item, напр. **`P4_STAGE4_SEQUENTIAL`** (Y/N).
+  За замовчуванням unchecked (тобто паралельно).
+
+## 2.2 Дізнатися поточний режим
+
+Динамічна дія “After Refresh” або процес **Before Header**:
+
+```plsql
+declare
+  l_mode number;
+begin
+  select nvl(max(sr.stage4_mode),0)
+    into l_mode
+    from TaskTracker.SIGNATURERIGHTS sr
+   where sr.task_id   = :P4_TASK_ID
+     and sr.stages_id = 4;
+
+  :P4_STAGE4_SEQUENTIAL := case when l_mode = 1 then 'Y' else 'N' end;
+end;
+```
+
+## 2.3 Зберегти режим для stage 4
+
+Процес **When Button Pressed = SAVE / APPLY**:
+
+```plsql
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage4_mode = case when :P4_STAGE4_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id   = :P4_TASK_ID
+   and sr.stages_id = 4;
+```
+
+> Якщо керуєш “по кожному SR”, можна ставити окремий чекбокс у рядку IG і писати його в `STAGE4_MODE` на рівні кожного запису.
+
+---
+
+# 3) `confirm_cart_pkg`: підтримка паралельно/послідовно
+
+Нижче — **точкові доповнення** до твого пакета (до body). Якщо ти вже додавав мої попередні хелпери — просто заміни їх на ці версії (з урахуванням `STAGE4_MODE`).
+
+## 3.1 Додай/онови хелпери (в body, після блоку ролей)
+
+```plsql
+  ------------------------------------------------------------------------------
+  -- Out-of-order / послідовність для stage 4
+  ------------------------------------------------------------------------------
+
+  -- Режим для stage 4: 0=паралельно, 1=послідовно.
+  -- Якщо ти керуєш глобально для всього stage 4 (однаково на всі SR), бери max().
+  function get_stage4_mode(p_task_id in number) return number is
+    l_mode number;
+  begin
+    select nvl(max(sr.stage4_mode),0)
+      into l_mode
+      from tasktracker.signaturerights@to_tasktracker10 sr
+     where sr.task_id   = p_task_id
+       and sr.stages_id = 4;
+    return l_mode; -- 0 | 1
+  exception when no_data_found then
+    return 0;
+  end;
+
+  -- Чи існує хоч одна відмітка для конкретного SIGNRIGHT_ID
+  function has_hist(p_signright_id in number) return boolean is
+    l_dummy number;
+  begin
+    select 1 into l_dummy
+      from tasktracker.signaturehistory@to_tasktracker10 h
+     where h.signright_id = p_signright_id
+       and rownum = 1;
+    return true;
+  exception when no_data_found then
+    return false;
+  end;
+
+  -- Мінімальний не підписаний SIGNRIGHT у stage (для "послідовно", беремо за SORT_ORDER)
+  function min_pending_sr_id(p_task_id in number, p_stage_id in number) return number is
+    l_id number;
+  begin
+    select x.id
+      into l_id
+      from (
+        select sr.id, sr.sort_order
+          from tasktracker.signaturerights@to_tasktracker10 sr
+         where sr.task_id   = p_task_id
+           and sr.stages_id = p_stage_id
+           and not exists (
+                 select 1 from tasktracker.signaturehistory@to_tasktracker10 h
+                  where h.signright_id = sr.id
+               )
+         order by sr.sort_order, sr.id
+      ) x
+     where rownum = 1;
+    return l_id;
+  exception when no_data_found then
+    return null;
+  end;
+
+  -- Відповідність ролі: (posada+department) OR (tabno) OR (shift_id)
+  function role_match_for_sr(
+    p_sr_id             in number,
+    p_ctx_position_id   in number,
+    p_ctx_department_id in number,
+    p_ctx_tabno         in number,
+    p_ctx_shift_id      in number
+  ) return boolean
+  is
+    l_pos   number;
+    l_dep   number;
+    l_tab   number;
+    l_shift number;
+  begin
+    select position_id, department_id, user_tabno, shift_symbolid
+      into l_pos, l_dep, l_tab, l_shift
+      from tasktracker.signaturerights@to_tasktracker10
+     where id = p_sr_id;
+
+    if l_pos is not null and l_dep is not null
+       and l_pos = p_ctx_position_id
+       and l_dep = p_ctx_department_id then
+      return true;
+    end if;
+
+    if l_tab is not null and l_tab = p_ctx_tabno then
+      return true;
+    end if;
+
+    if l_shift is not null and p_ctx_shift_id is not null
+       and l_shift = p_ctx_shift_id then
+      return true;
+    end if;
+
+    return false;
+  end;
+
+  -- Головна перевірка для stage 4: враховує STAGE4_MODE
+  function can_sign_stage4(
+    p_task_id           in number,
+    p_sr_id             in number,
+    p_ctx_position_id   in number,
+    p_ctx_department_id in number,
+    p_ctx_tabno         in number,
+    p_ctx_shift_id      in number
+  ) return boolean
+  is
+    l_mode        number := get_stage4_mode(p_task_id); -- 0 паралельно, 1 послідовно
+    l_min_pending number;
+  begin
+    if l_mode = 0 then
+      -- ПАРАЛЕЛЬНО: дозволяємо будь-який непідписаний SR, якщо роль підходить
+      if has_hist(p_sr_id) then
+        return false;
+      end if;
+      return role_match_for_sr(p_sr_id,
+                               p_ctx_position_id, p_ctx_department_id,
+                               p_ctx_tabno, p_ctx_shift_id);
+    else
+      -- ПОСЛІДОВНО: тільки мінімальний непідписаний за SORT_ORDER
+      l_min_pending := min_pending_sr_id(p_task_id, 4);
+      return (l_min_pending is not null
+              and l_min_pending = p_sr_id
+              and role_match_for_sr(p_sr_id,
+                    p_ctx_position_id, p_ctx_department_id,
+                    p_ctx_tabno, p_ctx_shift_id));
+    end if;
+  end;
+```
+
+## 3.2 Розшир `render_substage_rows(...)` (як я вже показував раніше)
+
+Додай параметри **`p_ctx_shift_id`** та **`p_task_id`** і в місці, де рендериш кнопку/“очікує”, зроби гілку:
+
+```plsql
+if p_stage_no = 4 then
+  l_can := can_sign_stage4(
+             p_task_id           => p_task_id,
+             p_sr_id             => l_signature_id,
+             p_ctx_position_id   => p_ctx_position_id,
+             p_ctx_department_id => p_ctx_department_id,
+             p_ctx_tabno         => p_ctx_tabno,
+             p_ctx_shift_id      => p_ctx_shift_id
+           );
+  -- далі — як у тебе: кнопка якщо l_can і т.д.
+else
+  -- старий шлях (has_role) для інших stage
+end if;
+```
+
+## 3.3 Розшир `render(...)`
+
+* Додай параметри **`p_task_id`** і **`p_shift_id`** (або зчитай з `v('P6_TASK_ID')/v('P6_SHIFT_ID')`).
+* У виклику `render_substage_rows(...)` передай `p_ctx_shift_id => p_shift_id`, `p_task_id => p_task_id`.
+* (За бажанням) Показуй “перемикач” на самій картці тільки для інформації: прочитай `get_stage4_mode(p_task_id)` і виведи “Режим: паралельно/послідовно”. Керування режимом ми вже робимо на сторінці маршруту.
+
+---
+
+# 4) Процес “Підписати” (INSERT у `SIGNATUREHISTORY`)
+
+Це не в пакеті рендера, а в серверному процесі кнопки:
+
+* Для **OLD_SIGNHIST_ID** можеш залишити логіку “остання відмітка у межах stage 4” незалежно від режиму — це працює і для послідовного, і для паралельного варіантів.
+
+```plsql
+declare
+  l_prev_hist_id number;
+begin
+  select h.id
+    into l_prev_hist_id
+    from TaskTracker.SIGNATUREHISTORY@to_tasktracker10 h
+   where h.signright_id in (
+           select sr.id
+             from TaskTracker.SIGNATURERIGHTS@to_tasktracker10 sr
+            where sr.task_id   = :P6_TASK_ID
+              and sr.stages_id = 4
+         )
+   order by h.sdate desc
+   fetch first 1 rows only;
+exception when no_data_found then
+  l_prev_hist_id := null;
+end;
+
+insert into TaskTracker.SIGNATUREHISTORY@to_tasktracker10(
+  id, signright_id, old_signhist_id, new_status_id,
+  signer_by, signer_date, note, sdate
+) values(
+  TaskTracker.SIGNATUREHISTORY_SEQ@to_tasktracker10.nextval,
+  :P_REQUESTED_SR_ID,
+  l_prev_hist_id,
+  10,
+  :PO_CUR_USER_TABNO,
+  sysdate,
+  :P6_NOTE,
+  sysdate
+);
+```
+
+---
+
+# 5) Куди саме вставляти у твоєму коді на фото
+
+* У **динамічному регіоні** (той, що на скрінах) у місці, де рендеряться рядки підетапу і приймається рішення «кнопка/очікує», додай гілку `if p_stage_no = 4 then ... can_sign_stage4(...)`.
+* Якщо ти рендериш **stage 4** у тому ж циклі, що й stage 2/6, просто передай в `render_substage_rows(...)` додатково `p_task_id` та `p_ctx_shift_id`.
+  `p_task_id` = ідентифікатор поточного завдання в картці; `p_ctx_shift_id` = твій обчислений/вибраний `SHIFT_ID` (якщо використовується).
+
+---
+
+## Підсумок
+
+* Зміни в БД — одна колонка.
+* На сторінці маршруту — один чекбокс + просте оновлення всіх SR у stage 4.
+* У пакеті — 4 допоміжні функції + маленька умова в місці рендера кнопки.
+* У процесі “Підписати” — `OLD_SIGNHIST_ID` як останній запис у stage 4.
+
+Це дасть тобі керування “послідовно/паралельно” **без** роздування логіки рендера і з повною сумісністю з уже написаними блоками на фото.

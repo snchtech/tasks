@@ -1,0 +1,251 @@
+Окей, додаємо підтримку **паралельних/послідовних** відміток на рівні **stage = 4** через колонку `SIGNATURERIGHTS.STAGE4_MODE` (0 – паралельно, 1 – послідовно).
+
+Нижче — компактні зміни до твого пакета (тільки те, що треба додати/замінити).
+
+---
+
+# 1) Отримати режим stage=4 для завдання
+
+```plsql
+-- ДОДАТИ: довідкова функція
+function get_stage_mode(p_task_id in number, p_stage_id in number) return number is
+  l_mode number := 0; -- дефолт: паралельно
+begin
+  -- якщо з якихось причин у різних SR буде різне значення – беремо MAX
+  select nvl(max(stage4_mode), 0)
+    into l_mode
+    from tasktracker.signaturerights@to_tasktracker10
+   where task_id   = p_task_id
+     and stages_id = p_stage_id;  -- 4
+  return l_mode;
+exception
+  when no_data_found then
+    return 0;
+end;
+```
+
+---
+
+# 2) Передати режим у рендер підетапу
+
+### Було (сигнатура)
+
+```plsql
+procedure render_substage_rows(
+  p_buf in out nocopy clob,
+  ...
+  p_stage_for_subtask  in number
+);
+```
+
+### Стало (додали `p_stage_mode`)
+
+```plsql
+procedure render_substage_rows(
+  p_buf in out nocopy clob,
+  p_app_id             in number,
+  p_app_user           in varchar2,
+  p_page_list_id       in number,
+  p_stage_id           in number,
+  p_stage_no           in number,
+  p_substage_id        in number,
+  p_substage_title     in varchar2,
+  p_substage_btn_text  in varchar2,
+  p_substage_after_text in varchar2,
+  p_ctx_position_id    in number,
+  p_ctx_department_id  in number,
+  p_ctx_tabno          in number,
+  p_substitution_mode  in number,
+  p_new_roles          in varchar2,
+  p_stage_for_subtask  in number,
+  p_stage_mode         in number     -- 0=паралельно, 1=послідовно (має сенс для stage=4)
+);
+```
+
+---
+
+# 3) Логіка кнопок у підетапі (паралельно vs послідовно)
+
+Усередині `render_substage_rows` (там, де ти показуєш кнопку/статус), додаємо прапор:
+
+```plsql
+-- На початку процедури (після оголошень змінних):
+    l_count_cb number := 0;        -- вже було
+    l_parallel boolean := (p_stage_no = 4 and nvl(p_stage_mode,0) = 0);
+```
+
+І замінюємо фрагмент, де показуєш кнопку/«Очікує/Розглядає».
+
+### Було (скорочено)
+
+```plsql
+if l_role_ok and l_count_cb = 0 then
+  append(... кнопка ...);
+  l_count_cb := l_count_cb + 1;
+elsif l_role_ok and l_count_cb > 0 then
+  append('Очікує відмітки');
+elsif (not l_role_ok) and l_count_cb = 0 then
+  append('Розглядає');
+  l_count_cb := l_count_cb + 1;
+else
+  append('Очікує відмітки');
+end if;
+```
+
+### Стало (враховуємо `l_parallel`)
+
+```plsql
+if l_role_ok then
+  if l_parallel then
+    -- ПАРАЛЕЛЬНО: показуємо кнопку на кожному рядку без підпису, де користувач має право
+    append(p_buf,
+      '<button id="signature-btn" data-signature-id="'||l_signature_id||'" '||
+      'class="confirm-signature-button">'||h(p_substage_btn_text)||'</button>');
+  else
+    -- ПОСЛІДОВНО: як і раніше — лише першу доступну кнопку
+    if l_count_cb = 0 then
+      append(p_buf,
+        '<button id="signature-btn" data-signature-id="'||l_signature_id||'" '||
+        'class="confirm-signature-button">'||h(p_substage_btn_text)||'</button>');
+      l_count_cb := l_count_cb + 1;
+    else
+      append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+    end if;
+  end if;
+
+else
+  -- Користувач не має права підпису для цього рядка
+  if l_parallel then
+    -- ПАРАЛЕЛЬНО: простий статус очікування
+    append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+  else
+    -- ПОСЛІДОВНО: «Розглядає» лише для першого непідписаного без кнопки
+    if l_count_cb = 0 then
+      append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+      l_count_cb := l_count_cb + 1;
+    else
+      append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+    end if;
+  end if;
+end if;
+```
+
+> Примітка: умова «є підпис» (`l_have_sign = 'Y'`) як і раніше **блокує** показ кнопки та вже відображає історію — це працює і в паралельному, і в послідовному режимі.
+
+---
+
+# 4) Виклик `render_substage_rows` із передачею режиму
+
+У `render()`:
+
+* Додай параметр **`p_task_id`** у функцію `render` (якщо його ще нема), бо режим беремо з `SIGNATURERIGHTS` для конкретного task.
+
+### Було (сигнатура `render`)
+
+```plsql
+function render(
+  p_app_id            in number,
+  p_page_list_id      in number,
+  ...
+  p_stage_for_subtask in number
+) return clob
+```
+
+### Стало
+
+```plsql
+function render(
+  p_app_id            in number,
+  p_task_id           in number,   -- ДОДАЛИ
+  p_page_list_id      in number,
+  p_substitution_mode in number,
+  p_cur_position_id   in number,
+  p_new_position_id   in number,
+  p_cur_tabno         in number,
+  p_new_tabno         in number,
+  p_cur_department_id in number,
+  p_new_department_id in number,
+  p_new_roles         in varchar2,
+  p_app_user          in varchar2,
+  p_p5_status_id      in number,
+  p_stage_for_subtask in number
+) return clob
+```
+
+* Перед викликом `render_substage_rows` визначаємо режим **тільки** для етапу 4:
+
+```plsql
+    -- усередині циклу по етапах:
+    -- l_stage_id, l_stage_no вже є
+    -- ...
+    -- підетапи
+    rc_sub := substages(p_page_list_id, l_stage_id);
+
+    -- режим відміток для поточного етапу
+    -- (для інших етапів він ігнорується; має сенс лише коли l_stage_no=4)
+    declare
+      l_stage_mode number := 0;
+    begin
+      if l_stage_no = 4 then
+        l_stage_mode := get_stage_mode(p_task_id => p_task_id, p_stage_id => l_stage_id);
+      end if;
+
+      loop
+        fetch rc_sub into l_sub_id, l_sub_no, l_sub_title, l_btn_text, l_after_text;
+        exit when rc_sub%notfound;
+
+        if apex_collection.collection_exists('CONFIRM_CART_'||l_stage_id||'_'||l_sub_id) then
+          render_substage_rows(
+            p_buf                 => l_buf,
+            p_app_id              => p_app_id,
+            p_app_user            => p_app_user,
+            p_page_list_id        => p_page_list_id,
+            p_stage_id            => l_stage_id,
+            p_stage_no            => l_stage_no,
+            p_substage_id         => l_sub_id,
+            p_substage_title      => l_sub_title,
+            p_substage_btn_text   => l_btn_text,
+            p_substage_after_text => l_after_text,
+            p_ctx_position_id     => l_ctx_position_id,
+            p_ctx_department_id   => l_ctx_department_id,
+            p_ctx_tabno           => l_ctx_tabno,
+            p_substitution_mode   => p_substitution_mode,
+            p_new_roles           => p_new_roles,
+            p_stage_for_subtask   => p_stage_for_subtask,
+            p_stage_mode          => l_stage_mode    -- ДОДАЛИ
+          );
+        else
+          append(l_buf, '<div class="need-data-add-text">Дозаповніть поля</div>');
+        end if;
+      end loop;
+      close rc_sub;
+    end;
+```
+
+---
+
+# 5) (Опційно) Маркер у UI
+
+Щоб користувач бачив режим етапу 4, можна додати маленький бейдж під назвою етапу:
+
+```plsql
+if l_stage_no = 4 then
+  append(l_buf,
+    '<div class="stage-mode">'||
+    case get_stage_mode(p_task_id, l_stage_id)
+      when 1 then '<span class="badge badge-seq">Послідовно</span>'
+      else         '<span class="badge badge-par">Паралельно</span>'
+    end||
+    '</div>');
+end if;
+```
+
+---
+
+## Підсумок логіки
+
+* **Послідовно (1)**: показуєш **лише одну** кнопку — для першого доступного рядка без підпису (поточна логіка із `l_count_cb`).
+* **Паралельно (0)**: показуєш **кнопку на кожному** рядку без підпису, де користувач має право (ігноруємо `l_count_cb`).
+* Історія підписів і все інше — без змін.
+
+Ці зміни мінімальні, локальні й не ламають існуючу структуру.

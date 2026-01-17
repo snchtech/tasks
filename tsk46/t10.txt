@@ -1,0 +1,94 @@
+Так — цю «сходинку» треба зберегти незалежно від режиму stage 4 (паралельно/послідовно). Рішення: відокремити **глобальне блокування етапу** (переходимо на наступний stage лише коли **всі** SR у попередньому stage мають запис у `SIGNATUREHISTORY`) від **локальної логіки всередині stage 4** (показ кнопок «паралельно» чи «послідовно» для окремих рядків).
+
+Нижче — мінімальні доповнення до пакета.
+
+# 1) Перевірка «етап завершено?»
+
+```plsql
+-- усі SR етапу закриті = можна показувати наступний stage
+function stage_open_count_by_no(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number
+) return number is
+  l_cnt number;
+begin
+  /* рахуємо SR без історії на підетапах потрібного етапу */
+  select count(*)
+    into l_cnt
+    from tasktracker.signaturerights@to_tasktracker10 sr
+   where sr.task_id = p_task_id
+     and sr.stages_id in (
+           select d.id
+             from tasktracker.dict_app_confirm_list@to_tasktracker10 d
+            where d.page_list_id    = p_page_list_id
+              and d.parent_stage_id = (
+                    select p.id
+                      from tasktracker.dict_app_confirm_list@to_tasktracker10 p
+                     where p.page_list_id    = p_page_list_id
+                       and p.parent_stage_id is null
+                       and p.stage           = p_stage_no
+                  )
+         )
+     and not exists (
+           select 1
+             from tasktracker.signaturehistory@to_tasktracker10 h
+            where h.signright_id = sr.id
+         );
+
+  return l_cnt; -- 0 = етап завершено
+end;
+```
+
+# 2) Гейт перед рендером підетапів
+
+У `render(...)` додай `p_task_id` (як і вище ми робили для stage4_mode) і постав «шлагбаум»:
+
+```plsql
+-- перед відкриттям rc_sub для поточного етапу
+if l_stage_no = 4 then
+  if stage_open_count_by_no(p_task_id, p_page_list_id, 2) > 0 then
+    append(l_buf, '<div class="stage-locked">Етап 4 стане доступним після завершення всіх відміток на етапі 2.</div>');
+    continue; -- не рендеримо підетапи stage 4
+  end if;
+elsif l_stage_no = 6 then
+  if stage_open_count_by_no(p_task_id, p_page_list_id, 4) > 0 then
+    append(l_buf, '<div class="stage-locked">Етап 6 стане доступним після завершення всіх відміток на етапі 4.</div>');
+    continue; -- не рендеримо підетапи stage 6
+  end if;
+end if;
+
+-- якщо дійшли сюди — попередній етап завершено → відкриваємо rc_sub і рендеримо
+rc_sub := substages(p_page_list_id, l_stage_id);
+```
+
+Це забезпечує:
+
+* **Stage 4 видимий** тільки коли **всі** SR stage 2 мають підпис.
+* **Stage 6 видимий** тільки коли **всі** SR stage 4 мають підпис.
+
+І це **не залежить** від того, як саме всередині stage 4 ви показуєте кнопки (паралельно чи послідовно).
+
+# 3) Внутрішня логіка stage 4 лишається як є
+
+* Паралельний/послідовний показ кнопок у `render_substage_rows(...)` (який ти вже додав через `p_stage_mode`) працює тільки **всередині** stage 4.
+* «Шлагбаум» з кроку 2 взагалі не дасть потрапити у рендер stage 4, якщо stage 2 не завершений; і так само не дасть у stage 6, якщо stage 4 не завершений — навіть якщо «останній» рядок підписаний, але інші ні.
+
+# 4) Плюс маленький UX-твік (опційно)
+
+Якщо хочеш, на заблокованому етапі можна показати лічильник «ще залишилось N підписів на попередньому етапі», змінивши повідомлення так:
+
+```plsql
+declare
+  l_missing number;
+begin
+  l_missing := stage_open_count_by_no(p_task_id, p_page_list_id, 4); -- для stage 6
+  append(l_buf, '<div class="stage-locked">Етап 6 відкриється після завершення етапу 4. Непідписаних: '||l_missing||'.</div>');
+end;
+```
+
+---
+
+### Висновок
+
+Так, зберігаємо вашу попередню бізнес-умову: **перехід між етапами дозволений тільки після повного завершення попереднього**, а «паралельно/послідовно» на stage 4 впливає **виключно на показ кнопок усередині етапу**, але **не знімає** міжетапні блокування.

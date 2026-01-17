@@ -1,0 +1,142 @@
+Коротко: зроби це **після** вставки/оновлення виконавців для stage=4 в тій самій транзакції. Є 3 робочі варіанти. Найпростіший і надійний — **один “підсумковий” PL/SQL-процес** наприкінці, який масово оновлює `stage4_mode` для всіх SR stage=4 поточного `task_id`.
+
+---
+
+# Варіант 1 (рекомендований): фінальний update в кінці процесингу
+
+1. Залишаємо колонку з дефолтом:
+
+```sql
+alter table TaskTracker.SIGNATURERIGHTS
+  modify stage4_mode default 0;  -- 0 = паралельно
+```
+
+2. На сторінці редагування маршруту (де ти додаєш/оновлюєш записи SR) додай **окремий процес** PL/SQL, який має **більший Sequence** за всі твої процеси вставки/оновлення SR (або постав його **останнім** у DA, з “Wait for Result = Yes”).
+
+```plsql
+declare
+  l_target number := case when upper(nvl(:P4_STAGE4_SEQUENTIAL,'N'))='Y' then 1 else 0 end;
+begin
+  -- Масове вирівнювання режиму для stage=4 після всіх DML
+  update TaskTracker.SIGNATURERIGHTS
+     set stage4_mode = l_target
+   where task_id   = :P4_TASK_ID
+     and stages_id = 4
+     and nvl(stage4_mode,-1) <> l_target;
+end;
+```
+
+* Якщо користувач поставив “послідовно” → `l_target = 1`, і **всі** SR зі stage=4 для цього `task_id` стануть послідовними.
+* Якщо зняв чекбокс → `l_target = 0` (паралельно).
+* `nvl(stage4_mode,-1) <> l_target` уникає зайвих перезаписів.
+
+### Як гарантувати порядок при AJAX/DA
+
+* Якщо це **Interactive Grid** з “Автоматичною обробкою рядків (ARP)”, то створюємо окремий процес **After Submit** з **Sequence** більшим за ARP.
+* Якщо це **Dynamic Action** (без Submit), робимо 2 кроки:
+
+  1. “Execute PL/SQL Code” / “Save IG data” — твій існуючий процес вставки/оновлення SR
+  2. **Після нього** ще один “Execute PL/SQL Code” з блоком вище (Wait for Result = Yes)
+
+  або викликати послідовно через JS:
+
+  ```js
+  apex.server.process("SAVE_SR", {pageItems:"#P4_TASK_ID,#P4_STAGE4_SEQUENTIAL"})
+    .then(function(){
+      return apex.server.process("SYNC_STAGE4_MODE", {pageItems:"#P4_TASK_ID,#P4_STAGE4_SEQUENTIAL"});
+    })
+    .then(function(){
+      apex.message.showPageSuccess("Збережено");
+    });
+  ```
+
+> Плюс: одна транзакція, ніяких тригерів і контекстів, проста підтримка.
+
+---
+
+# Варіант 2: ставити значення під час вставки SR
+
+У твоєму коді, де ти `INSERT INTO TaskTracker.SIGNATURERIGHTS (...)`, додай колонку `stage4_mode`:
+
+```plsql
+insert into TaskTracker.SIGNATURERIGHTS(
+  id, task_id, stages_id, position_id, department_id, unit_id, user_tabno,
+  sort_order, subtask_id, shift_symbolid, sr_task_mode, uchastok,
+  stage4_mode
+) values (
+  :p_id, :P4_TASK_ID, :p_stage_id, :p_pos_id, :p_dep_id, :p_unit_id, :p_tabno,
+  :p_sort, :p_subtask, :p_shift, :p_task_mode, :p_uchastok,
+  case when upper(nvl(:P4_STAGE4_SEQUENTIAL,'N'))='Y' then 1 else 0 end
+);
+```
+
+* Для апдейтів SR (якщо рядок вже існує) можна робити `stage4_mode = stage4_mode` (не чіпати), а **в кінці** все одно масово вирівнювати (див. Варіант 1).
+
+> Плюс: одразу правильне значення при вставці. Мінус: при редагуванні існуючих записів все одно треба масове вирівнювання.
+
+---
+
+# Варіант 3: тригер + аплікаційний контекст (просунуто)
+
+* Створюєш пакет-контекст:
+
+  ```plsql
+  create or replace package sr_ctx as
+    procedure set_stage4_mode(p_mode in number);
+  end;
+  /
+  create or replace package body sr_ctx as
+    procedure set_stage4_mode(p_mode in number) is
+    begin
+      dbms_session.set_context('SR_APP_CTX','STAGE4_MODE', p_mode);
+    end;
+  end;
+  /
+  ```
+
+* Створюєш **BEFORE INSERT OR UPDATE** тригер на `SIGNATURERIGHTS`, який:
+
+  * якщо `:new.stages_id = 4` і `:new.stage4_mode` is null → бере значення з `sys_context('SR_APP_CTX','STAGE4_MODE')` або ставить `0` за замовчуванням.
+
+* У процесі перед збереженням SR викликаєш:
+
+  ```plsql
+  sr_ctx.set_stage4_mode( case when upper(nvl(:P4_STAGE4_SEQUENTIAL,'N'))='Y' then 1 else 0 end );
+  ```
+
+> Плюс: логіка самозаповнення в БД, не залежить від APEX-процесів. Мінус: у тригері не дуже красиво тягнути `APEX_UTIL.GET_SESSION_STATE`; краще контекст, як показано. Складніше для підтримки.
+
+---
+
+## Що вибрати
+
+* **90% кейсів**: **Варіант 1** — **фінальний масовий update** в кінці процесу сторінки/DA.
+  Це найпростіше, прозоро і в одній транзакції з твоїми вставками/оновленнями SR.
+
+* Якщо хочеш мінімізувати масові апдейти — комбінуй **Варіант 2 + 1**: ставити значення при INSERT і все одно під кінець сторінки “підчистити” усі записи для stage=4 до потрібного режиму (діє і для тих, що вже були раніше).
+
+---
+
+## Готовий “пост-процес” для сторінки
+
+**Process Point:** After Submit (або DA — останній крок)
+**Condition:** Request IN `SAVE, APPLY` (або твій Request)
+
+```plsql
+declare
+  l_target number := case when upper(nvl(:P4_STAGE4_SEQUENTIAL,'N'))='Y' then 1 else 0 end;
+begin
+  -- важливо виконати ПІСЛЯ всіх DML по SIGNATURERIGHTS
+  update TaskTracker.SIGNATURERIGHTS
+     set stage4_mode = l_target
+   where task_id   = :P4_TASK_ID
+     and stages_id = 4
+     and nvl(stage4_mode,-1) <> l_target;
+
+  -- опціонально: перевірка, що щось змінилось
+  -- apex_debug.info('stage4_mode normalized to %s for task %s', l_target, :P4_TASK_ID);
+end;
+```
+
+> Коміт не став — APEX сам закомітить наприкінці запиту.
+> Якщо в тебе **кілька** асинхронних DA — краще об’єднай усе в **один** Submit/Process, або чітко ланцюжити послідовність (спочатку вставка SR, потім цей апдейт з `Wait for Result` = Yes).

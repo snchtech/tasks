@@ -1,0 +1,83 @@
+В APEX 24 для **Modal Dialog** APEX часто генерує не “чистий” `f?p=...`, а “action-URL” типу `#action$a-dialog-open?...` (через фреймворк Actions). Це нормально: клік по такому лінку **не робить класичну навігацію**, а відкриває діалог через заметку `#action...`.
+
+### Чому у вас “відкривається дві сторінки”
+
+Найчастіша причина — лінк у звіті фактично відкривається **в новій вкладці/вікні** (наприклад, через `target="_blank"` у Link Attributes або через налаштування колонки). Тоді відбувається таке:
+
+1. відкривається поточна сторінка (ORDS/Apex route) у новій вкладці;
+2. вже **після завантаження** сторінки в цій вкладці APEX бачить `#action$a-dialog-open...` і відкриває **діалог** → виглядає як “два кроки / два екрани”.
+
+Перевірте в IR:
+
+* у колонці, де показуєте “детальніше”, **не має бути** `target="_blank"` в Link Attributes;
+* якщо ви генеруєте `<a ...>` вручну в SQL, переконайтесь, що ви самі не додаєте `target` і що APEX не обгортає це додатково.
+
+---
+
+## `p_plain_url` і чому “boolean в SQL не працює”
+
+Так, `p_plain_url` має тип **BOOLEAN** (PL/SQL), а BOOLEAN **не можна передавати напряму з SQL**. Це видно і в документації: `p_plain_url IN BOOLEAN DEFAULT FALSE`. ([docs.oracle.com][1])
+Тому рішення — зробити **обгортку** (wrapper) з NUMBER (0/1), і всередині вже підставити BOOLEAN.
+
+### Варіант 1: окрема функція (рекомендую)
+
+```sql
+create or replace function get_url_plain_01(
+  p_page        in number,
+  p_items       in varchar2 default null,
+  p_values      in varchar2 default null,
+  p_clear_cache in varchar2 default null,
+  p_plain01     in number   default 0
+) return varchar2
+is
+begin
+  return apex_page.get_url(
+           p_page        => p_page,
+           p_items       => p_items,
+           p_values      => p_values,
+           p_clear_cache => p_clear_cache,
+           p_session     => v('APP_SESSION'),
+           p_plain_url   => (nvl(p_plain01,0) = 1)
+         );
+end;
+/
+```
+
+Тоді у вашому SQL для IR:
+
+```sql
+get_url_plain_01(
+  p_page    => 6,
+  p_items   => 'P6_ID',
+  p_values  => to_char(t.id),
+  p_plain01 => 1
+) as link_to_details
+```
+
+**Що дає `p_plain01 => 1`:**
+
+* ви отримаєте **звичайний URL** без “діалог-обгортки/JS”, який у деяких випадках прибирає зайву “проміжну” поведінку (документація описує, що `p_plain_url` прибирає “непотрібний JS” для модальних сторінок). ([docs.oracle.com][1])
+* і ви можете керувати цим з SQL як 0/1.
+
+---
+
+## Як зробити “правильно” для IR (щоб APEX сам керував діалогом)
+
+Найстабільніший підхід у 24-й версії:
+
+1. **повертайте лише URL** (не `<a>`), як ви і робите (`AS LINK_TO_DETAILS`);
+2. у колонці IR задайте тип **Link** і використайте “Link Target” (Page in this Application / Modal Dialog), щоб APEX сам згенерував коректну дію.
+
+Якщо ж ви хочете лишити HTML-лінк — тоді **не додавайте** `target="_blank"` і не змушуйте браузер відкривати в новій вкладці.
+
+---
+
+### Мінімальний чек-лист, щоб “не було двох вікон”
+
+* прибрати `target="_blank"` (якщо є);
+* або перейти на “Link column” (не HTML) і віддавати тільки URL;
+* якщо потрібен “чистий” URL саме з SQL → використати wrapper з `p_plain01 => 1`.
+
+Якщо покажете, **як саме налаштована колонка IR** (Link / HTML Expression / Escape special characters / Link attributes), я скажу точну комбінацію параметрів, яка у вашому кейсі прибере “подвійне відкриття” без побічних ефектів.
+
+[1]: https://docs.oracle.com/en/database/oracle/apex/24.1/aeapi/GET_URL-Function.html "GET_URL Function"

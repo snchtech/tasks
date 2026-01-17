@@ -1,0 +1,160 @@
+Чудове уточнення 💪
+Тепер завдання — **залишити існуючу структуру звіту з групуванням по типу компанії**,
+але **додати у вивід автора (`creator`)** і **допустити кілька рядків у межах однієї групи**,
+якщо різні користувачі заповнили дані для тієї ж компанії / підрозділу.
+
+Тобто:
+
+* група → **тип компанії** (`company_type_name`)
+* всередині групи → **різні компанії, юніти, користувачі**
+* у кінці групи → підсумок “Всього” по типу компанії
+
+---
+
+## 🔹 Оновлений SQL-запит
+
+```sql
+WITH base_data AS (
+    SELECT 
+        ep.id,
+        ct.id          AS company_type_id,
+        ct.name        AS company_type_name,
+        c.id           AS company_id,
+        c.name         AS company_name,
+        u.id           AS unit_id,
+        u.name         AS unit_name,
+        ep.people_count,
+        TO_CHAR(NVL(ep.date_update, ep.date_create), 'DD.MM.YYYY HH24:MI') AS date_display,
+        NVL(ep.updator, ep.creator) AS creator,
+        0 AS is_total,
+        0 AS is_header
+    FROM external_personal ep
+    JOIN company c       ON c.id = ep.company_id
+    JOIN company_type ct ON ct.id = c.company_type_id
+    LEFT JOIN units u    ON u.id = ep.unit_id
+    WHERE ep.date_end IS NULL
+      AND TRUNC(ep.date_create) = TRUNC(:P_DATE_REPORT)
+      AND ep.department_id = :P_DEPARTMENT_ID_FROMDB
+),
+totals AS (
+    SELECT 
+        NULL AS id,
+        ct.id   AS company_type_id,
+        ct.name AS company_type_name,
+        NULL AS company_id,
+        'Всього' AS company_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        SUM(ep.people_count) AS people_count,
+        NULL AS date_display,
+        NULL AS creator,
+        1 AS is_total,
+        0 AS is_header
+    FROM external_personal ep
+    JOIN company c       ON c.id = ep.company_id
+    JOIN company_type ct ON ct.id = c.company_type_id
+    WHERE ep.date_end IS NULL
+      AND TRUNC(ep.date_create) = TRUNC(:P_DATE_REPORT)
+      AND ep.department_id = :P_DEPARTMENT_ID_FROMDB
+    GROUP BY ct.id, ct.name
+),
+headers AS (
+    SELECT 
+        NULL AS id,
+        ct.id   AS company_type_id,
+        ct.name AS company_type_name,
+        NULL AS company_id,
+        NULL AS company_name,
+        NULL AS unit_id,
+        NULL AS unit_name,
+        NULL AS people_count,
+        NULL AS date_display,
+        NULL AS creator,
+        0 AS is_total,
+        1 AS is_header
+    FROM company_type ct
+    WHERE EXISTS (
+        SELECT 1
+        FROM external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        WHERE c.company_type_id = ct.id
+          AND ep.date_end IS NULL
+          AND TRUNC(ep.date_create) = TRUNC(:P_DATE_REPORT)
+          AND ep.department_id = :P_DEPARTMENT_ID_FROMDB
+    )
+)
+SELECT 
+    company_type_id,
+    company_type_name,
+    company_id,
+    company_name,
+    unit_name,
+    people_count,
+    creator,
+    date_display,
+    is_total,
+    is_header
+FROM (
+    SELECT * FROM headers
+    UNION ALL
+    SELECT * FROM base_data
+    UNION ALL
+    SELECT * FROM totals
+)
+ORDER BY company_type_id, is_header DESC, is_total, company_name, creator;
+```
+
+---
+
+## 🔹 Що змінилось
+
+| Було                               | Стало                                         |
+| ---------------------------------- | --------------------------------------------- |
+| Групування тільки по типу компанії | Залишилось по типу компанії                   |
+| Один запис на компанію             | Тепер кілька записів (по різних користувачах) |
+| Не було автора                     | Додано `creator`                              |
+| Підсумок один на тип               | Підсумок збережено                            |
+
+---
+
+## 🔹 Приклад результату
+
+```
+Тип компанії: Промислові
+---------------------------------------------------------
+Company A | Unit 1 | 10 | user_ivanov | 17.01.2026 09:10
+Company A | Unit 1 | 8  | user_petrenko | 17.01.2026 09:25
+Company B | Unit 2 | 5  | user_shevchuk | 17.01.2026 10:12
+Всього по типу:               23
+
+Тип компанії: Будівельні
+---------------------------------------------------------
+Company C | Unit 1 | 12 | user_kuzmenko | 17.01.2026 08:44
+Company D | Unit 3 | 4  | user_bondar | 17.01.2026 09:30
+Всього по типу:               16
+```
+
+---
+
+## 🔹 Рекомендації для відображення в APEX Interactive Report
+
+1. Колонки:
+
+   ```
+   COMPANY_TYPE_NAME
+   COMPANY_NAME
+   UNIT_NAME
+   CREATOR
+   PEOPLE_COUNT
+   DATE_DISPLAY
+   ```
+
+2. Використай **Highlighting**:
+
+   * `IS_HEADER = 1` → жирний шрифт, фон #f4f4f4
+   * `IS_TOTAL = 1` → зелений фон, жирний шрифт
+     (наприклад через CSS: `.a-IRR-table tr td[headers="COMPANY_NAME"]:contains("Всього") { background-color: #d4edda; font-weight: bold; }`)
+
+---
+
+Хочеш, я покажу короткий варіант CSS і умов форматування для IR, щоб `headers` та `totals` автоматично виділялись різними кольорами?

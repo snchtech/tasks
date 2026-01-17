@@ -1,0 +1,58 @@
+Так, ви праві: **вираз `(nvl(p_plain01,0)=1)` у SQL-контексті дає “не той” тип**, і компілятор може не прийняти його як `BOOLEAN` параметр у виклику `APEX_PAGE.GET_URL`. У таких випадках робимо **локальну boolean-змінну** і присвоєння через `IF`, а вже потім підставляємо її в `p_plain_url`.
+
+Ось робочий варіант-обгортка:
+
+```sql
+create or replace function get_url_plain_01(
+  p_page        in number,
+  p_items       in varchar2 default null,
+  p_values      in varchar2 default null,
+  p_clear_cache in varchar2 default null,
+  p_plain01     in number   default 0
+) return varchar2
+is
+  l_plain boolean := false;
+begin
+  if nvl(p_plain01, 0) = 1 then
+    l_plain := true;
+  else
+    l_plain := false;
+  end if;
+
+  return apex_page.get_url(
+           p_page        => p_page,
+           p_items       => p_items,
+           p_values      => p_values,
+           p_clear_cache => p_clear_cache,
+           p_session     => v('APP_SESSION'),
+           p_plain_url   => l_plain
+         );
+end;
+/
+```
+
+Використання в SQL для IR:
+
+```sql
+get_url_plain_01(
+  p_page    => 6,
+  p_items   => 'P6_ID',
+  p_values  => to_char(t.id),
+  p_plain01 => 1
+) as link_to_details
+```
+
+### Важливий нюанс про “два вікна”
+
+`p_plain_url` **не гарантує** прибрати “подвійне відкриття”, якщо причина — **`target="_blank"`** або якщо ви генеруєте **HTML `<a>`** і APEX/браузер відкриває нову вкладку, а вже там відпрацьовує `#action$a-dialog-open...`.
+
+Щоб точно прибрати “два екрани”, перевірте в колонці IR:
+
+* **Link Attributes**: щоб не було `target="_blank"`;
+* **Escape special characters**: якщо ви повертаєте просто URL — краще робити колонку типу **Link** (а не HTML Expression), і тоді APEX сам зробить коректний перехід/діалог.
+
+Якщо скинете 2 речі (без скрінів можна текстом):
+
+1. тип колонки (Link чи HTML Expression),
+2. що в “Link Attributes”,
+   — я скажу точну комбінацію налаштувань під ваш кейс APEX 24, щоб відкривалась **лише потрібна сторінка (або лише діалог)**.
