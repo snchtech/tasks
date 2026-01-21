@@ -1,0 +1,193 @@
+чудова ідея — винести «послідовно/паралельно» на рівень **кожного етапу** (2/4/6). Нижче — готові кроки: SQL оновлення під три чекбокси + мінімальні зміни в пакеті, щоб усе працювало узгоджено.
+
+---
+
+# 1) Схема БД: одна узагальнена колонка краще, ніж три
+
+Замість `STAGE4_MODE` раджу мати **єдину** колонку `STAGE_MODE` в `SIGNATURERIGHTS` (0 = паралельно, 1 = послідовно), а значення виставляти **по батьківському етапу** (2/4/6) через `DICT_APP_CONFIRM_LIST`.
+
+```sql
+-- 1) Додати нову колонку
+alter table TaskTracker.SIGNATURERIGHTS
+  add (stage_mode number(1) default 1 not null);
+
+-- (необов’язково) Якщо вже є дані у stage4_mode і їх треба зберегти для етапу 4:
+merge into TaskTracker.SIGNATURERIGHTS sr
+using (
+  select sr.id sr_id, nvl(sr.stage4_mode,1) as m
+  from TaskTracker.SIGNATURERIGHTS sr
+  join TaskTracker.DICT_APP_CONFIRM_LIST d on d.id = sr.stages_id and d.parent_stage_id is not null
+  join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+  where p.stage = 4
+) x
+on (x.sr_id = sr.id)
+when matched then update set sr.stage_mode = x.m;
+
+-- (необов’язково) Потім можете дропнути стару колонку:
+-- alter table TaskTracker.SIGNATURERIGHTS drop column stage4_mode;
+```
+
+> Якщо вам простіше залишити 3 окремі колонки (`STAGE2_MODE`, `STAGE4_MODE`, `STAGE6_MODE`) — це працюватиме, але дублює дані. Єдина `STAGE_MODE` + фільтр по батьківському етапу — чистіше.
+
+---
+
+# 2) Оновлення типу відміток із трьох чекбоксів на сторінці маршруту
+
+На сторінці створення/редагування маршруту додайте три айтеми-чекбокси:
+`P4_STAGE2_SEQUENTIAL`, `P4_STAGE4_SEQUENTIAL`, `P4_STAGE6_SEQUENTIAL` (Y/N).
+
+## Варіант А — одним `MERGE` (Oracle-friendly, читабельно)
+
+```sql
+merge into TaskTracker.SIGNATURERIGHTS sr
+using (
+  select sr.id as sr_id,
+         p.stage as parent_stage
+  from TaskTracker.SIGNATURERIGHTS sr
+  join TaskTracker.DICT_APP_CONFIRM_LIST d
+    on d.id = sr.stages_id
+   and d.parent_stage_id is not null
+  join TaskTracker.DICT_APP_CONFIRM_LIST p
+    on p.id = d.parent_stage_id
+  where sr.task_id = :P4_TASK_ID
+    and p.page_list_id = :P4_PAGE_LIST_ID  -- якщо треба фіксувати page_list
+    and p.stage in (2,4,6)
+) x
+on (sr.id = x.sr_id)
+when matched then update set sr.stage_mode =
+  case x.parent_stage
+    when 2 then case when :P4_STAGE2_SEQUENTIAL = 'Y' then 1 else 0 end
+    when 4 then case when :P4_STAGE4_SEQUENTIAL = 'Y' then 1 else 0 end
+    when 6 then case when :P4_STAGE6_SEQUENTIAL = 'Y' then 1 else 0 end
+    else sr.stage_mode
+  end;
+```
+
+## Варіант B — трьома `UPDATE` (просто й наочно)
+
+```sql
+-- Етап 2
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE2_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage = 2
+       );
+
+-- Етап 4
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE4_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage = 4
+       );
+
+-- Етап 6
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE6_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage = 6
+       );
+```
+
+**Коли запускати ці UPDATE/MERGE?**
+Після того, як ви згенерували/оновили записи `SIGNATURERIGHTS` (тобто **внизу** вашого AJAX/Process, одразу після коміту змін у SR, щоб режим гарантовано застосувався до повного набору записів етапу).
+
+---
+
+# 3) Зміни в пакеті `confirm_cart_pkg`
+
+## 3.1. Узагальнити функцію режиму етапу
+
+Замість вузької `get_stage4_mode(...)` зробимо **generic**:
+
+```plsql
+-- 0 = паралельно, 1 = послідовно для будь-якого батьківського етапу
+function get_stage_mode(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number
+) return number
+is
+  l_mode number := 1; -- дефолт: послідовно
+begin
+  select nvl(min(sr.stage_mode),1)
+    into l_mode
+    from TaskTracker.SIGNATURERIGHTS sr
+    join TaskTracker.DICT_APP_CONFIRM_LIST d
+      on d.id = sr.stages_id
+     and d.parent_stage_id is not null
+    join TaskTracker.DICT_APP_CONFIRM_LIST p
+      on p.id = d.parent_stage_id
+   where sr.task_id      = p_task_id
+     and p.page_list_id  = p_page_list_id
+     and p.parent_stage_id is null
+     and p.stage = p_stage_no;
+
+  return nvl(l_mode,1);
+exception
+  when no_data_found then
+    return 1;
+end;
+```
+
+## 3.2. Передавати режим у рендер рядків
+
+У вашому `render(...)` там, де ви проходите етапи:
+
+```plsql
+declare
+  l_is_active   boolean := (l_active_stage_no is null) or (l_stage_no = l_active_stage_no);
+  l_stage_mode  number  := get_stage_mode(p_task_id, p_page_list_id, l_stage_no); -- 0/1 для 2/4/6
+begin
+  ...
+  render_substage_rows(
+    ...
+    p_is_active_stage     => l_is_active,
+    p_stage_mode          => l_stage_mode
+  );
+```
+
+## 3.3. Усередині `render_substage_rows(...)`
+
+На початку процедури:
+
+```plsql
+  l_count_cb number := 0;
+  l_parallel boolean := (p_stage_mode = 0); -- тепер це працює для будьякого етапу
+```
+
+А в блоці показу кнопок використовуйте **тільки** `l_parallel` (без перевірок на `p_stage_no = 4`). Тобто:
+
+* якщо `not p_is_active_stage` → жодних кнопок;
+* якщо `l_parallel` → показуємо кнопки всім, хто має роль;
+* інакше (послідовно) → класика з `l_count_cb`.
+
+> Міжетапний «шлагбаум» (кнопки показуються тільки на **активному** етапі) лишається як у вас: активний визначається через `get_active_stage_no(...)` (як ми додали раніше).
+
+---
+
+## 4) Підсумок
+
+* **UI**: три чекбокси (`P4_STAGE2_SEQUENTIAL`, `P4_STAGE4_SEQUENTIAL`, `P4_STAGE6_SEQUENTIAL`).
+* **База**: одна колонка `SIGNATURERIGHTS.STAGE_MODE` (0/1).
+* **Процес збереження**: після вставки/оновлення SR — виконати `MERGE`/`UPDATE` (Варіант А або B), щоб виставити режим для кожного з етапів 2/4/6.
+* **Пакет**: читати режим етапу через `get_stage_mode(...)` та передавати в `render_substage_rows(...)`; всередині — `l_parallel := (p_stage_mode = 0)` без прив’язки до номера етапу.
+
+Цього досить, щоб ваші етапи 2/4/6 незалежно працювали у **паралельному** або **послідовному** режимах, а міжетапна логіка «далі тільки коли попередній завершено» збереглася.

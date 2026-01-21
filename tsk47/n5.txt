@@ -1,0 +1,162 @@
+Так, це робиться надійно **у три шари**: (1) серверна перевірка для відображення (disable у UI), (2) серверна перевірка в процесі збереження (щоб не «протиснули» зміну через DevTools), і (3) за потреби — тригер у БД. Нижче — готові фрагменти.
+
+---
+
+# 1) Узагальнена функція перевірки (SQL/PLSQL)
+
+Створюємо функцію, яка каже: «в етапі X для task_id вже є хоча б одна відмітка?».
+
+```sql
+create or replace function stage_has_signatures(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number   -- 2,4,6
+) return number
+is
+  l_exists number;
+begin
+  select case when exists (
+           select 1
+             from TaskTracker.SIGNATUREHISTORY sh
+             join TaskTracker.SIGNATURERIGHTS  sr on sr.id = sh.signright_id
+             join TaskTracker.DICT_APP_CONFIRM_LIST d on d.id = sr.stages_id
+             join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+            where sr.task_id        = p_task_id
+              and p.page_list_id    = p_page_list_id
+              and p.parent_stage_id is null
+              and p.stage           = p_stage_no
+         ) then 1 else 0 end
+    into l_exists
+    from dual;
+
+  return l_exists; -- 1 = є хоч одна відмітка, 0 = немає
+end;
+/
+```
+
+> Перевага: один виклик працює для будь-якого етапу (2/4/6).
+
+---
+
+# 2) APEX: disable чекбокси на сторінці маршруту
+
+## Варіант А (чисто серверний, без JS)
+
+1. Створіть **приховані** айтеми:
+
+* `P4_STAGE2_LOCKED`
+* `P4_STAGE4_LOCKED`
+* `P4_STAGE6_LOCKED`
+
+2. Додайте **Computations (Before Header)** для кожного:
+
+```sql
+-- для P4_STAGE2_LOCKED
+select stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 2) from dual
+
+-- для P4_STAGE4_LOCKED
+select stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 4) from dual
+
+-- для P4_STAGE6_LOCKED
+select stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 6) from dual
+```
+
+3. У властивостях кожного чекбокса (`P4_STAGE2_SEQUENTIAL`, `P4_STAGE4_SEQUENTIAL`, `P4_STAGE6_SEQUENTIAL`) увімкніть:
+
+* **Read Only** = *Always*,
+* **Read Only Condition** = *Value of Item/Column in Expression 1 = Expression 2*
+
+  * Expression 1: відповідний `P4_STAGE2_LOCKED` (або 4/6)
+  * Expression 2: `1`
+
+Таким чином, якщо є хоча б одна відмітка — айтем стає read-only/disabled автоматично, ще до рендеру.
+
+## Варіант B (через Dynamic Action на Page Load)
+
+Залишаємо ті самі приховані айтеми як у Варіанті А, і додаємо одну DA (Event: **Page Load**), Action: **Execute JavaScript**:
+
+```js
+[
+  { lock: 'P4_STAGE2_LOCKED', cb: 'P4_STAGE2_SEQUENTIAL', title: 'Етап 2 вже має відмітки' },
+  { lock: 'P4_STAGE4_LOCKED', cb: 'P4_STAGE4_SEQUENTIAL', title: 'Етап 4 вже має відмітки' },
+  { lock: 'P4_STAGE6_LOCKED', cb: 'P4_STAGE6_SEQUENTIAL', title: 'Етап 6 вже має відмітки' }
+].forEach(x => {
+  if ($v(x.lock) === '1') {
+    apex.item(x.cb).disable();
+    $('#' + x.cb).attr('title', x.title);
+  }
+});
+```
+
+> Можна обійтися й без прихованих айтемів, викликавши `stage_has_signatures(...)` у **Set Value** (AJAX Callback) і далі disable, але приховані айтеми простіші й працюють без зайвих запитів.
+
+---
+
+# 3) Серверна перевірка у процесі збереження (обов’язково)
+
+Навіть якщо чекбокс відключено у UI, користувач може підмінити значення. У вашому **APEX Process (ON SUBMIT / AJAX)** перед виконанням `UPDATE/MERGE` додайте перевірку:
+
+```plsql
+-- Етап 2
+if stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 2) = 1 then
+  raise_application_error(-20001, 'Етап 2 вже має відмітки — змінювати тип відміток заборонено.');
+end if;
+
+-- Етап 4
+if stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 4) = 1 then
+  raise_application_error(-20002, 'Етап 4 вже має відмітки — змінювати тип відміток заборонено.');
+end if;
+
+-- Етап 6
+if stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, 6) = 1 then
+  raise_application_error(-20003, 'Етап 6 вже має відмітки — змінювати тип відміток заборонено.');
+end if;
+
+-- якщо перевірки пройдені, виконуємо ваш UPDATE/MERGE для STAGE_MODE
+```
+
+---
+
+# 4) (Опційно) Страховка в БД (тригер)
+
+Якщо хочете «залізобетон», забороніть зміну `STAGE_MODE` у `SIGNATURERIGHTS`, якщо в етапі вже є підписи:
+
+```sql
+create or replace trigger trg_sr_no_mode_change_if_signed
+  before update of stage_mode on TaskTracker.SIGNATURERIGHTS
+  for each row
+declare
+  l_task_id      TaskTracker.SIGNATURERIGHTS.task_id%type;
+  l_stage_parent number;
+  l_pl_id        number;
+  l_has number;
+begin
+  -- визначаємо батьківський етап та page_list_id для поточного рядка
+  select p.stage, p.page_list_id, :new.task_id
+    into l_stage_parent, l_pl_id, l_task_id
+    from TaskTracker.DICT_APP_CONFIRM_LIST d
+    join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+   where d.id = :new.stages_id;
+
+  -- якщо є хоч одна відмітка у цьому етапі — заборонити зміну
+  select stage_has_signatures(l_task_id, l_pl_id, l_stage_parent)
+    into l_has
+    from dual;
+
+  if l_has = 1 then
+    raise_application_error(-20010, 'Неможливо змінити тип відміток: в етапі вже є підписи.');
+  end if;
+end;
+/
+```
+
+---
+
+## Підсумок
+
+* **Функція `stage_has_signatures`** → одна перевірка на всі етапи.
+* **APEX UI**: прихований item + Read Only Condition (або DA) → **disable чекбоксів**.
+* **APEX Process**: повторна перевірка перед `UPDATE/MERGE` → **блок від підміни**.
+* **(Опційно) Тригер**: гарантія на рівні БД.
+
+Так ви надійно «замикаєте» зміну типу відміток, якщо в етапі вже є хоч одна відмітка.

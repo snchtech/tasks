@@ -1,0 +1,92 @@
+крута ідея. Додаємо «бейдж із піктограмою» біля заголовка кожного етапу (2/4/6), залежно від `STAGE_MODE`:
+
+* `1` → **Послідовно** (ікона «нумерований список»)
+* `0` → **Паралельно** (ікона «діаграма/гілкування»)
+
+## 1) Патч до пакета (у циклі рендеру етапів)
+
+> ⚠️ Функція `get_stage_mode(p_task_id, p_page_list_id, p_stage_no)` має вже бути (як ми робили раніше).
+> Якщо у `render(...)` ще немає `p_task_id`, просто додай цей параметр і передай значення ззовні.
+
+```plsql
+-- усередині function render(...), у циклі по етапах після fetch l_stage_id, l_stage_no, l_stage_title:
+declare
+  l_stage_mode number := null; -- 0 паралельно, 1 послідовно
+  l_mode_html  varchar2(4000);
+begin
+  if l_stage_no in (2,4,6) then
+    l_stage_mode := get_stage_mode(p_task_id => p_task_id,
+                                   p_page_list_id => p_page_list_id,
+                                   p_stage_no => l_stage_no);
+
+    -- Збираємо HTML для бейджа з іконкою (Font APEX)
+    if nvl(l_stage_mode,1) = 1 then
+      -- Послідовно
+      l_mode_html :=
+        '<div class="stage-mode" title="Послідовні відмітки">'||
+          '<span class="a-Icon fa fa-list-ol" aria-hidden="true"></span>'||
+          '<span class="badge badge-seq">Послідовно</span>'||
+        '</div>';
+    else
+      -- Паралельно
+      l_mode_html :=
+        '<div class="stage-mode" title="Паралельні відмітки">'||
+          '<span class="a-Icon fa fa-project-diagram" aria-hidden="true"></span>'||
+          '<span class="badge badge-par">Паралельно</span>'||
+        '</div>';
+    end if;
+  end if;
+
+  append(l_buf,
+    '<div class="confirm-cart-item confirm-cart-item_stg">'||
+      '<div class="c-cart-stage">'||
+        '<span class="c-cart_stg">Етап '||l_stage_no||' - '||h(l_stage_title)||'</span>'||
+        nvl(l_mode_html,'')||
+      '</div>'||
+    '</div>');
+end;
+```
+
+> Якщо хочеш показувати піктограму **без тексту**, заміни `<span class="badge ...">...</span>` на порожній рядок.
+
+## 2) (Опціонально) компактні SVG-іконки замість Font APEX
+
+Якщо не хочеш залежати від `fa`, можна inline-SVG:
+
+```plsql
+-- Послідовно (нумерований список)
+l_mode_html :=
+  '<div class="stage-mode" title="Послідовні відмітки">'||
+    '<svg class="icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">'||
+      '<path d="M4 6h2V4H3v2h1zM8 5h13v2H8zM3 11h3v-2H3v2zm5-1h13v2H8zm-5 6h3v-2H3v2zm5-1h13v2H8z" />'||
+    '</svg>'||
+    '<span class="badge badge-seq">Послідовно</span>'||
+  '</div>';
+
+-- Паралельно (гілкування)
+l_mode_html :=
+  '<div class="stage-mode" title="Паралельні відмітки">'||
+    '<svg class="icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">'||
+      '<path d="M7 4h4v2H9v3c0 1.1.9 2 2 2h2V9l4 3-4 3v-2h-2c-2.21 0-4-1.79-4-4V6H7V4z"/>'||
+    '</svg>'||
+    '<span class="badge badge-par">Паралельно</span>'||
+  '</div>';
+```
+
+## 3) Трохи стилів (раз у Page CSS)
+
+```css
+.stage-mode{
+  display:inline-flex; align-items:center; gap:.4rem;
+  margin-left:.6rem; vertical-align:middle;
+}
+.stage-mode .icon, .stage-mode .a-Icon{font-size:14px;}
+.badge{
+  display:inline-block; padding:0 .5rem; line-height:1.4rem;
+  border-radius:.7rem; font-size:.75rem; font-weight:600;
+}
+.badge-seq{ background:#eef3ff; color:#2d50a7; }   /* послідовно */
+.badge-par{ background:#eaf8f1; color:#0a7a43; }   /* паралельно */
+```
+
+Готово: тепер для кожного етапу (2/4/6) біля назви буде акуратний бейдж із піктограмою, що показує режим відміток згідно `SIGNATURERIGHTS.STAGE_MODE`.

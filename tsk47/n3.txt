@@ -1,0 +1,154 @@
+Так, саме так: достатньо **однієї** колонки `STAGE_MODE` у `SIGNATURERIGHTS`, бо в тебе вже є `STAGES_ID`, який вказує на **підетап** (а через `DICT_APP_CONFIRM_LIST` легко вийти на батьківський етап 2/4/6). Тому окремі `STAGE2_MODE/…` не потрібні.
+
+Нижче — готові, короткі й робочі фрагменти.
+
+---
+
+## 1) DDL (разово)
+
+```sql
+alter table TaskTracker.SIGNATURERIGHTS
+  add (STAGE_MODE number(1) default 1 not null);  -- 0=паралельно, 1=послідовно
+
+alter table TaskTracker.SIGNATURERIGHTS
+  add constraint CHK_SR_STAGE_MODE check (STAGE_MODE in (0,1));
+```
+
+> За замовчуванням ставлю `1` (послідовно). Можеш змінити на `0`, якщо хочеш щоб дефолт був паралельно.
+
+---
+
+## 2) Оновлення режиму для ВСІХ рядків етапу 2/4/6 (за трьома чекбоксами)
+
+Виконай **після** того, як згенерував/оновив записи в `SIGNATURERIGHTS` (тобто внизу AJAX-процесу).
+
+### Варіант A — три прості `UPDATE`
+
+```sql
+-- Етап 2
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE2_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id    = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage           = 2
+       );
+
+-- Етап 4
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE4_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id    = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage           = 4
+       );
+
+-- Етап 6
+update TaskTracker.SIGNATURERIGHTS sr
+   set sr.stage_mode = case when :P4_STAGE6_SEQUENTIAL = 'Y' then 1 else 0 end
+ where sr.task_id = :P4_TASK_ID
+   and sr.stages_id in (
+         select d.id
+           from TaskTracker.DICT_APP_CONFIRM_LIST d
+           join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+          where p.page_list_id    = :P4_PAGE_LIST_ID
+            and p.parent_stage_id is null
+            and p.stage           = 6
+       );
+```
+
+### Варіант B — один `MERGE` (акуратно в одному запиті)
+
+```sql
+merge into TaskTracker.SIGNATURERIGHTS sr
+using (
+  select sr.id sr_id, p.stage parent_stage
+    from TaskTracker.SIGNATURERIGHTS sr
+    join TaskTracker.DICT_APP_CONFIRM_LIST d on d.id = sr.stages_id and d.parent_stage_id is not null
+    join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+   where sr.task_id      = :P4_TASK_ID
+     and p.page_list_id  = :P4_PAGE_LIST_ID
+     and p.parent_stage_id is null
+     and p.stage in (2,4,6)
+) x
+on (x.sr_id = sr.id)
+when matched then update set sr.stage_mode =
+  case x.parent_stage
+    when 2 then case when :P4_STAGE2_SEQUENTIAL = 'Y' then 1 else 0 end
+    when 4 then case when :P4_STAGE4_SEQUENTIAL = 'Y' then 1 else 0 end
+    when 6 then case when :P4_STAGE6_SEQUENTIAL = 'Y' then 1 else 0 end
+    else sr.stage_mode
+  end;
+```
+
+---
+
+## 3) Що змінити в пакеті `confirm_cart_pkg`
+
+Нічого «великих» переробок. Просто:
+
+1. Узагальни функцію режиму етапу (щоб працювала для **будь-якого** етапу, не тільки 4):
+
+```plsql
+function get_stage_mode(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number
+) return number
+is
+  l_mode number := 1; -- дефолт: послідовно
+begin
+  select nvl(min(sr.stage_mode),1)
+    into l_mode
+    from TaskTracker.SIGNATURERIGHTS sr
+    join TaskTracker.DICT_APP_CONFIRM_LIST d
+      on d.id = sr.stages_id
+     and d.parent_stage_id is not null
+    join TaskTracker.DICT_APP_CONFIRM_LIST p
+      on p.id = d.parent_stage_id
+   where sr.task_id      = p_task_id
+     and p.page_list_id  = p_page_list_id
+     and p.parent_stage_id is null
+     and p.stage         = p_stage_no;
+
+  return nvl(l_mode,1);
+exception when no_data_found then
+  return 1;
+end;
+```
+
+2. У `render(...)` перед рендером підетапів обчислюй режим:
+
+```plsql
+l_stage_mode := get_stage_mode(p_task_id, p_page_list_id, l_stage_no); -- 0/1
+```
+
+…і передавай в `render_substage_rows(..., p_stage_mode => l_stage_mode)`.
+
+3. Усередині `render_substage_rows(...)` просто роби:
+
+```plsql
+l_parallel boolean := (p_stage_mode = 0);
+```
+
+та використовуй твою існуючу логіку показу кнопок (паралельні/послідовні) + обмеження на **активний етап**, як ми вже додали раніше.
+
+---
+
+## 4) Маленькі поради по продуктивності
+
+* Індекс на `SIGNATURERIGHTS(task_id)` і (за потреби) `SIGNATURERIGHTS(stages_id)` пришвидшить оновлення.
+* Індекс на `DICT_APP_CONFIRM_LIST(parent_stage_id, page_list_id, stage)` також корисний для `IN (...)` підзапитів.
+* Запускай оновлення режимів **після** масового запису SR, одним блоком.
+
+---
+
+Готово: `STAGE_MODE` + твої `STAGES_ID` повністю покривають сценарій; пакет читає режим етапу через join на батьківський етап і застосовує паралельний/послідовний показ кнопок саме там, де треба.

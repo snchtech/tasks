@@ -1,0 +1,295 @@
+Так, це вирішується чисто на стороні пакета: обчислюємо **активний етап** (той, де ще є непідписані SR), і кнопки показуємо **тільки** на цьому етапі. Усередині активного етапу працює твоя логіка “послідовно/паралельно”.
+
+Нижче даю готові вставки/заміни.
+
+---
+
+# 1) Додай утиліту: який етап зараз активний?
+
+```plsql
+------------------------------------------------------------------------------
+-- Повертає НОМЕР активного етапу (2/4/6/...), де ще є SR без підпису.
+-- Якщо всі етапи закриті → повертає NULL.
+------------------------------------------------------------------------------
+function get_active_stage_no(
+  p_task_id      in number,
+  p_page_list_id in number
+) return number
+is
+  l_active number;
+begin
+  /*
+    Беремо SR -> приєднуємо підетап d (DICT_APP_CONFIRM_LIST, де parent_stage_id IS NOT NULL),
+    далі батьківський етап p (parent_stage_id IS NULL), і лівим join – історію.
+    Етап активний, якщо всередині нього існує хоча б один SR без запису в SIGNATUREHISTORY.
+  */
+  select min(p.stage) keep (dense_rank first order by p.stage)
+    into l_active
+    from tasktracker.signaturerights@to_tasktracker10 sr
+    join tasktracker.dict_app_confirm_list@to_tasktracker10 d
+      on d.id = sr.stages_id
+     and d.parent_stage_id is not null
+    join tasktracker.dict_app_confirm_list@to_tasktracker10 p
+      on p.id = d.parent_stage_id
+     and p.page_list_id = d.page_list_id
+     and p.parent_stage_id is null
+   left join tasktracker.signaturehistory@to_tasktracker10 h
+      on h.signright_id = sr.id
+   where sr.task_id     = p_task_id
+     and p.page_list_id = p_page_list_id
+   group by p.stage
+  having sum(case when h.id is null then 1 else 0 end) > 0;  -- є непідписані
+
+  return l_active; -- може бути NULL, якщо все підписано
+exception
+  when no_data_found then
+    return null;
+end;
+```
+
+> Це рівно той “active stage”, який ти описав: **перший (за порядком)** батьківський етап, де лишилися непідписані рядки.
+
+---
+
+# 2) (Нагадування) Режим паралельно/послідовно для stage=4
+
+Якщо ти вже додавав `get_stage4_mode(p_task_id)`, залишаємо як є. Якщо ні — додай:
+
+```plsql
+------------------------------------------------------------------------------
+-- 0 = паралельно, 1 = послідовно для stage 4 (беремо мін/макс – однаково)
+------------------------------------------------------------------------------
+function get_stage4_mode(p_task_id in number) return number
+is
+  l_mode number := 0;
+begin
+  select nvl(min(sr.stage4_mode),0)
+    into l_mode
+    from tasktracker.signaturerights@to_tasktracker10 sr
+    join tasktracker.dict_app_confirm_list@to_tasktracker10 d
+      on d.id = sr.stages_id
+     and d.parent_stage_id is not null
+   where sr.task_id = p_task_id
+     and d.stage    = 4;
+  return nvl(l_mode,0);
+exception
+  when no_data_found then return 0;
+end;
+```
+
+---
+
+# 3) Розшир сигнатуру `render_substage_rows(...)` і врахуй «активність» етапу
+
+**Сигнатура** (додали `p_is_active_stage boolean` та `p_stage_mode number`):
+
+```plsql
+procedure render_substage_rows(
+  p_buf                 in out nocopy clob,
+  p_app_id              in number,
+  p_app_user            in varchar2,
+  p_page_list_id        in number,
+  p_stage_id            in number,
+  p_stage_no            in number,
+  p_substage_id         in number,
+  p_substage_title      in varchar2,
+  p_substage_btn_text   in varchar2,
+  p_substage_after_text in varchar2,
+  p_ctx_position_id     in number,
+  p_ctx_department_id   in number,
+  p_ctx_tabno           in number,
+  p_substitution_mode   in number,
+  p_new_roles           in varchar2,
+  p_stage_for_subtask   in number,
+  p_is_active_stage     in boolean,  -- NEW: чи це активний етап
+  p_stage_mode          in number    -- NEW: 0=паралельно (лише для 4), 1=послідовно
+) is
+```
+
+На початку тіла зручно ввести:
+
+```plsql
+  l_count_cb number := 0;
+  l_parallel boolean := (p_stage_mode = 0); -- якщо етап 4 у паралельному режимі
+```
+
+### Заміни блок показу кнопок/статусів (там, де `l_have_sign <> 'Y'`)
+
+Ось готова версія з урахуванням *активності етапу* і *режиму*:
+
+```plsql
+      else
+        -- Немає підпису → або кнопка, або статус
+        append(p_buf, '<div class="c-cart-date-time"></div>');
+        append(p_buf, '<div class="c-cart-pib"></div>');
+        append(p_buf, '<div class="c-cart-signer-comment"></div>');
+
+        append(p_buf, '<div class="c-cart-signer-mark">');
+
+        declare
+          l_role_ok        boolean;
+          l_show_button    boolean := false;
+        begin
+          l_role_ok := has_role(
+            p_list_position_id   => l_list_position_id,
+            p_list_department_id => l_list_department_id,
+            p_list_unit_id       => l_list_unit_id,
+            p_list_tab_no        => l_list_tab_no,
+            p_ctx_position_id    => p_ctx_position_id,
+            p_ctx_department_id  => p_ctx_department_id,
+            p_ctx_tabno          => p_ctx_tabno,
+            p_substitution_mode  => p_substitution_mode,
+            p_new_roles          => p_new_roles,
+            p_app_id             => p_app_id,
+            p_app_user           => p_app_user
+          );
+
+          -- КРОК 1. Етап має бути активним, інакше кнопок не показуємо
+          if not p_is_active_stage then
+            l_show_button := false;
+
+          -- КРОК 2. Якщо активний і паралельний режим (актуально для stage 4):
+          elsif l_parallel then
+            l_show_button := l_role_ok;
+
+          -- КРОК 3. Інакше — послідовно (класика з l_count_cb):
+          else
+            if l_role_ok and l_count_cb = 0 then
+              l_show_button := true;
+              l_count_cb := l_count_cb + 1;
+            else
+              l_show_button := false;
+              if (not l_role_ok) and l_count_cb = 0 then
+                append(p_buf, '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">Розглядає</span>');
+                l_count_cb := l_count_cb + 1;
+                append(p_buf, '</div>'); -- .c-cart-signer-mark
+                append(p_buf, '</div>'); -- .confirm-cart-item
+                if l_subtask_content is not null then
+                  append(p_buf,
+                    '<span class="tsk-to-do"><span class="sbtsk-ttl">До виконання:</span> '||
+                    '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span></span>');
+                end if;
+                append(p_buf, '</div>'); -- .confirm-cart-item_wrapper
+                continue;
+              end if;
+            end if;
+          end if;
+
+          -- Рендер кнопки / статусу
+          if l_show_button then
+            append(p_buf,
+              '<button id="signature-btn" data-signature-id="'||l_signature_id||'" class="confirm-signature-button">'||
+              h(p_substage_btn_text)||'</button>');
+          else
+            if not p_is_active_stage then
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує завершення попередніх етапів</span>');
+            else
+              append(p_buf, '<span class="wait-confirm-signature-text">Очікує відмітки</span>');
+            end if;
+          end if;
+
+        end;
+
+        append(p_buf, '</div>'); -- .c-cart-signer-mark
+      end if;
+```
+
+> **Важливо:** у твоєму фрагменті було `if l_parallel and p_stage_no = 2 then ...`.
+> Це помилка: умова на номер тут не потрібна взагалі — **`l_parallel` вже кодує стан (паралельно лише для stage=4)**. Залиш лише `if l_parallel then ...`.
+
+---
+
+# 4) У `render(...)`: визнач активний етап і режим, та передай у підетап
+
+1. Додай у сигнатуру `render` параметр `p_task_id` (якщо ще не додав):
+
+```plsql
+function render(
+  p_app_id             in number,
+  p_page_list_id       in number,
+  p_substitution_mode  in number,
+  p_cur_position_id    in number,
+  p_new_position_id    in number,
+  p_cur_tabno          in number,
+  p_new_tabno          in number,
+  p_cur_department_id  in number,
+  p_new_department_id  in number,
+  p_new_roles          in varchar2,
+  p_app_user           in varchar2,
+  p_p5_status_id       in number,
+  p_stage_for_subtask  in number,
+  p_task_id            in number   -- NEW
+) return clob
+```
+
+2. На початку рендера зчитай активний етап:
+
+```plsql
+  l_active_stage_no number;
+begin
+  dbms_lob.createtemporary(l_buf, true);
+
+  l_active_stage_no := get_active_stage_no(p_task_id => p_task_id,
+                                           p_page_list_id => p_page_list_id);
+  ...
+```
+
+3. Усередині циклу етапів (де `l_stage_no` відомий) визнач `l_is_active` та режим:
+
+```plsql
+  declare
+    l_is_active boolean := (l_active_stage_no is null)  -- якщо все закрито: кнопок вже ніде не буде
+                        or (l_stage_no = l_active_stage_no);
+    l_stage_mode number := 1; -- дефолт: послідовно
+  begin
+    if l_stage_no = 4 then
+      l_stage_mode := get_stage4_mode(p_task_id);  -- 0 паралельно / 1 послідовно
+    end if;
+
+    rc_sub := substages(p_page_list_id, l_stage_id);
+    loop
+      fetch rc_sub into l_sub_id, l_sub_no, l_sub_title, l_btn_text, l_after_text;
+      exit when rc_sub%notfound;
+
+      if apex_collection.collection_exists('CONFIRM_CART_'||l_stage_id||'_'||l_sub_id) then
+        render_substage_rows(
+          p_buf                 => l_buf,
+          p_app_id              => p_app_id,
+          p_app_user            => p_app_user,
+          p_page_list_id        => p_page_list_id,
+          p_stage_id            => l_stage_id,
+          p_stage_no            => l_stage_no,
+          p_substage_id         => l_sub_id,
+          p_substage_title      => l_sub_title,
+          p_substage_btn_text   => l_btn_text,
+          p_substage_after_text => l_after_text,
+          p_ctx_position_id     => l_ctx_position_id,
+          p_ctx_department_id   => l_ctx_department_id,
+          p_ctx_tabno           => l_ctx_tabno,
+          p_substitution_mode   => p_substitution_mode,
+          p_new_roles           => p_new_roles,
+          p_stage_for_subtask   => p_stage_for_subtask,
+          p_is_active_stage     => l_is_active,    -- NEW
+          p_stage_mode          => l_stage_mode    -- NEW
+        );
+      else
+        append(l_buf, '<div class="need-data-add-text">Дозаповніть поля</div>');
+      end if;
+
+    end loop;
+    close rc_sub;
+  end;
+```
+
+---
+
+## Що це дає
+
+* **Кнопки відображаються лише на активному етапі** (де реально ще є непідписані SR).
+* Якщо користувач “перестрибнув” і підписав 3-й і 4-й SR у stage 2, але 1-й та 2-й лишилися не його — **активним лишається stage 2**, і **на stage 3 кнопки не показуються** (бо `p_is_active_stage=false`).
+* Усередині активного етапу:
+
+  * якщо **stage 4** із `stage4_mode=0` → кнопки показуються **паралельно** (всім з валідною роллю);
+  * інакше — **послідовно** (працює `l_count_cb`).
+
+Це саме той ефект, який ти хотів.
