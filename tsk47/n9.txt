@@ -1,0 +1,189 @@
+Круто, що ти перейшов на динамічні чекбокси. Є два надійних способи зробити їх «грейд-аут», якщо в етапі вже є підпис(и), і одразу проставити поточний `stage_mode` з БД.
+
+---
+
+# ВАРІАНТ A — «server-rendered» (рекомендую)
+
+Будуєш HTML чекбоксів на PL/SQL, одразу підставляючи:
+
+* `checked` → коли `stage_mode = 1` (послідовно),
+* `disabled` → коли `stage_has_signatures(...) = 1` (є хоч один підпис у цьому етапі),
+* додаткові `data-*` для подальшої логіки на клієнті.
+
+## 1) SQL/PLSQL курсор для етапів
+
+```plsql
+declare
+  cursor c_stages is
+    select p.id                         as stage_id,
+           p.stage                      as stage_no,     -- 2/4/6
+           nvl(max(sr.stage_mode), 0)   as stage_mode,   -- 0=паралель, 1=послідовно
+           stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, p.stage) as locked
+      from TaskTracker.DICT_APP_CONFIRM_LIST p      -- батьківські етапи
+      join TaskTracker.DICT_APP_CONFIRM_LIST c
+        on c.parent_stage_id = p.id                 -- підетапи
+      join TaskTracker.SIGNATURERIGHTS sr
+        on sr.stages_id = c.id
+       and sr.task_id   = :P4_TASK_ID
+     where p.page_list_id    = :P4_PAGE_LIST_ID
+       and p.parent_stage_id is null
+     group by p.id, p.stage
+     order by p.stage;
+begin
+  htp.p('<div class="stages-modes">');
+
+  for r in c_stages loop
+    -- готові прапори
+    -- checked: послідовно (1) → галка увімкнена
+    -- disabled: є підпис (locked=1) → заборонити зміну
+    htp.p(
+      '<label class="sign-mode-row">'||
+        '<input type="checkbox" class="sign-checkbox" '||
+               'id="sign-checkbx-'||r.stage_id||'" '||
+               'data-stage-id="'||r.stage_id||'" '||
+               'data-stage-no="'||r.stage_no||'" '||
+               'data-locked="'||r.locked||'" '||
+               'data-mode="'||r.stage_mode||'" '||
+               case when r.stage_mode = 1 then 'checked '  else '' end||
+               case when r.locked     = 1 then 'disabled ' else '' end||
+        '/>'||
+        '<span class="sign-mode-label">Етап '||r.stage_no||' — '||
+          case when r.stage_mode = 1
+               then '<span class="badge badge-seq">Послідовно</span>'
+               else '<span class="badge badge-par">Паралельно</span>'
+          end||
+        '</span>'||
+      '</label>'
+    );
+  end loop;
+
+  htp.p('</div>');
+end;
+```
+
+> Плюс: без додаткових AJAX-викликів — усе вирішено ще на сервері.
+> Мінусів майже немає: якщо на сторінці дуже багато етапів — але у тебе їх фактично 3 (2/4/6).
+
+---
+
+# ВАРІАНТ B — «client-rendered» (якщо чекбокси малюєш у JS)
+
+1. Додай **APEX процес (AJAX Callback)**, який повертає JSON по всіх етапах:
+
+```plsql
+-- Process name: GET_STAGE_MODES
+declare
+  l_json clob;
+begin
+  apex_json.open_object;       -- { 
+  apex_json.open_array('rows');--   "rows":[
+  for r in (
+    select p.id                       as stage_id,
+           p.stage                    as stage_no,
+           nvl(max(sr.stage_mode),0)  as stage_mode,
+           stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, p.stage) as locked
+      from TaskTracker.DICT_APP_CONFIRM_LIST p
+      join TaskTracker.DICT_APP_CONFIRM_LIST c
+        on c.parent_stage_id = p.id
+      join TaskTracker.SIGNATURERIGHTS sr
+        on sr.stages_id = c.id
+       and sr.task_id   = :P4_TASK_ID
+     where p.page_list_id    = :P4_PAGE_LIST_ID
+       and p.parent_stage_id is null
+     group by p.id, p.stage
+     order by p.stage
+  ) loop
+    apex_json.open_object;               -- {
+    apex_json.write('stage_id',   r.stage_id);
+    apex_json.write('stage_no',   r.stage_no);
+    apex_json.write('stage_mode', r.stage_mode); -- 0/1
+    apex_json.write('locked',     r.locked);     -- 0/1
+    apex_json.close_object;                     -- }
+  end loop;
+  apex_json.close_array;  -- ]
+  apex_json.close_object; -- }
+end;
+```
+
+2. На **Page Load** (DA → Execute JS) стягуєш дані та малюєш чекбокси:
+
+```js
+apex.server.process("GET_STAGE_MODES", {
+  pageItems: "#P4_TASK_ID,#P4_PAGE_LIST_ID"
+}, {
+  success: function (data) {
+    const box = document.querySelector(".stages-modes");
+    box.innerHTML = "";
+    (data.rows || []).forEach(r => {
+      const checked  = (String(r.stage_mode) === "1");  // послідовно
+      const disabled = (String(r.locked)     === "1");  // є підпис
+
+      const html = `
+        <label class="sign-mode-row">
+          <input type="checkbox"
+                 class="sign-checkbox"
+                 id="sign-checkbx-${r.stage_id}"
+                 data-stage-id="${r.stage_id}"
+                 data-stage-no="${r.stage_no}"
+                 data-locked="${r.locked}"
+                 data-mode="${r.stage_mode}"
+                 ${checked ? "checked" : ""}
+                 ${disabled ? "disabled" : ""} />
+          <span class="sign-mode-label">
+            Етап ${r.stage_no} — ${
+              checked
+                ? '<span class="badge badge-seq">Послідовно</span>'
+                : '<span class="badge badge-par">Паралельно</span>'
+            }
+          </span>
+        </label>`;
+      box.insertAdjacentHTML("beforeend", html);
+    });
+  }
+});
+```
+
+---
+
+## Дрібні, але важливі деталі
+
+* **Захист на клік**. Навіть якщо ти знімеш `disabled`, краще все одно підстрахуватися:
+
+```js
+$(document).on('click', '.sign-checkbox', function (e) {
+  if ($(this).data('locked') === 1 || String($(this).data('locked')) === "1") {
+    e.preventDefault();
+    return false;
+  }
+});
+```
+
+* **Серверна перевірка при збереженні** (обов’язково): перед `UPDATE` перевір `stage_has_signatures(...)`. Якщо `=1` — `raise_application_error(...)`. Це вже знімає всі «хаки через DevTools».
+
+* **Оновлення бейджа при кліку** (коли НЕ locked): після успішного збереження на сервері просто онови напис біля чекбокса:
+
+```js
+function refreshBadge($cb){
+  const $label = $cb.closest(".sign-mode-row").find(".sign-mode-label");
+  const isSeq = $cb.is(":checked");
+  $label.html(
+    "Етап " + $cb.data("stage-no") + " — " +
+    (isSeq ? '<span class="badge badge-seq">Послідовно</span>'
+           : '<span class="badge badge-par">Паралельно</span>')
+  );
+}
+```
+
+* **Іменування**. Ти вже задав формат `id="sign-checkbx-<stage_id>"`. Для серверного оновлення зручно зчитувати з `data-stage-id` та `checked`.
+
+---
+
+## Підсумок
+
+* На **рендері** одразу маркуєш кожен чекбокс за даними БД:
+  `checked` від `stage_mode`, `disabled` від `stage_has_signatures(...)`.
+* Це працює однаково і для “server-rendered”, і для “client-rendered” підходу: різниця лише в тому, де збираєш HTML.
+* На **збереженні** — повторна серверна перевірка (щоб не дали змінити тип етапу з уже існуючими підписами).
+* (Опційно) тригер у БД як «остання лінія оборони».
+
+Цього достатньо, щоб динамічні чекбокси завжди відображалися правильно та безпечно поводилися навіть при ручних спробах підміни значень.

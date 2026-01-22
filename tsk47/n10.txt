@@ -1,0 +1,109 @@
+Оскільки ти вже формуєш курсор по етапах у PL/SQL, просто додай у селект ознаку «є хоч одна відмітка» (locked) і поточний режим (stage_mode), а далі під час рендеру HTML підставляй атрибути `checked`/`disabled`. Нижче — самодостатній фрагмент для **PL/SQL Dynamic Content**.
+
+```plsql
+declare
+  -- Якщо ще не маєш: універсальна перевірка "чи є хоч одна відмітка в етапі"
+  function stage_has_signatures(
+    p_task_id      in number,
+    p_page_list_id in number,
+    p_stage_no     in number  -- 2/4/6 (номер батьківського етапу)
+  ) return number
+  is
+    l_exists number;
+  begin
+    select case when exists (
+             select 1
+               from TaskTracker.SIGNATUREHISTORY sh
+               join TaskTracker.SIGNATURERIGHTS  sr on sr.id = sh.signright_id
+               join TaskTracker.DICT_APP_CONFIRM_LIST d on d.id = sr.stages_id
+               join TaskTracker.DICT_APP_CONFIRM_LIST p on p.id = d.parent_stage_id
+              where sr.task_id        = p_task_id
+                and p.page_list_id    = p_page_list_id
+                and p.parent_stage_id is null
+                and p.stage           = p_stage_no
+           ) then 1 else 0 end
+      into l_exists
+      from dual;
+    return l_exists; -- 1 = є підпис(и), 0 = немає
+  end;
+
+  cursor c_stages is
+    /* Батьківські етапи (2/4/6) з агрегованим stage_mode та locked */
+    select p.id                      as stage_id,
+           p.stage                   as stage_no,
+           nvl(max(sr.stage_mode),0) as stage_mode,  -- 0=паралельно, 1=послідовно
+           stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, p.stage) as locked
+      from TaskTracker.DICT_APP_CONFIRM_LIST p      -- батьківський етап
+      join TaskTracker.DICT_APP_CONFIRM_LIST c on c.parent_stage_id = p.id
+      join TaskTracker.SIGNATURERIGHTS sr
+        on sr.stages_id = c.id
+       and sr.task_id   = :P4_TASK_ID
+     where p.page_list_id    = :P4_PAGE_LIST_ID
+       and p.parent_stage_id is null
+     group by p.id, p.stage
+     order by p.stage;
+
+  l_checked  varchar2(20);
+  l_disabled varchar2(20);
+  l_badge    varchar2(200);
+begin
+  htp.p('<div class="stages-modes">');
+
+  for r in c_stages loop
+    -- Визначаємо атрибути інпуту
+    l_checked  := case when r.stage_mode = 1 then ' checked' else '' end;     -- послідовно
+    l_disabled := case when r.locked     = 1 then ' disabled' else '' end;    -- є підпис(и)
+
+    -- Бейджик режиму
+    l_badge := case when r.stage_mode = 1
+                    then '<span class="badge badge-seq">Послідовно</span>'
+                    else '<span class="badge badge-par">Паралельно</span>'
+               end;
+
+    -- HTML чекбокс: активний/неактивний залежно від locked, і checked залежно від stage_mode
+    htp.p(
+      '<label class="sign-mode-row'||case when r.locked=1 then ' is-locked' end||'">'||
+        '<input type="checkbox" class="sign-checkbox" '||
+               'id="sign-checkbx-'||r.stage_id||'" '||
+               'data-stage-id="'||r.stage_id||'" '||
+               'data-stage-no="'||r.stage_no||'" '||
+               'data-locked="'||r.locked||'" '||
+               'data-mode="'||r.stage_mode||'" '||
+               l_checked||l_disabled||
+               ' />'||
+        '<span class="sign-mode-label" '||
+              case when r.locked=1 then 'title="Етап має відмітки — змінювати тип заборонено"' end||'>'||
+          'Етап '||r.stage_no||' — '||l_badge||
+        '</span>'||
+      '</label>'
+    );
+  end loop;
+
+  htp.p('</div>');
+end;
+```
+
+### Як це працює
+
+* `locked = 1` (у курсорі через `stage_has_signatures`) → у `<input>` додається `disabled`, а до `<label>` — клас `is-locked` і тултіп.
+* `stage_mode = 1` → у `<input>` додається `checked` (послідовно). Якщо `0` — без `checked` (паралельно).
+* Усі рішення приймаються **на сервері** під час побудови HTML, тож не потрібні додаткові AJAX-виклики, і кнопки/чекбокси відразу коректні.
+
+### Нотатки
+
+* Якщо чекбокси зберігаєш через AJAX — на бекенді обов’язково повтори перевірку:
+
+  ```plsql
+  if stage_has_signatures(:P4_TASK_ID, :P4_PAGE_LIST_ID, :P_CLICKED_STAGE_NO) = 1 then
+    raise_application_error(-20001, 'Етап вже має відмітки — змінювати тип відміток заборонено.');
+  end if;
+  ```
+* Для кращого UX можеш стилізувати неактивні чекбокси:
+
+  ```css
+  .sign-mode-row.is-locked { opacity:.65; cursor:not-allowed; }
+  .badge-seq { background:#eee; padding:2px 6px; border-radius:10px; }
+  .badge-par { background:#eee; padding:2px 6px; border-radius:10px; }
+  ```
+
+Цього вистачить, щоб одразу на рендері робити чекбокси активними/неактивними залежно від того, чи є хоч одна відмітка у відповідному етапі.
