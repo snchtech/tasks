@@ -1,0 +1,131 @@
+Ось рівно той фрагмент, який ламав «активність» stage = 4, і його правильна версія.
+
+# 1) Помилка у виборі попередніх етапів (було → стало)
+
+### Було (неправильно)
+
+```plsql
+-- WHERE stg < p_stage_no застосовується лише до останнього SELECT
+for s in (
+  select 2 as stg from dual
+  union all select 4 from dual
+  union all select 6 from dual
+  where stg < p_stage_no
+)
+loop
+  if not is_stage_completed(p_task_id, p_page_list_id, s.stg) then
+    l_prev_ok := false;
+    exit;
+  end if;
+end loop;
+```
+
+### Стало (правильно)
+
+```plsql
+for s in (
+  select stg
+    from (select 2 stg from dual
+          union all select 4 from dual
+          union all select 6 from dual)
+   where stg < p_stage_no
+)
+loop
+  if not is_stage_completed(p_task_id, p_page_list_id, s.stg) then
+    l_prev_ok := false;
+    exit;
+  end if;
+end loop;
+```
+
+> Чому це критично? У «було» предикат `where stg < p_stage_no` фактично не фільтрував (бо `stg` не існує поза підзапитом), тож 4-й етап інколи вважався активним, навіть коли stage 2 не завершений.
+
+---
+
+# 2) «Ранній вихід» у рендері рядка й навіщо `continue;`
+
+Коли етап **не активний**, ми взагалі не повинні заходити в гілки `l_parallel` / `l_count_cb`. Тому робимо ранній вихід — малюємо статус і переходимо до **наступного рядка**:
+
+```plsql
+-- КРОК 1. Етап має бути активним, інакше кнопок не показуємо
+if not p_is_active_stage then
+  append(p_buf, '<span class="wait-confirm-signature-text">Очікує завершення попередніх етапів</span>');
+  append(p_buf, '</div>'); -- .c-cart-signer-mark
+  append(p_buf, '</div>'); -- .confirm-cart-item
+  if l_subtask_content is not null then
+    append(p_buf,
+      '<span class="tsk-to-do"><span class="sbtsk-ttl">До виконання:</span> '||
+      '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span></span>');
+  end if;
+  append(p_buf, '</div>'); -- .confirm-cart-item_wrapper
+  continue;  -- ← КРИТИЧНО: перейти до наступного запису, не виконуючи логіку кнопок
+end if;
+```
+
+**Навіщо `continue;`?**
+Щоб гарантовано **не** виконалась подальша логіка відображення (паралельний/послідовний режим, перша кнопка тощо) для неактивного етапу. Без `continue;` ти мимоволі можеш потрапити в гілки, що малюють кнопку.
+
+---
+
+# 3) Як формувати `p_is_active_stage` «раз на підетап» (від батьківського етапу)
+
+Ідея: обчислюємо «активність» для **батьківського етапу** (2/4/6) **перед** ітерацією його підетапів, і передаємо це значення в рендер рядків кожного підетапу.
+
+```plsql
+-- усередині render (в циклі по етапах):
+fetch rc_stg into l_stage_id, l_stage_no, l_stage_title;
+
+-- 1) одна перевірка на батьківський етап
+l_is_active_stage := is_stage_active(:P4_TASK_ID, :P4_PAGE_LIST_ID, l_stage_no);
+
+-- 2) далі малюємо підетапи, передаючи прапор
+rc_sub := substages(p_page_list_id, l_stage_id);
+loop
+  fetch rc_sub into l_sub_id, l_sub_no, l_sub_title, l_btn_text, l_after_text;
+  exit when rc_sub%notfound;
+
+  if apex_collection.collection_exists('CONFIRM_CART_'||l_stage_id||'_'||l_sub_id) then
+    render_substage_rows(
+      p_buf                 => l_buf,
+      p_app_id              => p_app_id,
+      p_app_user            => p_app_user,
+      p_page_list_id        => p_page_list_id,
+      p_stage_id            => l_stage_id,
+      p_stage_no            => l_stage_no,     -- ← номер батьківського етапу (2/4/6)
+      p_substage_id         => l_sub_id,
+      p_substage_title      => l_sub_title,
+      p_substage_btn_text   => l_btn_text,
+      p_substage_after_text => l_after_text,
+      p_ctx_position_id     => l_ctx_position_id,
+      p_ctx_department_id   => l_ctx_department_id,
+      p_ctx_tabno           => l_ctx_tabno,
+      p_substitution_mode   => p_substitution_mode,
+      p_new_roles           => p_new_roles,
+      p_stage_for_subtask   => p_stage_for_subtask,
+      p_is_active_stage     => l_is_active_stage  -- ← тут передаємо
+    );
+  else
+    append(l_buf, '<div class="need-data-add-text">Дозаповніть поля</div>');
+  end if;
+
+end loop;
+```
+
+А в сигнатуру `render_substage_rows` додаємо параметр:
+
+```plsql
+procedure render_substage_rows(
+  ...
+  p_is_active_stage in boolean
+) is
+```
+
+І саме **його** використовуємо в «ранньому виході» (див. п. 2) перед будь-яким рендером кнопок.
+
+---
+
+## Підсумок логіки
+
+* Виправлений підзапит гарантує, що для stage 4/6 активно буде тільки тоді, коли всі попередні етапи завершені.
+* `continue;` зупиняє обробку рядка, якщо етап неактивний, і не допускає «витік» кнопок.
+* `p_is_active_stage` обчислюється **раз** на батьківський етап і «роздається» всім його підетапам, щоб усередині вони вже не виконували зайвих перевірок.

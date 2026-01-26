@@ -1,0 +1,165 @@
+Те, що в тебе з’являються кнопки на stage = 4, коли stage = 2 ще не завершений, майже напевно через помилку у самій перевірці «активності етапу». У твоєму фрагменті з `is_stage_active` є критичний SQL-нюанс: `WHERE stg < p_stage_no` застосовується лише до останнього `SELECT`. Через це для stage = 4 попередній етап 2 фактично не фільтрується як слід — і 4-й етап вважається «активним».
+
+Нижче — мінімальні, але точні правки, щоб логіка запрацювала як треба.
+
+---
+
+# 1) Виправляємо `is_stage_completed`
+
+(Тут усе ок, лишаю як є — функція правильна. Додаю тільки невеличку оптимізацію по `distinct`.)
+
+```plsql
+function is_stage_completed(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number
+) return boolean
+is
+  l_total  number;
+  l_signed number;
+begin
+  -- 1) Усього SR у цьому батьківському етапі (2/4/6)
+  select count(*)
+    into l_total
+    from TaskTracker.SIGNATURERIGHTS sr
+    join TaskTracker.DICT_APP_CONFIRM_LIST d
+      on d.id = sr.stages_id
+     and d.parent_stage_id is not null
+    join TaskTracker.DICT_APP_CONFIRM_LIST p
+      on p.id = d.parent_stage_id
+   where sr.task_id        = p_task_id
+     and p.page_list_id    = p_page_list_id
+     and p.parent_stage_id is null
+     and p.stage           = p_stage_no;
+
+  if l_total = 0 then
+    return false; -- нема кого підписувати → вважаємо НЕ завершеним
+  end if;
+
+  -- 2) Скільки з них мають хоча б один підпис
+  select count(*)    -- DISTINCT вже не потрібен якщо join унікальний по sr.id
+    into l_signed
+    from (
+      select sr.id
+        from TaskTracker.SIGNATURERIGHTS  sr
+        join TaskTracker.DICT_APP_CONFIRM_LIST d
+          on d.id = sr.stages_id
+         and d.parent_stage_id is not null
+        join TaskTracker.DICT_APP_CONFIRM_LIST p
+          on p.id = d.parent_stage_id
+        join TaskTracker.SIGNATUREHISTORY sh
+          on sh.signright_id = sr.id
+       where sr.task_id        = p_task_id
+         and p.page_list_id    = p_page_list_id
+         and p.parent_stage_id is null
+         and p.stage           = p_stage_no
+       group by sr.id
+    );
+
+  return (l_signed = l_total);
+end;
+```
+
+---
+
+# 2) Виправляємо `is_stage_active`
+
+Головна правка — правильно відфільтрувати попередні етапи (2,4,6), загорнувши список у підзапит:
+
+```plsql
+function is_stage_active(
+  p_task_id      in number,
+  p_page_list_id in number,
+  p_stage_no     in number
+) return boolean
+is
+  l_prev_ok        boolean := true;
+  l_stg_completed  boolean;
+begin
+  -- Усі попередні (для 4 — це 2; для 6 — це 2 і 4)
+  if p_stage_no > 2 then
+    for s in (
+      select stg
+        from (select 2 stg from dual
+              union all select 4 from dual
+              union all select 6 from dual)
+       where stg < p_stage_no
+    )
+    loop
+      if not is_stage_completed(p_task_id, p_page_list_id, s.stg) then
+        l_prev_ok := false;
+        exit;
+      end if;
+    end loop;
+  end if;
+
+  l_stg_completed := is_stage_completed(p_task_id, p_page_list_id, p_stage_no);
+
+  -- Активний тоді, коли ВСІ попередні завершені і поточний ще НЕ завершений
+  return (l_prev_ok and not l_stg_completed);
+end;
+```
+
+> Це саме та помилка, через яку 4-й етап «проскочував» умову активності.
+
+---
+
+# 3) Жорстке блокування рендера кнопок, якщо етап НЕ активний
+
+У блокові відмалювання рядка (де ти зараз робиш `if not p_is_active_stage then l_show_button := false; …`) зроби «ранній вихід» для неактивних етапів, щоб **ніколи** не зайти у гілку з `l_parallel`/`l_count_cb`. Так ти виключиш будь-який шанс випадкового показу кнопки.
+
+```plsql
+-- КРОК 1. Етап має бути активним, інакше кнопки не показуємо і навіть не інкрементуємо l_count_cb
+if not p_is_active_stage then
+  append(p_buf, '<span class="wait-confirm-signature-text">Очікує завершення попередніх етапів</span>');
+  append(p_buf, '</div>'); -- .c-cart-signer-mark
+  append(p_buf, '</div>'); -- .confirm-cart-item
+  if l_subtask_content is not null then
+    append(p_buf,
+      '<span class="tsk-to-do"><span class="sbtsk-ttl">До виконання:</span> '||
+      '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span></span>');
+  end if;
+  append(p_buf, '</div>'); -- .confirm-cart-item_wrapper
+  continue; -- ← критично!
+end if;
+```
+
+Тільки **після** цього блоку переходь до перевірок `l_parallel`/`l_is_role` і т.д. (тобто активний етап гарантовано).
+
+---
+
+# 4) Перевірка «активності» має братися по **батьківському** етапу
+
+Переконайся, що ти вираховуєш `p_is_active_stage` **раз на підетап (substage)** по **номерy батьківського етапу** (`p_stage_no` = 2/4/6) і передаєш це значення всередину рендеру рядків. Наприклад:
+
+```plsql
+-- у рендері етапу:
+l_is_active_stage := is_stage_active(:P4_TASK_ID, :P4_PAGE_LIST_ID, l_stage_no);
+
+-- далі передай у render_substage_rows(..., p_is_active_stage => l_is_active_stage, ...)
+```
+
+І використовуй саме це `p_is_active_stage` у внутрішній логіці рендеру кнопок.
+
+---
+
+# 5) Маленький порядок викликів
+
+Щоб не робити десятки повторних селектів:
+
+* На початку рендеру **кешуй**:
+
+  * `l_stage2_active := is_stage_active(..., 2)`
+  * `l_stage4_active := is_stage_active(..., 4)`
+  * `l_stage6_active := is_stage_active(..., 6)`
+* Або хоч би рахуй `l_is_active_stage` один раз на батьківський етап перед ітерацією підетапів — і **передавай** його в `render_substage_rows`.
+
+---
+
+## Що вийде після правок
+
+* Для stage = 4 **кнопок не буде**, поки stage = 2 не завершений повністю (незалежно від ролей/паралельності).
+* Для stage = 6 — те саме: жодних кнопок, поки stage = 4 не завершений повністю.
+* `l_parallel` і «перша доступна кнопка» (`l_count_cb`) тепер спрацьовують **тільки** якщо батьківський етап активний (перевірка на самому початку блоку).
+
+Цих трьох кроків достатньо, щоб прибрати «витік» кнопок на 4-му етапі, зберігши твою лінійну/паралельну логіку всередині активного етапу.
