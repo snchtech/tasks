@@ -1,0 +1,65 @@
+Ти правий: **у Interactive Report немає** властивості типу *No Data Found Message* (це є в Classic Report / Cards тощо). В IR “No data found” — це **вбудоване повідомлення**.
+
+Є 2 нормальні способи зробити “Немає записів для ознайомлення”.
+
+---
+
+## Спосіб 1 (локально для цього IR): Dynamic Action + JS (рекомендую)
+
+### 1) Дай регіону Static ID
+
+Interactive Report region → **Advanced → Static ID**
+Наприклад: `ir_ack`
+
+### 2) Створи Dynamic Action
+
+* **Event**: `After Refresh`
+* **Selection Type**: Region
+* **Region**: твій IR
+* **True Action**: Execute JavaScript Code
+
+### 3) JS код
+
+```js
+(function () {
+  const regionId = "ir_ack"; // <-- static id регіону IR
+  const $r = $("#" + regionId);
+
+  // В APEX 22/24 зазвичай один із цих селекторів існує
+  const $msg =
+    $r.find(".a-IRR-noDataMsg").first()
+      .add($r.find(".t-IRR-noDataMsg").first())
+      .add($r.find(".a-IRR-noDataFound").first());
+
+  if ($msg.length) {
+    $msg.text("Немає записів для ознайомлення");
+  }
+})();
+```
+
+✅ Працює і в APEX 22, і в APEX 24 (класи можуть трохи різнитись, тому я дав кілька селекторів).
+
+> Якщо після цього все одно бачиш “лупу” — це ок, ти змінюєш текст. Якщо хочеш ще й прибрати іконку/рамку — скажи, дам CSS під твою тему.
+
+---
+
+## Спосіб 2 (глобально для всієї апки): замінити системне повідомлення IR
+
+У цьому випадку **в усіх Interactive Report** “No data found” стане твоїм текстом.
+
+Шлях (може трохи відрізнятись за версією):
+**Shared Components → Globalization → Text Messages** (або *Translation / Messages*)
+Шукаєш ключ, пов’язаний з IR “No data found” і міняєш текст.
+
+На практиці частіше роблять **Спосіб 1**, бо тобі треба саме для одного IR (“ознайомлення”).
+
+---
+
+## Найшвидше: перевірка, який клас у тебе реально
+
+Відкрий сторінку з порожнім IR → F12 → Inspect на текст “No data found” → подивись клас елемента:
+
+* якщо бачиш `.a-IRR-noDataMsg` — все ок
+* якщо інший — скинеш мені 1 рядок HTML/клас, і я піджену селектор під 100%.
+
+Хочеш, щоб воно було **не просто текстом**, а красиво по центру (без “лупи” і бордера) — зроблю CSS під Universal Theme 42.

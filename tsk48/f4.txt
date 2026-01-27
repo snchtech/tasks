@@ -1,0 +1,102 @@
+Ок — ось акуратний варіант під **APEX (Universal Theme / IR)**: текст по центру, “картка”, м’яка рамка, іконка (через emoji, без залежностей), нормально виглядає і в APEX 22/24.
+
+### 1) CSS (Page → CSS → Inline або Static Application File)
+
+```css
+/* ===== IR: кастомне повідомлення "нема даних" ===== */
+.ir-no-ack {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 140px;
+  padding: 18px;
+}
+
+.ir-no-ack__box {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  width: min(720px, 100%);
+  padding: 16px 18px;
+  border: 1px dashed rgba(0,0,0,.22);
+  border-radius: 12px;
+  background: rgba(255,255,255,.7);
+  box-shadow: 0 6px 18px rgba(0,0,0,.06);
+}
+
+.ir-no-ack__icon {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgba(0,0,0,.06);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.ir-no-ack__title {
+  margin: 0;
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: .2px;
+}
+
+.ir-no-ack__text {
+  margin: 4px 0 0;
+  font-size: 13px;
+  opacity: .85;
+}
+
+/* якщо тема темна */
+@media (prefers-color-scheme: dark) {
+  .ir-no-ack__box {
+    background: rgba(20,20,20,.45);
+    border-color: rgba(255,255,255,.22);
+    box-shadow: 0 10px 26px rgba(0,0,0,.35);
+  }
+  .ir-no-ack__icon { background: rgba(255,255,255,.08); }
+  .ir-no-ack__text { opacity: .9; }
+}
+```
+
+### 2) JS (у твій DA After Refresh → Execute JS Code)
+
+Цей код **замінює стандартний “no data” блок IR** на стилізований HTML.
+
+```js
+(function () {
+  const regionId = "ir_ack"; // <-- Static ID твого IR регіону
+  const $r = $("#" + regionId);
+
+  // Знаходимо стандартний елемент "no data" (класи можуть відрізнятись між версіями)
+  const $msg =
+    $r.find(".a-IRR-noDataMsg").first()
+      .add($r.find(".t-IRR-noDataMsg").first())
+      .add($r.find(".a-IRR-noDataFound").first());
+
+  if (!$msg.length) return;
+
+  // Ставимо наш HTML
+  $msg.html(`
+    <div class="ir-no-ack">
+      <div class="ir-no-ack__box" role="status" aria-live="polite">
+        <div class="ir-no-ack__icon">📭</div>
+        <div class="ir-no-ack__content">
+          <p class="ir-no-ack__title">Немає записів для ознайомлення</p>
+          <p class="ir-no-ack__text">На цей момент у списку немає активних завдань, які потребують вашого ознайомлення.</p>
+        </div>
+      </div>
+    </div>
+  `);
+})();
+```
+
+### Де вставити
+
+* **CSS**: Page Designer → Page → **CSS → Inline**
+* **JS**: Dynamic Action на IR → Event **After Refresh** → Action **Execute JavaScript Code**
+* Не забудь **Static ID** для IR регіону: `ir_ack`
+
+Якщо хочеш, зроблю ще варіант **без emoji** (через CSS-псевдоелемент) або повністю прибрати стандартну “лупу/рамку” IR, щоб виглядало як “порожній стан” у сучасних застосунках.

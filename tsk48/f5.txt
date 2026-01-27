@@ -1,0 +1,108 @@
+Ок, робимо це “по-Apex’івськи”: **на Global Page один раз дістаємо доступ → кладемо в items → далі в будь-якому PL/SQL/HTML генераторі просто перевіряємо items і не рендеримо кнопку**.
+
+## 1) Створи items на Global Page (Page 0)
+
+Наприклад:
+
+* `P0_ACCESS_LEVEL` (Number)
+* `P0_ACCESS_UNIT_ID` (Number) *(або відповідний тип, як у БД)*
+* (опційно) `P0_EFF_USER_ID` (Number) — щоб не дублювати логіку підміни
+
+> Items мають бути **Session State = Per Session (Default)**.
+
+---
+
+## 2) На Global Page додай процес, який запише значення в ці items
+
+**Page 0 → Processing → Process → Point: “On Load: Before Header”** (або “Before Regions” — головне, щоб ДО рендеру твоїх вкладок).
+
+### PL/SQL процес (приклад)
+
+```plsql
+declare
+  l_eff_user_id   number;
+  l_access_level  number;
+  l_unit_id       number;
+begin
+  -- 1) effective user id з урахуванням substitution
+  l_eff_user_id :=
+    case
+      when nvl(:P0_SUBSTITUTION_MODE, 0) = 0 then :P0_CUR_USER_ID
+      else :P0_NEW_USER_ID
+    end;
+
+  -- 2) дістаємо доступ (підстав реальні назви таблиці/колонок)
+  begin
+    select tac.access_level, tac.unit_id
+      into l_access_level, l_unit_id
+      from tasktracker.task_access_control@TO_TASKTRACKER10 tac
+     where tac.user_id = l_eff_user_id;
+
+  exception
+    when no_data_found then
+      -- якщо запису нема: постав дефолт (обери свою політику)
+      l_access_level := 2;
+      l_unit_id      := null;
+  end;
+
+  -- 3) записуємо в session state items
+  :P0_ACCESS_LEVEL   := l_access_level;
+  :P0_ACCESS_UNIT_ID := l_unit_id;
+  -- (опційно)
+  -- :P0_EFF_USER_ID     := l_eff_user_id;
+end;
+```
+
+✅ Тепер `:P0_ACCESS_LEVEL` та `:P0_ACCESS_UNIT_ID` доступні **всюди** (PL/SQL, SQL, Conditions, Dynamic Actions).
+
+---
+
+## 3) Прибрати кнопку “До виконання” у твоєму PL/SQL, який генерує вкладки/кнопки
+
+Там, де ти рендериш кнопку, обгорни умовою:
+
+### Варіант A: просто не друкувати кнопку
+
+```plsql
+if not ( nvl(:P0_ACCESS_LEVEL, -1) = 1 and :P0_ACCESS_UNIT_ID is null ) then
+  -- рендер кнопки “До виконання”
+  htp.p(
+    '<button type="button" class="t-Button t-Button--hot" id="btnTodo">'||
+    'До виконання'||
+    '</button>'
+  );
+end if;
+```
+
+### Варіант B: якщо кнопка — це вкладка/пункт меню
+
+```plsql
+if nvl(:P0_ACCESS_LEVEL, -1) = 1 and :P0_ACCESS_UNIT_ID is null then
+  null; -- не додаємо вкладку "До виконання"
+else
+  -- додаємо вкладку
+  htp.p('<li class="t-Tabs-item"><a class="t-Tabs-link" href="...">До виконання</a></li>');
+end if;
+```
+
+---
+
+## 4) Додатково (якщо кнопка — APEX Button, не через htp.p)
+
+Тоді взагалі ідеально: у кнопки **Server-side Condition**:
+
+* Type: **PL/SQL Expression**
+
+```plsql
+not (nvl(:P0_ACCESS_LEVEL, -1) = 1 and :P0_ACCESS_UNIT_ID is null)
+```
+
+---
+
+### Примітка про “коли оновлювати”
+
+Якщо substitution mode може змінюватись без повного reload — після перемикання підміни зроби **Redirect / Reload** або виклич `apex.submit()` / refresh, щоб процес Page 0 знову поставив правильні значення.
+
+---
+
+Якщо скинеш фрагмент твого PL/SQL, де саме генерується вкладка/кнопка “До виконання” (1–2 абзаци коду) — я вставлю цю перевірку прямо в твій шаблон, щоб нічого не зламати по HTML-структурі.

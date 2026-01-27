@@ -1,0 +1,177 @@
+Нижче даю **готовий SQL для Interactive Report**, який:
+
+* визначає **effective_user_id** з урахуванням substitution mode;
+* визначає, чи користувач має роль **SHIFT_PERSONAL** через **APEX ACL таблицю** (а не через boolean-функцію, бо її не можна в SQL);
+* тягне **access_level** і **unit_id** з `TASK_ACCESS_CONTROL`;
+* застосовує різні правила “не показувати, якщо вже ознайомився”:
+
+  * **без shift_personal** → разово (будь-коли в історії)
+  * **з shift_personal** → тільки в межах поточної зміни (між `:P0_SHIFT_START` та `:P0_SHIFT_END`)
+
+> Я написав у стилі твоєї схеми: `TaskTracker. ... @TO_TASKTRACKER10`. Підстав свої реальні назви колонок у `TASK_ACCESS_CONTROL`.
+
+---
+
+## 1) SQL для IR (готовий)
+
+```sql
+with
+/* 1) effective user (з урахуванням substitution) */
+p as (
+  select
+    case
+      when nvl(:P0_SUBSTITUTION_MODE,0) = 0 then :P0_CUR_USER_ID
+      else :P0_NEW_USER_ID
+    end as eff_user_id,
+    :P0_SHIFT_START as shift_start,
+    :P0_SHIFT_END   as shift_end
+  from dual
+),
+
+/* 2) чи має користувач роль SHIFT_PERSONAL (APEX ACL) */
+r as (
+  select
+    case
+      when exists (
+        select 1
+        from apex_appl_acl_user_roles ur
+        where ur.application_id = :APP_ID
+          and upper(ur.user_name) = upper(:APP_USER)
+          and ur.role_static_id = 'SHIFT_PERSONAL'
+      ) then 1 else 0
+    end as is_shift_personal
+  from dual
+),
+
+/* 3) доступ користувача з task_access_control */
+ac as (
+  select
+    nvl(max(tac.access_level), 2) as access_level,  -- якщо нема запису: умовно 2
+    max(tac.unit_id)             as unit_id
+    -- якщо в тебе там ще department_id є — можеш також витягнути
+  from tasktracker.task_access_control@TO_TASKTRACKER10 tac
+  join p on tac.user_id = p.eff_user_id
+),
+
+/* 4) user_ctx (як у тебе було) */
+uc as (
+  select *
+  from user_ctx
+),
+
+/* 5) активні задачі */
+t_base as (
+  select
+    t.*,
+    s.status_name,
+    sm.id as status_main_id
+  from TaskTracker.TASKS@TO_TASKTRACKER10 t
+  left join TaskTracker.DICT_STATUS@TO_TASKTRACKER10 s
+    on s.id = t.status_id
+  left join TaskTracker.DICT_STATUS_MAIN@TO_TASKTRACKER10 sm
+    on sm.id = s.status_main_id
+  where sm.id <> 0   -- активні (як у тебе)
+)
+
+select
+  t.*,
+  t.status_name
+from t_base t
+cross join uc
+cross join p
+cross join r
+cross join ac
+where
+  /* -------------------------------
+     A) ФІЛЬТР ПО ДОСТУПУ (access_level)
+     ------------------------------- */
+  (
+       /* access_level = 2 або 3 -> по department користувача + по unit (якщо задано) */
+       (ac.access_level in (2,3)
+        and (uc.department_id is null or uc.department_id = t.department_id)
+        and (ac.unit_id is null or ac.unit_id = t.unit_id)
+       )
+
+    or /* access_level = 1 і unit_id is null -> бачить ВСЕ активне без обмежень */
+       (ac.access_level = 1 and ac.unit_id is null)
+
+    or /* access_level = 1 і unit_id задано -> всі активні, але тільки цей unit */
+       (ac.access_level = 1 and ac.unit_id is not null and t.unit_id = ac.unit_id)
+  )
+
+  /* -------------------------------
+     B) ФІЛЬТР "НЕ ПОКАЗУВАТИ, ЯКЩО ВЖЕ ОЗНАЙОМИВСЯ"
+     ------------------------------- */
+  and
+  (
+    /* B1: НЕ shift_personal (або shift-час не задано) -> разове ознайомлення назавжди */
+    (
+      (r.is_shift_personal = 0 or p.shift_start is null or p.shift_end is null)
+      and not exists (
+        select 1
+        from TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 v
+        where v.task_id = t.id
+          and v.user_id = p.eff_user_id
+      )
+    )
+
+    or
+
+    /* B2: shift_personal + shift-час задано -> фільтр тільки в межах зміни */
+    (
+      r.is_shift_personal = 1
+      and p.shift_start is not null
+      and p.shift_end   is not null
+      and not exists (
+        select 1
+        from TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 v
+        where v.task_id = t.id
+          and v.user_id = p.eff_user_id
+          and v.date_viewed between p.shift_start and p.shift_end
+      )
+    )
+  );
+```
+
+### Чому так
+
+* `APEX_ACL.HAS_USER_ROLE` у SQL не зайде (BOOLEAN), тому беремо роль через `apex_appl_acl_user_roles`.
+* Shift-логіка працює **тільки коли є роль + задані `:P0_SHIFT_START/:P0_SHIFT_END`**. Якщо shift-часи порожні — падаємо на “разовий” режим.
+
+---
+
+## 2) Як “додати в звіт” (IR)
+
+1. Region (Interactive Report) → **Source** → встав цей SQL.
+2. Переконайся, що `:P0_SUBSTITUTION_MODE`, `:P0_CUR_USER_ID`, `:P0_NEW_USER_ID`, `:P0_SHIFT_START`, `:P0_SHIFT_END` реально існують і мають тип **DATE** (не текст).
+3. Якщо треба показувати текст “Зміна … з … по …” у самому IR — додай у `select` ще одну computed колонку, наприклад:
+
+```sql
+case
+  when r.is_shift_personal = 1
+   and p.shift_start is not null
+   and p.shift_end is not null
+  then 'Зміна '||:P0_SHIFT_ID||' з '||
+       to_char(p.shift_start,'dd.mm.yyyy hh24:mi')||' по '||
+       to_char(p.shift_end,'dd.mm.yyyy hh24:mi')
+end as shift_info
+```
+
+і потім у Columns → `SHIFT_INFO` задаєш заголовок “Зміна”.
+
+---
+
+## 3) Маленькі уточнення, які часто “вистрілюють”
+
+* Якщо в `TASK_VIEWED` є `SUBSTITUTION_ID` і ти хочеш вести історію окремо “за кого ознайомлювався”, тоді в `NOT EXISTS` можна додати:
+
+  ```sql
+  and nvl(v.substitution_id,-1) = nvl(:P0_NEW_USER_ID,-1)
+  ```
+
+  (або твоя логіка), але ти це не просив — залишив базово по `eff_user_id`.
+* Якщо “завдання не закрито” у тебе визначається не тільки `sm.id <> 0`, а ще якимись статусами — додай ці умови у `t_base`.
+
+---
+
+Якщо скинеш структуру `TASK_ACCESS_CONTROL` (2–3 колонки) — я піджену `ac as (...)` так, щоб без `max()` і з точним вибором запису (на випадок, якщо там може бути кілька рядків на user).
