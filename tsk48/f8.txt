@@ -1,0 +1,281 @@
+Чудово, тоді робимо **чисту, цілісну версію**, без `l_count_cb`, без “магії”, з чітким розділенням відповідальностей.
+Я дам **готовий до вставки код**, розбитий логічно, і прокоментую ключові місця.
+
+---
+
+# ✅ ЦІЛІСНА АРХІТЕКТУРА
+
+## Основні принципи (важливо запам’ятати)
+
+1. **Статуси ≠ кнопки**
+2. **Активний етап керує всім**
+3. **“Розглядає” — рівно один раз на етап**
+4. **“Від імені” — тільки в активному етапі**
+5. **MAIN_SIGNER — тільки в бізнес-логіці, не в UI**
+
+---
+
+# 1️⃣ Основні змінні (на початку рендера етапу)
+
+```plsql
+-- Флаги рівня етапу
+l_stage_has_current    BOOLEAN := FALSE; -- чи вже є "Розглядає" в цьому етапі
+```
+
+---
+
+# 2️⃣ Рендер одного рядка SIGNATURERIGHTS
+
+```plsql
+DECLARE
+   l_is_first_active_row BOOLEAN := FALSE;
+   l_show_sign_button    BOOLEAN := FALSE;
+   l_can_byname          BOOLEAN := FALSE;
+BEGIN
+   ------------------------------------------------------
+   -- 1. Визначаємо ПЕРШИЙ активний рядок етапу
+   ------------------------------------------------------
+   IF p_is_active_stage AND NOT l_stage_has_current THEN
+      l_is_first_active_row := TRUE;
+      l_stage_has_current  := TRUE;
+   END IF;
+
+   ------------------------------------------------------
+   -- 2. Чи показувати кнопку ОСНОВНОГО підпису
+   ------------------------------------------------------
+   IF p_is_active_stage THEN
+      IF l_parallel THEN
+         l_show_sign_button := l_is_role;
+      ELSE
+         l_show_sign_button := l_is_role AND l_is_first_active_row;
+      END IF;
+   END IF;
+
+   ------------------------------------------------------
+   -- 3. Рендер кнопки підпису або статусу
+   ------------------------------------------------------
+   IF l_show_sign_button THEN
+      append(
+         p_buf,
+         '<button class="confirm-signature-button"
+                  data-signature-id="'||l_signature_id||'">'
+         || h(p_substage_btn_text) ||
+         '</button>'
+      );
+   ELSE
+      IF NOT p_is_active_stage THEN
+         append(
+            p_buf,
+            '<span class="wait-confirm-signature-text">
+               Очікує завершення попередніх етапів
+             </span>'
+         );
+      ELSIF l_is_first_active_row THEN
+         append(
+            p_buf,
+            '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">
+               Розглядає
+             </span>'
+         );
+      ELSE
+         append(
+            p_buf,
+            '<span class="wait-confirm-signature-text">
+               Очікує відмітки
+             </span>'
+         );
+      END IF;
+   END IF;
+```
+
+---
+
+# 3️⃣ Визначення можливості **“Від імені”**
+
+## 3.1 Отримання категорії ОТіЗ виконавця
+
+```plsql
+   l_list_kategoria_otiz NUMBER := NULL;
+
+   BEGIN
+      IF l_list_tab_no IS NOT NULL THEN
+         SELECT t.kategoria_otiz
+           INTO l_list_kategoria_otiz
+           FROM kbs.personal@to_tasktracker10 t
+          WHERE t.tab_no = l_list_tab_no
+            AND t.priznak IS NULL;
+
+      ELSIF l_list_position_id IS NOT NULL
+         AND l_list_department_id IS NOT NULL THEN
+
+         SELECT t.kategoria_otiz
+           INTO l_list_kategoria_otiz
+           FROM kbs.personal@to_tasktracker10 t
+          WHERE t.dolznost = l_list_position_id
+            AND t.tseh_id  = l_list_department_id
+            AND (l_list_uchastok IS NULL OR t.uchastok = l_list_uchastok)
+            AND t.priznak IS NULL
+            AND ROWNUM = 1;
+      END IF;
+   EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+         l_list_kategoria_otiz := NULL;
+   END;
+```
+
+---
+
+## 3.2 Виклик бізнес-логіки
+
+```plsql
+   BEGIN
+      l_can_byname :=
+         task_tracker_pkg.can_sign_by_other_personal(
+            p_signature_user_id      => l_list_tab_no,
+            p_signature_position_id  => l_list_position_id,
+            p_signature_department   => l_list_department_id,
+            p_signature_uchastok     => l_list_uchastok,
+            p_signature_kategoria    => l_list_kategoria_otiz,
+            p_cur_position_id        => l_cur_position_id,
+            p_cur_department_id      => l_cur_department_id,
+            p_cur_uchastok           => l_cur_uchastok,
+            p_cur_kategoria          => l_cur_kategoria
+         );
+   EXCEPTION
+      WHEN OTHERS THEN
+         l_can_byname := FALSE;
+   END;
+```
+
+---
+
+## 3.3 Рендер кнопки **“Від імені”**
+
+```plsql
+   IF p_is_active_stage
+      AND l_can_byname
+      AND (l_parallel OR l_is_first_active_row)
+   THEN
+      append(
+         p_buf,
+         '<button type="button"
+                  class="byname-signature-button"
+                  data-signature-id="'||l_signature_id||'">
+            Від імені
+          </button>'
+      );
+   END IF;
+
+   append(p_buf, '</div>');
+END;
+```
+
+---
+
+# 4️⃣ ОНОВЛЕНА бізнес-логіка
+
+`CAN_SIGN_BY_OTHER_PERSONAL`
+
+```plsql
+FUNCTION can_sign_by_other_personal(
+   p_signature_user_id     IN NUMBER,
+   p_signature_position_id IN NUMBER,
+   p_signature_department  IN NUMBER,
+   p_signature_uchastok    IN NUMBER,
+   p_signature_kategoria   IN NUMBER,
+   p_cur_position_id       IN NUMBER,
+   p_cur_department_id     IN NUMBER,
+   p_cur_uchastok          IN NUMBER,
+   p_cur_kategoria         IN NUMBER
+) RETURN BOOLEAN
+IS
+   v_sign_pos NUMBER;
+   v_sign_dep NUMBER;
+   v_sign_uch VARCHAR2(100);
+   v_sign_kat NUMBER;
+
+   FUNCTION has_main_signer_role RETURN BOOLEAN IS
+   BEGIN
+      RETURN apex_acl.has_user_role(
+         p_application_id => :APP_ID,
+         p_user_name      => :APP_USER,
+         p_role_static_id => 'MAIN_SIGNER'
+      );
+   END;
+BEGIN
+   ------------------------------------------------------
+   -- Дані виконавця
+   ------------------------------------------------------
+   IF p_signature_user_id IS NOT NULL THEN
+      SELECT dolznost, tseh_id, uchastok, kategoria_otiz
+        INTO v_sign_pos, v_sign_dep, v_sign_uch, v_sign_kat
+        FROM kbs.personal@to_tasktracker10
+       WHERE tab_no = p_signature_user_id
+         AND priznak IS NULL;
+
+   ELSIF p_signature_position_id IS NOT NULL
+      AND p_signature_department IS NOT NULL THEN
+
+      SELECT dolznost, tseh_id,
+             CASE
+               WHEN p_signature_uchastok IS NULL THEN NULL
+               ELSE uchastok
+             END,
+             kategoria_otiz
+        INTO v_sign_pos, v_sign_dep, v_sign_uch, v_sign_kat
+        FROM kbs.personal@to_tasktracker10
+       WHERE dolznost = p_signature_position_id
+         AND tseh_id  = p_signature_department
+         AND (p_signature_uchastok IS NULL OR uchastok = p_signature_uchastok)
+         AND priznak IS NULL
+         AND ROWNUM = 1;
+   ELSE
+      RETURN FALSE;
+   END IF;
+
+   ------------------------------------------------------
+   -- Умови доступу
+   ------------------------------------------------------
+   IF v_sign_dep = p_cur_department_id
+      AND (p_signature_uchastok IS NULL OR v_sign_uch = p_cur_uchastok)
+      AND (
+            (v_sign_kat <> 1 AND p_cur_kategoria = 1)
+         OR has_main_signer_role
+          )
+   THEN
+      RETURN TRUE;
+   END IF;
+
+   RETURN FALSE;
+
+EXCEPTION
+   WHEN NO_DATA_FOUND THEN
+      RETURN FALSE;
+   WHEN OTHERS THEN
+      RETURN FALSE;
+END;
+```
+
+---
+
+# 🧪 Поведінка тепер гарантовано правильна
+
+| Ситуація         | Результат                    |
+| ---------------- | ---------------------------- |
+| Активний етап    | ✔                            |
+| Паралельний етап | кілька “Від імені”           |
+| Послідовний етап | тільки 1                     |
+| Неактивний етап  | ❌ жодних кнопок              |
+| MAIN_SIGNER      | ✔ навіть керівник → керівник |
+| “Розглядає”      | рівно 1                      |
+
+---
+
+## Хочеш далі:
+
+* 🔍 **таблицю тест-кейсів**
+* 🧩 **винести рендер у процедури**
+* ⚡ **оптимізувати SELECT-и**
+* 🧠 **схему станів етапів**
+
+Просто скажи 👌

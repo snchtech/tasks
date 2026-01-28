@@ -1,0 +1,232 @@
+Супер, дякую за чітке формулювання 👍
+Робимо саме те, що ти просиш: **мінімальні правки**, **без тотального рефакторингу**, але з **правильною логікою**.
+
+Я **НЕ міняю твою структуру**, лише:
+
+* прибираю некоректні умови,
+* додаю 2 чіткі флаги,
+* фіксую статус **«Розглядає» тільки для послідовного етапу**,
+* блочимо кнопку **«Від імені»** поза активним етапом.
+
+---
+
+# 🧩 1. Мінімальні змінні (додати НАД циклом етапу)
+
+```plsql
+-- Чи вже показали "Розглядає" у цьому етапі
+l_stage_has_current BOOLEAN := FALSE;
+```
+
+---
+
+# 🧩 2. Визначення first row (МІНІМАЛЬНА заміна l_count_cb)
+
+🔴 **НЕ видаляємо `l_count_cb` повністю**, але:
+
+* **він більше не керує статусами**
+* використовується тільки для кнопок
+
+```plsql
+l_is_first_active_row BOOLEAN := FALSE;
+
+IF p_is_active_stage AND NOT l_stage_has_current THEN
+   l_is_first_active_row := TRUE;
+   l_stage_has_current  := TRUE;
+END IF;
+```
+
+---
+
+# 🧩 3. ПРАВКА ТВОГО КОДУ СТАТУСІВ (мінімально)
+
+### ❌ Було (фрагмент)
+
+```plsql
+if not p_is_active_stage then
+   l_show_button := false;
+elsif l_parallel then
+   l_show_button := l_is_role;
+else
+   if l_is_role and l_count_cb = 0 then
+      l_show_button = true;
+      l_count_cb := l_count_cb + 1;
+   elsif (not l_is_role) and l_count_cb = 0 then
+      l_show_button := false;
+      l_count_cb:= l_count_cb + 1;
+      append(p_buf,
+        '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">
+           Розглядає
+         </span>');
+   else
+      l_this_row_rendered := true;
+      l_show_button := false;
+   end if;
+end if;
+```
+
+---
+
+### ✅ Стало (МІНІМАЛЬНО переписано)
+
+```plsql
+-- Чи показуємо кнопку основного підпису
+IF NOT p_is_active_stage THEN
+   l_show_button := FALSE;
+
+ELSIF l_parallel THEN
+   l_show_button := l_is_role;
+
+ELSE
+   l_show_button := l_is_role AND l_is_first_active_row;
+END IF;
+```
+
+---
+
+# 🧩 4. Рендер кнопки / статусу (МІНІМАЛЬНА ПРАВКА)
+
+### ❌ Було
+
+```plsql
+if l_show_button then
+   append(p_buf,'<button ...>...</button>');
+if not is_active_stage then
+   append(p_buf,'Очікує завершення попередніх етапів');
+else
+   append(p_buf,'Очікує відмітки');
+end;
+end if;
+```
+
+---
+
+### ✅ Стало
+
+```plsql
+IF l_show_button THEN
+   append(
+      p_buf,
+      '<button id="signature-btn"
+               data-signature-id="'||l_signature_id||'"
+               class="confirm-signature-button">'
+      || h(p_substage_btn_text) ||
+      '</button>'
+   );
+ELSE
+   IF NOT p_is_active_stage THEN
+      append(
+         p_buf,
+         '<span class="wait-confirm-signature-text">
+            Очікує завершення попередніх етапів
+          </span>'
+      );
+
+   ELSIF NOT l_parallel
+      AND l_is_first_active_row
+   THEN
+      append(
+         p_buf,
+         '<span class="wait-confirm-signature-text wait-confirm-signature-text-current">
+            Розглядає
+          </span>'
+      );
+
+   ELSE
+      append(
+         p_buf,
+         '<span class="wait-confirm-signature-text">
+            Очікує відмітки
+          </span>'
+      );
+   END IF;
+END IF;
+
+append(p_buf, '</div>');
+```
+
+---
+
+# 🧩 5. МІНІМАЛЬНА правка кнопки **«Від імені»**
+
+## ❌ Було
+
+```plsql
+if l_can_byname then
+   append(p_buf,'<button ...>Від імені</button>');
+end if;
+```
+
+---
+
+## ✅ Стало (КРИТИЧНА правка)
+
+```plsql
+IF p_is_active_stage
+   AND l_can_byname
+   AND (l_parallel OR l_is_first_active_row)
+THEN
+   append(
+      p_buf,
+      '<button type="button"
+               class="byname-signature-button"
+               data-signature-id="'||l_signature_id||'">
+         Від імені
+       </button>'
+   );
+END IF;
+```
+
+---
+
+# 🧩 6. МІНІМАЛЬНА правка `CAN_SIGN_BY_OTHER_PERSONAL`
+
+### ❌ Було
+
+```plsql
+AND v_sign_kat <> 1
+AND p_cur_kategoria = 1
+```
+
+---
+
+### ✅ Стало
+
+```plsql
+AND (
+      (v_sign_kat <> 1 AND p_cur_kategoria = 1)
+   OR apex_acl.has_user_role(
+         p_application_id => :APP_ID,
+         p_user_name      => :APP_USER,
+         p_role_static_id => 'MAIN_SIGNER'
+      )
+)
+```
+
+---
+
+# ✅ ЩО ТИ ОТРИМУЄШ БЕЗ ПЕРЕПИСУ ВСЬОГО
+
+✔ Статус **«Розглядає»** — тільки для послідовних
+✔ Паралельні етапи не плутають UX
+✔ «Від імені» не лізе в неактивні етапи
+✔ MAIN_SIGNER працює без ламання старої логіки
+✔ `l_count_cb` більше не шкодить статусам
+
+---
+
+## 🧪 Рекомендація (не обовʼязково, але корисно)
+
+Після впровадження — **один тест-кейс**:
+
+* послідовний → паралельний → послідовний
+* у другому етапі 2 виконавці
+* перевір, що **“Від імені” не зʼявляється в 3-му**
+
+---
+
+Якщо хочеш — наступним кроком:
+
+* зроблю **диф (було/стало)** по рядках
+* або дам **чекліст тестування**
+
+Кажи 👍

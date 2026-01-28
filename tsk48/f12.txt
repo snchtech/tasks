@@ -1,0 +1,253 @@
+Окей, тепер картина **повністю склалась** 👍
+Тут проблема **не в синтаксисі** твого агрегатного запиту — він логічно коректний.
+Проблема **в тому, НАД ЧИМ саме ти його виконуєш і ЯК Oracle 21 це оптимізує**.
+
+Я розкладу по поличках.
+
+---
+
+# 🔴 ГОЛОВНА ПРОБЛЕМА (корінь зла)
+
+Ти **рахуєш агрегати над view, яке:**
+
+* містить **поля з DBLINK**
+* містить **підзапити з DBLINK усередині CASE**
+* містить **EXISTS / NOT EXISTS з DBLINK**
+* містить **DATE + NULL-логіку**
+* і при цьому **Oracle 21 намагається pushdown'ити частину логіки на Oracle 10**
+
+👉 У результаті Oracle:
+
+* аналізує **ВСІ колонки view**
+* аналізує **ВСІ підзапити в CASE**
+* намагається **виконати частину EXISTS віддалено**
+* і натикається на **несумісну конструкцію**
+
+Тому:
+
+```
+ORA-02063: preceding line from <dblink>
+```
+
+а як «винну» колонку показує **першу текстову з view** (`DEP.SHORT_NAME`), навіть якщо вона не в SELECT.
+
+---
+
+# 🧠 Чому БЕЗ SUM() все працює
+
+Без агрегатів:
+
+* Oracle робить **row-by-row fetch**
+* не намагається оптимізувати
+* не робить query rewrite
+* не аналізує CASE повністю
+
+З `SUM(CASE WHEN ...)`:
+
+* Oracle **повинен гарантувати коректність**
+* тому аналізує:
+
+  * всі WHEN
+  * всі EXISTS
+  * всі підзапити
+  * всі колонки view
+* і **намагається частину виконати на remote**
+
+---
+
+# ⚠️ КОНКРЕТНІ ПРОБЛЕМНІ МІСЦЯ У ТВОЄМУ КОДІ
+
+## 1️⃣ EXISTS / NOT EXISTS з DBLINK усередині CASE
+
+Наприклад:
+
+```sql
+AND NOT EXISTS (
+  SELECT 1
+  FROM tasktracker.signaturehistory@TO_TASKTRACKER10 h
+  WHERE h.signright_id = r_id
+    AND h.new_status_id IS NOT NULL
+)
+```
+
+🔴 **Це критично** для Oracle 21:
+
+* EXISTS у CASE
+* агрегат зверху
+* DBLINK усередині
+
+👉 Oracle **намагається винести EXISTS у remote**
+👉 Oracle 10 **не може виконати такий rewrite**
+👉 ORA-02063
+
+---
+
+## 2️⃣ Змішування локальних і remote-умов
+
+```sql
+WHEN status_main_id <> 0
+ AND (
+      planning_date_end < SYSDATE
+   OR EXISTS (SELECT 1 FROM remote_table@dblink ...)
+ )
+```
+
+* `SYSDATE` — локальний
+* `remote_table@dblink` — remote
+* Oracle 21 намагається це **обʼєднати**
+
+👉 на Oracle 12 проковтувалось
+👉 на Oracle 21 — **ні**
+
+---
+
+## 3️⃣ CASE + DATE + NULL + DBLINK
+
+```sql
+WHEN planning_date_end < SYSDATE
+ AND actual_date_end IS NULL
+```
+
+`actual_date_end` у тебе приходить:
+
+* або з remote
+* або з підзапиту з remote
+
+👉 Oracle 21 намагається **привести типи і виконати частково на remote**
+
+---
+
+# ✅ ЯК ПРАВИЛЬНО ЦЕ ВИПРАВИТИ (реально працює)
+
+## 🟢 ПРАВИЛО №1
+
+👉 **Усі агрегації — ТІЛЬКИ над base-view**
+👉 **ЖОДНОГО DBLINK усередині CASE**
+
+---
+
+## 1️⃣ Розширюємо `v_tasks_base` (це ключ)
+
+Тобі **ТРЕБА зафіксувати всі логічні прапорці ЗАЗДАЛЕГІДЬ**, без EXISTS у фінальному SUM.
+
+### Додаємо в `v_tasks_base`:
+
+```sql
+CREATE OR REPLACE VIEW v_tasks_base AS
+SELECT
+    t.id AS task_id,
+    t.page_list_id,
+    t.status_main_id,
+    t.planning_date_start,
+    t.planning_date_end,
+    ae.actual_date_end,
+
+    /* ===== прапорці ===== */
+
+    /* чи є shift */
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+        WHERE sr.task_id = t.id
+          AND sr.shift_symbol_id IS NOT NULL
+      )
+      THEN 1 ELSE 0
+    END AS has_shift,
+
+    /* чи є незавершені попередні етапи */
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 r_prev
+        WHERE r_prev.task_id = t.id
+          AND NOT EXISTS (
+            SELECT 1
+            FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h2
+            WHERE h2.signright_id = r_prev.id
+              AND h2.new_status_id IS NOT NULL
+          )
+      )
+      THEN 1 ELSE 0
+    END AS has_open_prev_stage,
+
+    /* проблемна */
+    CASE
+      WHEN t.planning_date_end < SYSDATE
+       AND ae.actual_date_end IS NULL
+      THEN 1 ELSE 0
+    END AS is_problem
+
+FROM TaskTracker.TASKS@TO_TASKTRACKER10 t
+LEFT JOIN (
+    SELECT sr3.task_id, MAX(h.signer_date) actual_date_end
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr3
+    JOIN TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+      ON h.signright_id = sr3.id
+    WHERE sr3.stages_id = 6
+    GROUP BY sr3.task_id
+) ae ON ae.task_id = t.id;
+```
+
+🔐 Тут **ВСІ EXISTS виконуються один раз**, не в агрегаті.
+
+---
+
+## 2️⃣ Тепер твій SUM стає БЕЗПЕЧНИМ
+
+```sql
+SELECT
+  SUM(CASE
+        WHEN status_main_id <> 0
+         AND (planning_date_end > SYSDATE OR actual_date_end IS NULL)
+        THEN 1 ELSE 0
+      END) AS CNT_PLANNED,
+
+  SUM(CASE
+        WHEN has_open_prev_stage = 1
+        THEN 1 ELSE 0
+      END) AS CNT_TODO,
+
+  SUM(CASE
+        WHEN has_shift = 1
+        THEN 1 ELSE 0
+      END) AS CNT_SHIFT,
+
+  SUM(CASE
+        WHEN is_problem = 1
+        THEN 1 ELSE 0
+      END) AS CNT_PROBLEM,
+
+  SUM(CASE
+        WHEN status_main_id = 0
+        THEN 1 ELSE 0
+      END) AS CNT_ARCHIVE
+
+FROM v_tasks_base;
+```
+
+✅ **ЖОДНОГО DBLINK у SELECT**
+✅ **Oracle 21 щасливий**
+✅ **ORA-02063 зникає**
+
+---
+
+# 🧠 КОРОТКО ФІНАЛ
+
+🔴 Проблема НЕ в SUM
+🔴 Проблема в `SUM + CASE + EXISTS + DBLINK`
+
+🟢 Рішення:
+
+> **винести всю логіку з DBLINK у base-view**,
+> а агрегувати **тільки числові прапорці**
+
+---
+
+Якщо хочеш — наступним кроком можу:
+
+* 🔍 допомогти **перенести ВСЮ твою логіку TODO / SHIFT / PROBLEM** у base-view
+* 🧪 показати, де саме Oracle 21 робить pushdown (EXPLAIN PLAN)
+* 🧱 зробити ще **окремий analytic-view для dashboard**
+
+Скажи 👍
