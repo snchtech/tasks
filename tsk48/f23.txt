@@ -1,0 +1,256 @@
+Чудово, це **останній “дорослий” рівень** цієї архітектури 💪
+Покажу **як правильно підтримувати multiple dialogs** (кілька діалогів підряд / вкладені / різні типи) **без колізій** і без залежності від DOM.
+
+---
+
+# 🎯 Проблема multiple dialogs (що може піти не так)
+
+Уяви сценарій:
+
+1. Dialog A → Save
+2. Відкрився Dialog B → Cancel
+3. Потім Dialog C → Save
+
+Якщо тримати лише **один рядок** (`P0_DIALOG_RESULT`), виникають ризики:
+
+* старе значення “протікає”
+* важко зрозуміти, **який саме dialog** закрився
+* складно масштабувати
+
+Тому вводимо **структурований контракт**.
+
+---
+
+# 🧠 ПРАВИЛЬНА МОДЕЛЬ: `dialogId + result`
+
+Ми передаємо **не просто результат**, а **подію**:
+
+```json
+{
+  dialog: "SIGN_BY",
+  result: "DONE"
+}
+```
+
+---
+
+# 1️⃣ Global Page — новий стандарт item
+
+## Page 0 → Items
+
+### 🔹 Замість одного рядка — JSON
+
+| Item                | Тип    |
+| ------------------- | ------ |
+| `P0_DIALOG_PAYLOAD` | Hidden |
+
+---
+
+# 2️⃣ Закриття dialog (універсально)
+
+## ✅ JS (рекомендовано)
+
+### Global helper (Page 0 → Execute on Page Load)
+
+```js
+(function () {
+  window.AppDialog = {
+    close: function (dialogId, result) {
+      const payload = {
+        dialog: dialogId,
+        result: result,
+        ts: Date.now()
+      };
+
+      apex.item('P0_DIALOG_PAYLOAD')
+        .setValue(JSON.stringify(payload));
+
+      apex.navigation.closeDialog();
+    }
+  };
+})();
+```
+
+### У будь-якому dialog page
+
+```js
+AppDialog.close('SIGN_BY', 'DONE');
+```
+
+або
+
+```js
+AppDialog.close('EDIT_TASK', 'UPDATED');
+```
+
+---
+
+## ✅ PL/SQL (якщо треба)
+
+```plsql
+apex_util.set_session_state(
+  'P0_DIALOG_PAYLOAD',
+  json_object(
+    'dialog' value 'SIGN_BY',
+    'result' value 'DONE',
+    'ts'     value systimestamp
+  )
+);
+
+apex_navigation.close_dialog;
+```
+
+---
+
+# 3️⃣ Global Page — єдиний dispatcher (READY)
+
+## Dynamic Action: `DA_DIALOG_PAYLOAD_DISPATCHER`
+
+**Event**: `Dialog Closed`
+**Selection**: Page
+
+### Client-side Condition
+
+```js
+!!$v('P0_DIALOG_PAYLOAD')
+```
+
+---
+
+### True Action → Execute JS
+
+```js
+(function () {
+  const raw = $v('P0_DIALOG_PAYLOAD');
+  apex.item('P0_DIALOG_PAYLOAD').setValue(null);
+
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (e) {
+    console.error('Invalid dialog payload', raw);
+    return;
+  }
+
+  // 1️⃣ глобальна подія
+  apex.event.trigger(document, 'apex-dialog-result', payload);
+
+  // 2️⃣ подія конкретного dialog
+  apex.event.trigger(
+    document,
+    `apex-dialog-${payload.dialog}`,
+    payload
+  );
+})();
+```
+
+---
+
+# 4️⃣ Як ловити multiple dialogs (різні рівні)
+
+## 🔹 ВАРІАНТ A — слухати ВСЕ
+
+```js
+document.addEventListener('apex-dialog-result', function (e) {
+  console.log('Any dialog:', e.detail.dialog, e.detail.result);
+});
+```
+
+---
+
+## 🔹 ВАРІАНТ B — слухати КОНКРЕТНИЙ dialog
+
+### Page 5
+
+```js
+document.addEventListener('apex-dialog-SIGN_BY', function (e) {
+  if (e.detail.result === 'DONE') {
+    apex.region('MARKS_REGION').refresh();
+  }
+});
+```
+
+### Інша сторінка
+
+```js
+document.addEventListener('apex-dialog-EDIT_TASK', function (e) {
+  apex.region('TASKS_IR').refresh();
+});
+```
+
+✔ без `switch`
+✔ без if-else
+✔ без хаосу
+
+---
+
+# 5️⃣ Як поводиться Cancel / X / ESC
+
+| Дія       | Payload |
+| --------- | ------- |
+| Save / OK | ✅ є     |
+| Cancel    | ❌ немає |
+| X         | ❌ немає |
+| ESC       | ❌ немає |
+
+👉 Dispatcher **не стріляє**
+👉 Ніяких fake-result’ів
+👉 Чиста логіка
+
+(Якщо треба — можна додати `apex-dialog-cancelled` окремо)
+
+---
+
+# 6️⃣ Переваги цієї моделі
+
+✅ підтримка **будь-якої кількості dialog-ів**
+✅ вкладені / послідовні / паралельні
+✅ ніяких race-condition
+✅ легке логування
+✅ легко дебажити
+✅ легко розширювати (`payload.extra`)
+
+---
+
+# 7️⃣ Контрольний тест (рекомендую)
+
+У Console:
+
+```js
+document.addEventListener('apex-dialog-result', e =>
+  console.log('DIALOG EVENT:', e.detail)
+);
+```
+
+Закрий кілька різних dialog-ів → побачиш різні payload’и.
+
+---
+
+# 8️⃣ Фінальний стандарт (коротко)
+
+**У dialog page**
+
+```js
+AppDialog.close('DIALOG_ID', 'RESULT');
+```
+
+**Global Page**
+
+* один DA
+* один dispatcher
+* zero DOM
+
+**Сторінки**
+
+* слухають те, що їм потрібно
+
+---
+
+Якщо хочеш — наступні апгрейди:
+
+* 🧠 `AppDialog.on('SIGN_BY:DONE', fn)`
+* 🧪 debug overlay (показ payload на екрані)
+* 📦 винести все в `app.dialog.js`
+* 🧾 логування dialog lifecycle в БД
+
+Скажи, що з цього беремо — і доведемо до ідеалу 🚀

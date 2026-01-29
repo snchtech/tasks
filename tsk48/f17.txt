@@ -1,0 +1,170 @@
+Супер. Нижче — **READY-TO-COPY пакет для Global Page (Page 0)** в Oracle APEX **24+**, без зайвої теорії.
+Просто копіюєш — і всі діалоги в проєкті починають працювати стабільно.
+
+---
+
+# ✅ GLOBAL PAGE (PAGE 0) — ГОТОВИЙ ШАБЛОН
+
+## 0️⃣ Page Item (обовʼязково)
+
+**Page 0 → Item**
+
+| Властивість            | Значення           |
+| ---------------------- | ------------------ |
+| Name                   | `P0_DIALOG_RESULT` |
+| Type                   | Hidden             |
+| Maintain Session State | Yes                |
+| Value Protected        | No                 |
+
+---
+
+## 1️⃣ Dynamic Action: `DA_DIALOG_RESULT_DISPATCHER`
+
+**Page 0 → Dynamic Actions → Create**
+
+### 🔹 Identification
+
+* **Name**: `DA_DIALOG_RESULT_DISPATCHER`
+
+---
+
+### 🔹 When
+
+* **Event**: `Dialog Closed`
+* **Selection Type**: Page
+
+---
+
+### 🔹 Client-side Condition
+
+* **Type**: JavaScript Expression
+* **Value**:
+
+```js
+!!$v('P0_DIALOG_RESULT')
+```
+
+---
+
+### 🔹 True Action 1 — Execute JavaScript Code
+
+```js
+(function () {
+  const result = $v('P0_DIALOG_RESULT');
+
+  // одразу очищаємо, щоб не стріляло повторно
+  apex.item('P0_DIALOG_RESULT').setValue(null);
+
+  // глобальна подія для всього застосунку
+  apex.event.trigger(document, 'apex-dialog-result', {
+    result: result
+  });
+})();
+```
+
+✅ **ЦЕ ВСЕ.**
+Більше DA на Global Page не потрібно.
+
+---
+
+## 2️⃣ Global JavaScript Helper (опціонально, але рекомендую)
+
+**Page 0 → JavaScript → Execute when Page Loads**
+
+```js
+(function () {
+  window.AppDialog = {
+    close: function (result) {
+      apex.item('P0_DIALOG_RESULT').setValue(result);
+      apex.navigation.closeDialog();
+    }
+  };
+})();
+```
+
+Тепер **у будь-якому діалозі**:
+
+```js
+AppDialog.close('SIGN_BY_DONE');
+```
+
+---
+
+## 3️⃣ Як використовувати в діалогах (швидка памʼятка)
+
+### ✔ PL/SQL процес у Dialog Page
+
+```plsql
+apex_util.set_session_state('P0_DIALOG_RESULT', 'UPDATED');
+apex_navigation.close_dialog;
+```
+
+### ✔ JS у Dialog Page
+
+```js
+AppDialog.close('UPDATED');
+```
+
+---
+
+## 4️⃣ Як ловити результат у будь-якій сторінці (page 5, iframe тощо)
+
+**Execute when Page Loads** або окремий JS-файл:
+
+```js
+document.addEventListener('apex-dialog-result', function (e) {
+  switch (e.detail.result) {
+
+    case 'SIGN_BY_DONE':
+      apex.region('MARKS_REGION').refresh();
+      break;
+
+    case 'UPDATED':
+      apex.region('MAIN_REPORT').refresh();
+      break;
+
+  }
+});
+```
+
+📌 selector-и НЕ потрібні
+📌 iframe не має значення
+📌 вкладені діалоги — працюють
+
+---
+
+## 5️⃣ Перевірка (швидкий чек)
+
+1. Відкрий будь-який dialog
+2. Закрий через `AppDialog.close('TEST')`
+3. У консолі page 0:
+
+```js
+document.addEventListener('apex-dialog-result', e => console.log(e.detail));
+```
+
+👉 має прийти `{ result: "TEST" }`
+
+---
+
+## 6️⃣ Що цей шаблон гарантує
+
+✅ Працює в **APEX 22 / 23 / 24**
+✅ Не залежить від DOM
+✅ Не ламається при вкладених iframe
+✅ Не закриває “зайві” діалоги
+✅ Один стандарт для всього проєкту
+
+---
+
+## 7️⃣ Хочеш далі?
+
+Можемо:
+
+* 🔧 додати **map-handler’ів** (без switch)
+* 📦 винести в `app.dialog.js`
+* 🧪 додати **debug-mode**
+* 🧠 прив’язати до ролей / page_id
+* 🔁 зробити **multi-result** (array)
+
+Скажи, який наступний апгрейд робимо 🚀

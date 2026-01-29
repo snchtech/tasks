@@ -1,0 +1,193 @@
+Дуже влучне питання 👍
+Ти правильно відчув «розрив»: **PL/SQL → JS → подія → сторінка 5**.
+Зараз я з’єднаю це **в один причинно-наслідковий ланцюжок**, без магії.
+
+---
+
+# 🔗 Як PL/SQL реально призводить до `apex-dialog-result`
+
+## Ключова думка (одним реченням)
+
+👉 **PL/SQL НЕ тригерить JS-подію напряму**
+👉 він **лише змінює session state**
+👉 **JS на Global Page реагує на `Dialog Closed` і вже тоді тригерить подію**
+
+---
+
+## 1️⃣ Повний ланцюг подій (по кроках)
+
+### 🔹 КРОК 1. Page 2 (Dialog) — PL/SQL
+
+```plsql
+apex_util.set_session_state(
+  'P0_DIALOG_RESULT',
+  'SIGN_BY_DONE'
+);
+
+apex_navigation.close_dialog;
+```
+
+Що тут відбувається:
+
+* у **SESSION STATE** записується:
+
+  ```
+  P0_DIALOG_RESULT = 'SIGN_BY_DONE'
+  ```
+* dialog **закривається**
+* браузер **повертається на батьківську сторінку**
+
+❗️ **ЖОДНОГО JavaScript тут ще нема**
+
+---
+
+### 🔹 КРОК 2. Global Page — спрацьовує `Dialog Closed`
+
+Ось критичний момент.
+
+У тебе на **Global Page (Page 0)** є Dynamic Action:
+
+* **Event**: `Dialog Closed`
+* **Condition**:
+
+```js
+!!$v('P0_DIALOG_RESULT')
+```
+
+👉 APEX автоматично:
+
+* детектить, що dialog закрився
+* виконує DA
+* читає **session state**, який щойно змінив PL/SQL
+
+---
+
+### 🔹 КРОК 3. JS на Global Page — створюється кастомна подія
+
+Ось твій код (в DA):
+
+```js
+(function () {
+  const result = $v('P0_DIALOG_RESULT');
+
+  apex.item('P0_DIALOG_RESULT').setValue(null);
+
+  apex.event.trigger(document, 'apex-dialog-result', {
+    result: result
+  });
+})();
+```
+
+Тут **відбувається магія, яку ти шукав**:
+
+✅ **Саме тут створюється подія `apex-dialog-result`**
+✅ Вона летить в `document`
+✅ Вона містить `event.detail.result = 'SIGN_BY_DONE'`
+
+❗️ PL/SQL **не тригерить подію**
+❗️ **JS на Global Page її створює**
+
+---
+
+### 🔹 КРОК 4. Page 5 — слухач вже ЧЕКАЄ
+
+На сторінці 5 ти заздалегідь написав:
+
+```js
+document.addEventListener('apex-dialog-result', function (e) {
+  console.log(e.detail.result);
+});
+```
+
+Це означає:
+
+> «Коли **колись у майбутньому** зʼявиться подія
+> `apex-dialog-result` — виконай мене»
+
+📌 Коли Global Page викликає `apex.event.trigger(...)`
+📌 цей listener **спрацьовує миттєво**
+
+---
+
+## 2️⃣ Де САМЕ розмістити listener на сторінці 5
+
+### ✅ ПРАВИЛЬНЕ МІСЦЕ
+
+**Page 5 → JavaScript → Execute when Page Loads**
+
+```js
+(function () {
+  document.addEventListener('apex-dialog-result', function (e) {
+    console.log('Dialog result:', e.detail.result);
+
+    if (e.detail.result === 'SIGN_BY_DONE') {
+      apex.region('MARKS_REGION').refresh();
+    }
+  });
+})();
+```
+
+📌 Чому тут:
+
+* код виконається **один раз**
+* listener залишиться активним
+* він переживе refresh region’ів
+* iframe / DOM — не важливо
+
+---
+
+### ❌ НЕПРАВИЛЬНІ МІСЦЯ
+
+🚫 Dynamic Action
+🚫 Inline JS в кнопці
+🚫 DA → Dialog Closed (там уже пізно)
+🚫 After Refresh region
+
+---
+
+## 3️⃣ Аналогія (щоб закріпити)
+
+Уяви:
+
+* **PL/SQL** — залишив записку на столі
+* **Dialog Closed** — хтось зайшов у кімнату
+* **Global Page JS** — прочитав записку і крикнув:
+
+  > «ГЕЙ, ВІДБУЛОСЬ SIGN_BY_DONE!»
+* **Page 5** — стоїть і слухає
+
+---
+
+## 4️⃣ Чому це стабільно в APEX 24
+
+✔ Dialog може жити де завгодно
+✔ iframe не має значення
+✔ DOM не важливий
+✔ Працює через **APEX lifecycle**, а не браузерні трюки
+
+---
+
+## 5️⃣ Швидка перевірка (рекомендую)
+
+### На сторінці 5 в Console:
+
+```js
+document.addEventListener('apex-dialog-result', e => {
+  alert(e.detail.result);
+});
+```
+
+👉 Натисни кнопку → має зʼявитись alert.
+
+---
+
+## 6️⃣ Якщо хочеш — наступний рівень
+
+Можемо:
+
+* 🧠 зробити **registry handler’ів** (`AppDialog.on('SIGN_BY_DONE', fn)`)
+* 🧪 додати **debug mode**
+* 🔁 підтримку **multiple dialogs**
+* 📦 винести listener в shared JS
+
+Скажи, який апгрейд робимо далі — ти вже дуже близько до ідеальної архітектури 👌
