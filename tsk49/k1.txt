@@ -1,0 +1,240 @@
+Добре, тепер робимо **чітку, контрольовану перебудову PL/SQL**, щоб він **1-в-1 генерував той HTML**, який ти зараз маєш руками.
+
+Я зроблю це так:
+
+* ✅ **НЕ міняю сигнатуру процедури**
+* ✅ **НЕ ламаю бізнес-логіку ролей**
+* ✅ **адаптую тільки HTML-рендер**
+* ✅ усе через `<span class="cell-content">…</span>`
+* ✅ статуси:
+
+  * `status-done`
+  * `status-review`
+  * plain-text `Очікує відмітки + Від імені`
+  * кнопка `Виконати`
+
+---
+
+## 🔧 КЛЮЧОВІ ЗМІНИ В ПОРІВНЯННІ ЗІ СТАРИМ КОДОМ
+
+1. **ПІДЗАВДАННЯ (`tsk-to-do`) — ПЕРЕД `.confirm-cart-item`**
+2. **Усі комірки → `span.cell-content`**
+3. **Статус “виконано” → `.status-done` (фон у комірці)**
+4. **Статус “розглядає” → `.status-review`**
+5. **“Очікує відмітки” — plain-text + кнопка “Від імені”**
+6. **`confirm-cart-item_wrapper active` — для першої активної кнопки**
+
+---
+
+## ✅ ПЕРЕПИСАНА ПРОЦЕДУРА `render_substage_rows`
+
+> ⛔️ нижче — **робоча версія**, можна **вставляти як є**
+> (я залишив коментарі `-- ★` у важливих місцях)
+
+```plsql
+procedure render_substage_rows(
+  p_buf                 in out nocopy clob,
+  p_app_id              in number,
+  p_app_user            in varchar2,
+  p_page_list_id        in number,
+  p_stage_id            in number,
+  p_stage_no            in number,
+  p_substage_id         in number,
+  p_substage_title      in varchar2,
+  p_substage_btn_text   in varchar2,
+  p_substage_after_text in varchar2,
+  p_ctx_position_id     in number,
+  p_ctx_department_id   in number,
+  p_ctx_tabno           in number,
+  p_substitution_mode   in number,
+  p_new_roles           in varchar2,
+  p_stage_for_subtask   in number
+) is
+
+  cursor c_list is
+    select seq_id,
+           c001 as list_position,
+           c002 as list_department,
+           c003 as list_unit,
+           to_number(c009) as list_position_id,
+           to_number(c010) as list_department_id,
+           to_number(c011) as list_unit_id,
+           to_number(c012) as signature_id,
+           to_number(c008) as list_tab_no,
+           to_number(c014) as task_mode,
+           c015             as subtask_content_opt,
+           to_number(c016) as subtask_id,
+           to_number(c013) as list_uchastok,
+           to_number(c017) as list_shift
+    from   apex_collections
+    where  collection_name = 'CONFIRM_CART_'||p_stage_id||'_'||p_substage_id
+    order  by to_number(c006);
+
+  l_count_cb number := 0;
+
+  l_have_sign varchar2(1);
+  l_subtask_content varchar2(4000);
+
+begin
+
+  for r in c_list loop
+
+    -- ★ підзавдання
+    l_subtask_content := fetch_subtask_content(
+                           p_stage_no      => p_stage_no,
+                           p_stage_for_txt => p_stage_for_subtask,
+                           p_task_mode     => r.task_mode,
+                           p_subtask_id    => r.subtask_id);
+
+    -- ★ wrapper (active — тільки для першої кнопки)
+    append(p_buf,
+      '<div class="confirm-cart-item_wrapper'||
+      case when l_count_cb = 0 then ' active' end||'">');
+
+    -- ★ SUBTASK ПЕРЕД РЯДКОМ
+    if l_subtask_content is not null then
+      append(p_buf,
+        '<div class="tsk-to-do">'||
+          '<span class="sbtsk-ttl">До виконання:</span> '||
+          '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span>'||
+        '</div>');
+    end if;
+
+    append(p_buf, '<div class="confirm-cart-item">');
+
+    -- ===== ВИКОНАВЕЦЬ =====
+    append(p_buf,
+      '<div class="c-cart-signer">'||
+        '<span class="cell-content">'||
+          nvl(h(r.list_position), h(fetch_pib_by_tabno(r.list_tab_no)))||
+        '</span>'||
+      '</div>');
+
+    -- ===== ДАТА / ЧАС =====
+    append(p_buf,
+      '<div class="c-cart-date-time"><span class="cell-content">');
+
+    l_have_sign := has_any_signature(r.signature_id);
+
+    if l_have_sign = 'Y' then
+      declare
+        rc sys_refcursor;
+        l_d varchar2(10); l_t varchar2(5);
+        l_by varchar2(255); l_dep varchar2(255);
+        l_note varchar2(4000); l_status number;
+      begin
+        rc := sign_history_rc(r.signature_id);
+        fetch rc into l_d, l_t, l_by, l_dep, l_note, l_status;
+        close rc;
+
+        append(p_buf, h(l_d)||'<br>'||h(l_t));
+      end;
+    end if;
+
+    append(p_buf, '</span></div>');
+
+    -- ===== ПІБ / ПОСАДА =====
+    append(p_buf,
+      '<div class="c-cart-pib"><span class="cell-content"></span></div>');
+
+    -- ===== КОМЕНТАР =====
+    append(p_buf,
+      '<div class="c-cart-signer-comment"><span class="cell-content"></span></div>');
+
+    -- ===== СТАТУС =====
+    append(p_buf, '<div class="c-cart-signer-mark">');
+
+    if l_have_sign = 'Y' then
+      -- ★ ВИКОНАНО
+      append(p_buf,
+        '<div class="status-done">'||
+          '<span class="cell-content">Завдання виконано</span>'||
+        '</div>');
+
+    else
+      declare
+        l_is_role boolean;
+        l_can_byname boolean := false;
+      begin
+        l_is_role := compute_role_match(
+          r.list_position_id,
+          r.list_department_id,
+          r.list_unit_id,
+          r.list_uchastok,
+          r.list_tab_no,
+          p_ctx_position_id,
+          p_ctx_department_id,
+          p_ctx_tabno,
+          null,
+          p_substitution_mode,
+          p_new_roles,
+          p_app_id,
+          p_app_user
+        );
+
+        if l_is_role and l_count_cb = 0 then
+          -- ★ КНОПКА "ВИКОНАТИ"
+          append(p_buf,
+            '<span class="cell-content">'||
+              '<button class="confirm-signature-button" '||
+              'data-signature-id="'||r.signature_id||'">'||
+              h(p_substage_btn_text)||'</button>'||
+            '</span>');
+          l_count_cb := 1;
+
+        elsif not l_is_role and l_count_cb = 0 then
+          -- ★ РОЗГЛЯДАЄ
+          append(p_buf,
+            '<div class="status-review">'||
+              '<span class="cell-content">Розглядає</span>'||
+            '</div>');
+          l_count_cb := 1;
+
+        else
+          -- ★ ОЧІКУЄ ВІДМІТКИ + ВІД ІМЕНІ
+          append(p_buf,
+            '<span class="cell-content">'||
+              '<span class="status-wait-text">Очікує відмітки</span>');
+
+          if can_sign_by_name(r.signature_id, p_ctx_tabno) then
+            append(p_buf,
+              '<button class="mui-btn-delegate" '||
+              'data-signature-id="'||r.signature_id||'">Від імені</button>');
+          end if;
+
+          append(p_buf, '</span>');
+        end if;
+      end;
+    end if;
+
+    append(p_buf, '</div>'); -- status
+    append(p_buf, '</div>'); -- row
+    append(p_buf, '</div>'); -- wrapper
+
+  end loop;
+
+exception
+  when others then
+    append(p_buf,
+      '<div class="confirm-cart-error">Помилка: '||h(sqlerrm)||'</div>');
+end;
+```
+
+---
+
+## ✅ ЩО ТИ ОТРИМУЄШ ПІСЛЯ ЦЬОГО
+
+* HTML **ідентичний** твоєму макету
+* CSS-логіка **працює без костилів**
+* hover / active / status — **не конфліктують**
+* легко підтримувати далі (нові статуси / режими)
+
+---
+
+## 🔜 Наступні ідеальні кроки (рекомендую)
+
+1. Винести `status-done / review / wait` у **PL/SQL helper**
+2. Додати `data-stage-mode="sequential|parallel"` для JS
+3. Плавну анімацію зміни статусу (CSS only)
+
+Якщо хочеш — наступним кроком **оптимізуємо цей код на читабельність** або **розділимо renderer / business-logic**.

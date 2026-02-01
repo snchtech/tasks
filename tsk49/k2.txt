@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body>
+    <style>
+
+.confirm-cart-container {
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 13px;
+}
+
+/* ===== TABLE HEADER ===== */
+.confirm-cart-table-header {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 2fr 2fr 1fr;
+  gap: 8px;
+  padding: 6px 8px;
+
+  font-weight: 600;
+  color: #37474f;
+
+  background: #f5f7fa;              /* ← легкий фон */
+  border: 1px solid #e0e0e0;
+  border-radius: 8px 8px 0 0;        /* ← як у MUI */
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+/* ===== STAGE ===== */
+.cart-stage {
+  margin-bottom: 16px;
+}
+
+.cart-stage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  font-weight: 600;
+  color: #37474f;
+  padding: 6px 0;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+/* ===== CARD ===== */
+.confirm-cart-item_wrapper {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+
+/* ACTIVE ROW */
+.confirm-cart-item_wrapper.active {
+  background: #e3f2fd;
+  border-color: #90caf9;
+}
+
+/* SUBTASK */
+.tsk-to-do {
+  font-size: 12px;
+  color: #555;
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #eee;
+}
+
+.sbtsk-ttl {
+  font-weight: 600;
+  color: #1976d2;
+}
+
+/* ROW GRID */
+.confirm-cart-item {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 2fr 2fr 1fr;
+  align-items: center;
+}
+
+/* VERTICAL DIVIDERS */
+.confirm-cart-item > div:not(:last-child),
+.confirm-cart-table-header > div:not(:last-child) {
+  padding-right: 10px;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.confirm-cart-item > div,
+.confirm-cart-table-header > div {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* divider малюється ТІЛЬКИ якщо є контент */
+.confirm-cart-item > div:not(:last-child) .cell-content:not(:empty)::after,
+.confirm-cart-table-header > div:not(:last-child) .cell-content::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 22px;              /* однакова висота */
+  width: 1px;
+  background: #d0d0d0;
+}
+
+/* CELLS */
+.c-cart-date-time {
+  font-size: 12px;
+  color: #666;
+}
+
+.c-cart-dep {
+  font-size: 11px;
+  color: #777;
+}
+
+/* STATUS */
+.c-cart-signer-mark {
+  text-align: right;
+  font-weight: 600;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.c-cart-signer-mark.success {
+  color: #2e7d32;
+}
+
+.c-cart-signer-mark.pending {
+  color: #ef6c00;
+}
+
+.c-cart-signer-mark.wait {
+  color: #757575;
+}
+
+/* BUTTON */
+.confirm-signature-button {
+  padding: 4px 10px;
+  border-radius: 16px;
+  border: none;
+  background: #1976d2;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cart-stage:first-child .confirm-cart-item_wrapper:first-of-type {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* ===== MUI STYLE CHIPS / BUTTONS ===== */
+
+/* Виконано (chip) */
+.mui-chip-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #fff8e1;           /* світло-жовтий */
+  color: #f9a825;
+  border: 1px solid #f9a825;
+  cursor: default;
+  transition: all .2s ease;
+}
+
+.mui-chip-done::before {
+  content: "✓";
+  font-weight: 700;
+}
+
+/* hover → зелений */
+.mui-chip-done:hover {
+  background: #2e7d32;
+  border-color: #2e7d32;
+  color: #fff;
+}
+
+.mui-chip-done:hover::before {
+  color: #fff;
+}
+
+
+/* Очікує відмітки */
+.mui-chip-wait {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #f5f5f5;
+  color: #616161;
+  border: 1px solid #cfcfcf;
+}
+
+/* Кнопка "Від імені" */
+.mui-btn-delegate {
+  margin-left: 6px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+
+  background: linear-gradient(180deg,#1976d2,#1565c0);
+  color: #fff;
+  transition: all .2s ease;
+}
+
+.mui-btn-delegate:hover {
+  background: linear-gradient(180deg,#0d47a1,#0b3c91);
+}
+
+/* Кнопка "Виконати" */
+.confirm-signature-button {
+  padding: 6px 18px;
+  border-radius: 18px;
+  border: none;
+
+  background: #ffeb3b;          /* жовта */
+  color: #000;                  /* чорний текст */
+  font-size: 13px;
+  font-weight: 700;
+
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+
+  cursor: pointer;
+  transition: all .2s ease;
+}
+
+/* іконка OK */
+.confirm-signature-button::before {
+  content: "✓";
+  font-weight: 800;
+}
+
+/* hover → зелена */
+.confirm-signature-button:hover {
+  background: #2e7d32;
+  color: #fff;
+}
+
+.confirm-signature-button:hover::before {
+  color: #fff;
+}
+
+/* ===== STATUS CELL BACKGROUND ===== */
+.c-cart-signer-mark.status-done {
+  background: #e8f5e9;          /* світло-салатовий */
+  color: #1b5e20;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 6px 8px;
+  height: 100%;
+}
+
+/* Plain text status */
+.status-wait-text {
+  color: #616161;
+  font-weight: 600;
+  margin-right: 8px;
+  height: 100%;
+}
+
+/* Кнопка "Від імені" — лишаємо */
+.mui-btn-delegate {
+  padding: 5px 14px;
+  border-radius: 18px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* STATUS: Розглядає */
+.c-cart-signer-mark.status-review {
+  background: #fff3e0;          /* світло-помаранчевий */
+  color: #000;
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 6px 8px;
+  height: 100%;
+}
+
+.cart-stage-mode {
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.cart-stage-mode.parallel {
+  color: #1565c0;
+}
+
+.cart-stage-mode.parallel::after {
+  content: "⤮";
+}
+
+.cart-stage-mode.sequential {
+  color: #455a64;
+}
+
+.cart-stage-mode.sequential::after {
+  content: "→";
+}
+
+/* ===== STAGE BACKGROUND ===== */
+.cart-stage {
+  padding: 8px;
+  border-radius: 10px;
+  background: #fafafa;
+  border-left: 4px solid #cfd8dc; /* базова сіра */
+}
+
+/* Відступ між етапами */
+.cart-stage + .cart-stage {
+  margin-top: 18px;
+}
+
+/* Індивідуальні кольори (опціонально) */
+.cart-stage.stage-1 {
+  border-left-color: #64b5f6;   /* синій */
+}
+
+.cart-stage.stage-2 {
+  border-left-color: #ffb74d;   /* помаранчевий */
+}
+
+.cart-stage.stage-3 {
+  border-left-color: #81c784;   /* зелений */
+}
+
+.confirm-cart-item_wrapper {
+  transition: background-color .15s ease,
+              box-shadow .15s ease,
+              border-color .15s ease;
+}
+
+.confirm-cart-item_wrapper:hover {
+  background: #fffdf7;        /* дуже світлий теплий */
+  border-color: #f0e6c8;
+  box-shadow: 0 2px 6px rgba(0,0,0,.06);
+}
+
+.confirm-cart-item_wrapper.active:hover {
+  background: #e3f2fd;      /* лишається активний */
+  border-color: #90caf9;
+  box-shadow: none;
+}
+
+
+    </style>
+<div class="confirm-cart-container">
+
+  <!-- ===== HEADER TABLE ===== -->
+  <div class="confirm-cart-table-header">
+    <div><span class="cell-content">Виконавець</span></div>
+    <div><span class="cell-content">Дата і час</span></div>
+    <div><span class="cell-content">ПІБ та посада</span></div>
+    <div><span class="cell-content">Коментар</span></div>
+    <div><span class="cell-content">Статус</span></div>
+  </div>
+
+  <!-- ================== ЕТАП 1 ================== -->
+  <div class="cart-stage stage-1">
+    <div class="cart-stage-header">
+      Етап 1 — Видача завдання
+          <div class="cart-stage-mode sequential">
+  Послідовно
+</div>
+    </div>
+
+
+    <div class="confirm-cart-item_wrapper">
+      <div class="tsk-to-do">
+        <span class="sbtsk-ttl">До виконання:</span>
+        <span class="sbtsk-txt">Ознайомитись із завданням</span>
+      </div>
+
+      <div class="confirm-cart-item">
+        <div class="c-cart-signer">
+          <span class="cell-content">Іваненко І.І.</span>
+        </div>
+
+        <div class="c-cart-date-time">
+          <span class="cell-content">29.01.2026<br>21:08</span>
+        </div>
+
+        <div class="c-cart-pib">
+          <span class="cell-content">
+            Начальник цеху<br>
+            <span class="c-cart-dep">(Цех №2)</span>
+          </span>
+        </div>
+
+        <div class="c-cart-signer-comment">
+          <span class="cell-content">Без зауважень</span>
+        </div>
+
+      <div class="c-cart-signer-mark status-done">
+  <span class="cell-content">Завдання виконано</span>
+</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================== ЕТАП 2 ================== -->
+  <div class="cart-stage stage-2">
+    <div class="cart-stage-header">
+      Етап 2 — Виконання завдання
+          <div class="cart-stage-mode parallel">
+  Послідовно
+</div>
+    </div>
+
+
+
+    <!-- АКТИВНИЙ -->
+    <div class="confirm-cart-item_wrapper active">
+      <div class="tsk-to-do">
+        <span class="sbtsk-ttl">До виконання:</span>
+        <span class="sbtsk-txt">Виконати перевірку та внести дані</span>
+      </div>
+
+      <div class="confirm-cart-item">
+        <div class="c-cart-signer">
+          <span class="cell-content">Петров П.П.</span>
+        </div>
+
+        <div class="c-cart-date-time">
+          <span class="cell-content"></span>
+        </div>
+
+        <div class="c-cart-pib">
+          <span class="cell-content"></span>
+        </div>
+
+        <div class="c-cart-signer-comment">
+          <span class="cell-content"></span>
+        </div>
+
+        <div class="c-cart-signer-mark pending">
+          <span class="cell-content">
+            <button class="confirm-signature-button">Виконати</button>
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ВИКОНАВЕЦЬ 2 -->
+    <div class="confirm-cart-item_wrapper">
+       <div class="tsk-to-do">
+        <span class="sbtsk-ttl">До виконання:</span>
+        <span class="sbtsk-txt">Виконати перевірку та внести дані</span>
+      </div>
+  <div class="confirm-cart-item">
+
+    <div class="c-cart-signer">
+      <span class="cell-content">Сидоренко С.С.</span>
+    </div>
+
+    <div class="c-cart-date-time">
+      <span class="cell-content"></span>
+    </div>
+
+    <div class="c-cart-pib">
+      <span class="cell-content"></span>
+    </div>
+
+    <div class="c-cart-signer-comment">
+      <span class="cell-content"></span>
+    </div>
+
+    <div class="c-cart-signer-mark">
+      <span class="cell-content">
+        <span class="status-wait-text">Очікує відмітки</span>
+        <button class="mui-btn-delegate">Від імені</button>
+      </span>
+    </div>
+
+  </div>
+</div>
+
+    <!-- ВИКОНАВЕЦЬ 3 -->
+    <div class="confirm-cart-item_wrapper">
+      <div class="confirm-cart-item">
+        <div class="c-cart-signer">
+          <span class="cell-content">Коваленко О.О.</span>
+        </div>
+        <div class="c-cart-date-time"><span class="cell-content"></span></div>
+        <div class="c-cart-pib"><span class="cell-content"></span></div>
+        <div class="c-cart-signer-comment"><span class="cell-content"></span></div>
+        <div class="c-cart-signer-mark status-review">
+        <span class="cell-content">Розглядає</span>
+      </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================== ЕТАП 3 ================== -->
+  <div class="cart-stage stage-3">
+    <div class="cart-stage-header">
+      Етап 3 — Завершення завдання
+      <div class="cart-stage-mode sequential">
+    Послідовно
+  </div>
+    </div>
+    
+
+    <div class="confirm-cart-item_wrapper">
+      <div class="confirm-cart-item">
+        <div class="c-cart-signer">
+          <span class="cell-content">Мельник М.М.</span>
+        </div>
+        <div class="c-cart-date-time"><span class="cell-content"></span></div>
+        <div class="c-cart-pib"><span class="cell-content"></span></div>
+        <div class="c-cart-signer-comment"><span class="cell-content"></span></div>
+        <div class="c-cart-signer-mark wait">
+          <span class="cell-content">Очікує завершення</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
