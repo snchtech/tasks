@@ -1,0 +1,154 @@
+Проблема тут логічна: зараз `GET_SR_STATUS_F` просто бере “статус етапу” з довідника по `sr.stages_id`. Для `stages_id = 6` він завжди повертає `14`, тому **перший же підпис у цьому етапі** одразу ставить “завершено/архів”, навіть якщо в цьому ж етапі лишилися інші `SIGNATURERIGHTS`.
+
+Тобто статус `14` має бути **умовним**: тільки якщо підпис — **останній** у (фінальному) етапі. Інакше — статус “очікує інших підписів” (може бути ваш `15`).
+
+---
+
+## Де найкраще це визначати
+
+Так, **під час встановлення відмітки** (тобто перед вставкою в `SIGNATUREHISTORY`) — це найправильніший момент, бо саме тоді ви знаєте:
+
+* який етап (`stages_id / stage`);
+* скільки всього рядків `SR` у цьому етапі;
+* скільки вже підписано.
+
+Технічно це можна зробити або:
+
+1. у вашій функції `GET_SR_STATUS_F` (мінімальні зміни у коді APEX/PLSQL), або
+2. у тригері `BEFORE INSERT` на `SIGNATUREHISTORY` (найстабільніше, бо важче “обійти” логіку).
+
+Ви просили “можливо тут діставати статус або в функції” — покажу варіант **через функцію** (як ви і плануєте).
+
+---
+
+## Мінімальне рішення: робимо `14` тільки для останнього підпису в етапі
+
+### 1) Додаємо статус 15 (якщо його ще нема)
+
+Ідея: `15 = Очікує інших підписів (в етапі)`. Головне — щоб він **не мав main_status = 0** (не архівував).
+
+### 2) Переписуємо функцію: якщо базовий статус = 14 → перевіряємо “чи останній я в етапі”
+
+Нижче я виходжу з вашого прикладу, що “stage 6” — це **`DICT_APP_CONFIRM_LIST.ID = 6`**, який дає `STATUS_ID = 14`.
+Також я зробив групування по **номеру етапу `DICT.stage`**, щоб рішення працювало навіть якщо колись у межах одного етапу буде кілька різних `DICT.ID`.
+
+> Якщо `SIGNATUREHISTORY` теж на віддаленій БД, просто додайте `@TO_TASKTRACKER10` у запитах до `SIGNATUREHISTORY`.
+
+```sql
+CREATE OR REPLACE FUNCTION get_sr_status_f (p_sr_id IN NUMBER)
+  RETURN NUMBER
+AS
+  l_task_id     NUMBER;
+  l_subtask_id  NUMBER;
+  l_stage_no    NUMBER;
+  l_base_status NUMBER;
+
+  l_total_in_stage   NUMBER;
+  l_signed_others    NUMBER;
+
+  l_wait_status_id   CONSTANT NUMBER := 15; -- "очікує інших підписів"
+BEGIN
+  /* 1) Базові дані по SR + довіднику */
+  SELECT sr.task_id,
+         sr.subtask_id,
+         d.stage,
+         d.status_id
+    INTO l_task_id,
+         l_subtask_id,
+         l_stage_no,
+         l_base_status
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+    JOIN TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+      ON d.id = sr.stages_id
+   WHERE sr.id = p_sr_id;
+
+  IF l_base_status IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  /* 2) Якщо це НЕ фінальний статус - повертаємо як є */
+  IF l_base_status <> 14 THEN
+    RETURN l_base_status;
+  END IF;
+
+  /* 3) Порахуємо скільки всього SR в цьому етапі (по stage_no) */
+  SELECT COUNT(*)
+    INTO l_total_in_stage
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr2
+    JOIN TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d2
+      ON d2.id = sr2.stages_id
+   WHERE sr2.task_id = l_task_id
+     AND NVL(sr2.subtask_id, -1) = NVL(l_subtask_id, -1)
+     AND d2.stage = l_stage_no;
+
+  /* 4) Скільки ІНШИХ SR в цьому етапі вже мають підпис (є запис у SIGNATUREHISTORY) */
+  SELECT COUNT(*)
+    INTO l_signed_others
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr2
+    JOIN TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d2
+      ON d2.id = sr2.stages_id
+   WHERE sr2.task_id = l_task_id
+     AND NVL(sr2.subtask_id, -1) = NVL(l_subtask_id, -1)
+     AND d2.stage = l_stage_no
+     AND sr2.id <> p_sr_id
+     AND EXISTS (
+           SELECT 1
+             FROM signaturehistory sh
+            WHERE sh.signright_id = sr2.id
+         );
+
+  /* 5) Якщо всі інші вже підписані -> я останній -> можна 14. Інакше 15. */
+  IF l_signed_others = l_total_in_stage - 1 THEN
+    RETURN 14;
+  ELSE
+    RETURN l_wait_status_id;
+  END IF;
+
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END get_sr_status_f;
+/
+```
+
+### Як це працює на ваших кейсах
+
+* **В етапі один SR**: `total=1`, `signed_others=0`, `0 = 1-1` ✅ → поверне `14`.
+* **В етапі два SR**:
+
+  * перший підпис: `total=2`, `signed_others=0`, `0 = 1` ❌ → поверне `15`.
+  * другий підпис: до нього вже є `SIGNATUREHISTORY` по першому → `signed_others=1`, `1 = 1` ✅ → поверне `14`.
+
+---
+
+## Як “краще” з точки зору архітектури (щоб не хардкодити 14/15)
+
+Найчистіше — не вшивати “14 означає фінал” в код, а зробити це конфігом:
+
+**Варіант A (швидкий):** додати в `DICT_APP_CONFIRM_LIST` колонку, напр.
+
+* `STATUS_ID_LAST` (для останнього підпису в етапі)
+* `STATUS_ID_NOT_LAST` (для проміжних)
+
+І для `ID=6` поставити:
+
+* `STATUS_ID_LAST = 14`
+* `STATUS_ID_NOT_LAST = 15`
+
+Тоді функція буде універсальна і не знатиме про “14”.
+
+**Варіант B (ще краще):** у `MAIN_STATUS` (або окремій таблиці) мати прапор:
+
+* `IS_ARCHIVE = 1/0` або `IS_FINAL = 1/0`
+  і застосовувати “перевірку останнього” для всіх статусів з `IS_FINAL=1`.
+
+---
+
+## Додатково (дуже бажано)
+
+1. Індекс на `SIGNATUREHISTORY(SIGNRIGHT_ID)` — щоб `EXISTS` працював швидко.
+2. Якщо підпис може ставитись **паралельно двома людьми** майже одночасно, можливий race-condition. Найнадійніше тоді винести логіку в тригер і (за потреби) робити блокування “за task_id” (але часто це не потрібно, якщо підписання не відбувається одночасно).
+
+---
+
+Якщо покажеш шматок PL/SQL, де саме ти робиш `INSERT INTO signaturehistory (...) new_status_id := ...`, я одразу вставлю туди готовий фрагмент (і підкажу, чи краще робити `GET_SR_STATUS_F(:SR_ID)` **до** інсерту чи вже в `BEFORE INSERT` тригері).
