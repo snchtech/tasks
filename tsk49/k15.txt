@@ -1,0 +1,200 @@
+Ок, логіка зрозуміла: **режим “Зміна”** у тебе зараз визначається через `shift_id` (і те, що “звичайні” поля `position_id/unit_id/tab_no` порожні). Тому **shift_unit_id** і **shift_position_id** треба тримати **в окремих колонках**, і враховувати їх **тільки** в гілці “зміна”.
+
+---
+
+## 1) Чи “нормально” писати shift_department_id в department_id?
+
+Так, **це нормально**, якщо ти трактуєш `DEPARTMENT_ID` як “цільовий департамент виконавця/прав” **для будь-якого режиму**, а режим розрізняєш за наявністю `SHIFT_ID` (і/або іншими полями).
+
+Але важливий нюанс:
+
+* Якщо ти **запишеш shift_position_id у POSITION_ID**, то твоя “зміна” перестане попадати в цей кейс:
+
+```plsql
+if p_list_position_id is null
+and p_list_department_id is not null
+and p_list_unit_id is null
+and p_list_tab_no is null
+and p_list_shift_id is not null
+```
+
+Тому для “зміни” **правильно** мати **окремі** колонки:
+
+* `SHIFT_UNIT_ID`
+* `SHIFT_POSITION_ID`
+  (і якщо хочеш чистоту моделі — можна мати і `SHIFT_DEPARTMENT_ID`, але це вже не обов’язково, якщо `DEPARTMENT_ID` уніфікований)
+
+---
+
+## 2) Що саме доробити в compute_role_match
+
+### Варіант без зміни твоєї архітектури
+
+Додаємо 2 нові параметри: `p_list_shift_unit_id`, `p_list_shift_position_id`
+і в “shift-only” гілці робимо додаткові перевірки **лише якщо вони задані**.
+
+Нижче — **акуратно переписаний** фрагмент (з виправленням дрібних помилок типу `return` в `has_unit_role`, `:=` замість `=`, декларацій boolean і т.д.)
+
+```plsql
+function compute_role_match(
+  p_list_position_id      in number,
+  p_list_department_id    in number,
+  p_list_unit_id          in number,
+  p_list_uchastok         in number,
+  p_list_tab_no           in number,
+
+  -- NEW: поля для вкладки "Зміна"
+  p_list_shift_unit_id    in number,
+  p_list_shift_position_id in number,
+
+  p_ctx_position_id       in number,
+  p_ctx_department_id     in number,
+  p_ctx_tabno             in number,
+  p_ctx_uchastok          in number,
+  p_substitution_mode     in number,
+  p_new_roles             in varchar2,
+  p_app_id                in number,
+  p_app_user              in varchar2,
+  p_list_shift_id         in number,
+  p_ctx_shift             in number
+) return boolean
+is
+  l_is_position   boolean := true;
+  l_is_department boolean := true;
+  l_is_unit       boolean := true;
+  l_is_uchastok   boolean := true;
+  l_is_tabno      boolean := true;
+  l_is_shift      boolean := true;
+
+  l_is_shift_unit boolean := true;
+  l_is_shift_pos  boolean := true;
+
+  function has_unit_role(p_unit_id number) return boolean is
+  begin
+    if p_unit_id is null then
+      return true;
+    end if;
+
+    if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles, '~'), 'U_' || p_unit_id) > 0;
+    else
+      return apex_acl.has_user_role(p_app_id, p_app_user, 'U_' || p_unit_id);
+    end if;
+  end has_unit_role;
+
+begin
+  /* ===== Case 1: заданий тільки табельний ===== */
+  if     p_list_position_id   is null
+     and p_list_department_id is null
+     and p_list_unit_id       is null
+     and p_list_shift_id      is null
+     and p_list_tab_no        is not null
+  then
+    l_is_tabno := (p_list_tab_no = p_ctx_tabno);
+    return l_is_tabno;
+  end if;
+
+  /* ===== Case 2: режим "Зміна" =====
+     Твій маркер режиму: shift_id є, а звичайні поля порожні (tab/position/unit).
+     department_id тут може бути "цільовим департаментом" — лишаємо як є.
+  */
+  if     p_list_position_id   is null
+     and p_list_department_id is not null
+     and p_list_unit_id       is null
+     and p_list_tab_no        is null
+     and p_list_shift_id      is not null
+  then
+    l_is_shift := (p_list_shift_id = p_ctx_shift);
+
+    -- якщо вказали shift_position_id — перевіряємо позицію
+    if p_list_shift_position_id is not null then
+      l_is_shift_pos := (p_list_shift_position_id = p_ctx_position_id);
+    end if;
+
+    -- якщо вказали shift_unit_id — перевіряємо unit (через роль U_<id>, як у тебе всюди)
+    if p_list_shift_unit_id is not null then
+      l_is_shift_unit := has_unit_role(p_list_shift_unit_id);
+    end if;
+
+    -- якщо department_id заданий (він тут завжди not null), і ти хочеш щоб департамент теж звірявся:
+    l_is_department := (p_list_department_id = p_ctx_department_id);
+
+    return (l_is_shift and l_is_department and l_is_shift_pos and l_is_shift_unit);
+  end if;
+
+  /* ===== Case 3: звичайний режим (посада/департамент/unit/участок) ===== */
+  if p_list_position_id is not null then
+    l_is_position := (p_list_position_id = p_ctx_position_id);
+  end if;
+
+  if p_list_department_id is not null then
+    l_is_department := (p_list_department_id = p_ctx_department_id);
+  end if;
+
+  if p_list_unit_id is not null then
+    l_is_unit := has_unit_role(p_list_unit_id);
+  end if;
+
+  if p_list_uchastok is not null then
+    l_is_uchastok := (p_list_uchastok = p_ctx_uchastok);
+  end if;
+
+  return (l_is_position and l_is_department and l_is_unit and l_is_uchastok);
+end compute_role_match;
+```
+
+---
+
+## 3) Вставка в SIGNATURERIGHTS: що робити з полями
+
+Твій поточний код:
+
+```plsql
+IF sr_shift_symbol_id IS NOT NULL THEN
+  l_department_id := l_sr_shift_department_id;
+END IF;
+```
+
+✅ лишай — це ок.
+
+Додай ще:
+
+```plsql
+IF sr_shift_symbol_id IS NOT NULL THEN
+  l_shift_unit_id     := :PXX_SHIFT_UNIT_ID;     -- якщо заповнили
+  l_shift_position_id := :PXX_SHIFT_POSITION_ID; -- якщо заповнили
+END IF;
+```
+
+і пиши їх у **окремі** колонки `SHIFT_UNIT_ID`, `SHIFT_POSITION_ID`.
+
+DDL якщо треба:
+
+```sql
+alter table signaturerights add shift_unit_id number;
+alter table signaturerights add shift_position_id number;
+```
+
+---
+
+## 4) Маленький баг у твоєму HTML кнопки “Від імені”
+
+У тебе зараз атрибут без закриваючих лапок. Має бути так:
+
+```plsql
+append(
+  p_buf,
+  '<button type="button" class="byname-signature-button" data-signature-id="' ||
+  l_signature_id || '">Від імені</button>'
+);
+```
+
+---
+
+### Підсумок
+
+* `DEPARTMENT_ID` можна і далі використовувати як універсальний департамент (це ок).
+* `SHIFT_UNIT_ID` і `SHIFT_POSITION_ID` **не можна** зливати в `UNIT_ID / POSITION_ID`, бо зламаєш визначення режиму “зміна”.
+* У compute_role_match додаєш 2 параметри й робиш додаткові перевірки **лише в shift-гілці**.
+
+Якщо хочеш — можу одразу показати, як виглядатиме виклик `compute_role_match(...)` у твоєму PL/SQL-рендері (де ти зараз береш значення з рядка `signaturerights`).

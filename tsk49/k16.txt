@@ -1,0 +1,127 @@
+Ок — показую **як саме викликати `compute_role_match(...)`** у твоєму PL/SQL рендері (dynamic content), коли ти проходишся по рядках `SIGNATURERIGHTS` і вирішуєш: **це “мій” рядок чи ні**, і чи показувати кнопку **“Від імені”**.
+
+Нижче приклад максимально “вставив і адаптував” — з урахуванням нових колонок `SHIFT_UNIT_ID`, `SHIFT_POSITION_ID`.
+
+---
+
+## 1) Приклад циклу по SIGNATURERIGHTS + виклик compute_role_match
+
+```plsql
+declare
+  -- контекст поточного користувача (звідки береш — item-и global page або join до USERS)
+  l_ctx_position_id   number := :P0_POSITION_ID;
+  l_ctx_department_id number := :P0_DEPARTMENT_ID;
+  l_ctx_tabno         number := :P0_TABNO;
+  l_ctx_uchastok      number := :P0_UCHASTOK;
+  l_ctx_shift         number := :P0_SHIFT_ID; -- або твоя функція визначення поточної зміни
+
+  -- substitution
+  l_substitution_mode number := nvl(:P0_SUBSTITUTION_MODE, 0);
+  l_new_roles         varchar2(4000) := :P0_NEW_ROLES;
+
+  -- службові
+  l_is_role           boolean;
+  l_signature_id      number;
+
+begin
+  for sr in (
+    select
+      sr.id                as signature_id,
+      sr.position_id,
+      sr.department_id,
+      sr.unit_id,
+      sr.uchastok,
+      sr.tab_no,
+      sr.shift_id,
+
+      -- NEW:
+      sr.shift_unit_id,
+      sr.shift_position_id
+
+    from TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+    where sr.task_id = :P6_TASK_ID
+    order by sr.stages_id, sr.order_no
+  )
+  loop
+    l_signature_id := sr.signature_id;
+
+    l_is_role := compute_role_match(
+      /* list (із SR) */
+      p_list_position_id        => sr.position_id,
+      p_list_department_id      => sr.department_id,
+      p_list_unit_id            => sr.unit_id,
+      p_list_uchastok           => sr.uchastok,
+      p_list_tab_no             => sr.tab_no,
+
+      /* NEW: shift fields (із SR) */
+      p_list_shift_unit_id      => sr.shift_unit_id,
+      p_list_shift_position_id  => sr.shift_position_id,
+
+      /* ctx (поточний користувач) */
+      p_ctx_position_id         => l_ctx_position_id,
+      p_ctx_department_id       => l_ctx_department_id,
+      p_ctx_tabno               => l_ctx_tabno,
+      p_ctx_uchastok            => l_ctx_uchastok,
+
+      /* substitution */
+      p_substitution_mode       => l_substitution_mode,
+      p_new_roles               => l_new_roles,
+      p_app_id                  => :APP_ID,
+      p_app_user                => :APP_USER,
+
+      /* shift compare */
+      p_list_shift_id           => sr.shift_id,
+      p_ctx_shift               => l_ctx_shift
+    );
+
+    -- Далі твоя логіка рендеру рядка...
+    -- Напр., показати кнопку "Від імені" лише якщо це НЕ мій рядок:
+    if p_is_active_stage
+       and l_can_byname
+       and (l_parallel or l_is_first_active_row)
+       and not l_is_role
+    then
+      append(
+        p_buf,
+        '<button type="button" class="byname-signature-button" data-signature-id="' ||
+        l_signature_id || '">Від імені</button>'
+      );
+    end if;
+
+  end loop;
+end;
+```
+
+> ⚠️ Важливо: я **поправив лапки** в `data-signature-id="..."`, бо в тебе було без закриття.
+
+---
+
+## 2) Що обов’язково має бути в SELECT
+
+Щоб виклик працював, у курсорі/запиті мусить бути:
+
+* `sr.shift_id`
+* `sr.shift_unit_id`
+* `sr.shift_position_id`
+
+Якщо колонок ще нема — треба їх створити в таблиці, і заповнювати при вставці SR для вкладки “Зміна”.
+
+---
+
+## 3) Мінімальна вставка SR для “Зміна” (і куди писати department)
+
+Ти можеш лишати “shift department” в **`department_id`** (це ок), а нові поля писати окремо:
+
+```plsql
+if sr_shift_symbol_id is not null then
+  l_department_id      := l_sr_shift_department_id;  -- як і було
+  l_shift_id           := sr_shift_symbol_id;
+
+  l_shift_unit_id      := :PXX_SHIFT_UNIT_ID;        -- optional
+  l_shift_position_id  := :PXX_SHIFT_POSITION_ID;    -- optional
+end if;
+```
+
+---
+
+Якщо скинеш твій реальний фрагмент “рендеру рядка” (де формується `l_is_role`, `l_can_byname`, `l_parallel`, `l_is_first_active_row`) — я вставлю цей виклик **прямо в твою структуру** без зайвих змін.
