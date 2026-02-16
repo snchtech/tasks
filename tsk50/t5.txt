@@ -1,0 +1,140 @@
+Зрозуміло. У картці відміток у тебе **ключове місце**, де тягнеться “посада/цех” для виводу “Виконано / Зафіксовано” — це `sign_history_rc`. Тому:
+
+1. **Переробляємо `sign_history_rc`**: підчіпляємо `SIGNHISTORY_USER_SNAPSHOT` по `sh.id` і через `COALESCE(...)` робимо fallback на старі дані (`Personal + ps.name + p.tseh_short`) якщо snapshot ще відсутній (для історичних записів до впровадження таблиці).
+
+2. **Щоб у лівій колонці (коли SR має лише табельний)** показувались саме історичні дані — просто **фетчимо `sign_history_rc` один раз ДО формування лівої колонки** і використовуємо `l_by/l_posada/l_dep` замість `fetch_executor_by_tabno`, якщо підпис уже є.
+
+Нижче — точні фрагменти.
+
+---
+
+## 1) Переробка `sign_history_rc` (історична посада/департамент + fallback)
+
+> Головне: додай `sh.id` у join через `shs.signhist_id = sh.id` і заміни поля `posada/depart` на `COALESCE(...)`.
+
+```plsql
+function sign_history_rc(p_signright_id in number) return sys_refcursor is
+  rc sys_refcursor;
+begin
+  open rc for
+    select
+      to_char(sh.signer_date, 'dd.mm.yyyy') as sdatev,
+      to_char(sh.signer_date, 'hh24:mi')    as stimev,
+
+      p.familia || ' ' || substr(p.imya,1,1) || '. ' || substr(p.otchestvo,1,1) || '.' as signer_by,
+
+      /* ✅ ІСТОРИЧНА посада (якщо є snapshot), інакше як було */
+      coalesce(pos_hist.name, ps.name) as posada,
+
+      /* ✅ ІСТОРИЧНИЙ департамент (якщо є snapshot), інакше як було */
+      coalesce(dep_hist.short_name, p.tseh_short) as depart,
+
+      sh.note,
+      sh.new_status_id,
+
+      -- для mark_by_chief
+      chief.familia || ' ' || substr(chief.imya,1,1) || '. ' || substr(chief.otchestvo,1,1) || '.' as chief_pib,
+      chief_ps.name as chief_posada,
+      chief.tseh_short as chief_depart
+
+    from TaskTracker.signaturehistory@TO_TASKTRACKER10 sh
+
+    left join TaskTracker.signaturerights@TO_TASKTRACKER10 sr
+      on sr.id = sh.signright_id
+
+    left join kbs.personal@TO_TASKTRACKER10 p
+      on p.tab_no = sh.signer_by
+     and p.priznak is null
+
+    /* ✅ snapshot (може бути NULL для старих записів) */
+    left join TaskTracker.SIGNHISTORY_USER_SNAPSHOT@TO_TASKTRACKER10 shs
+      on shs.signhist_id = sh.id
+
+    /* ✅ розшифровки історичних ID */
+    left join KBS.SPR_DOLZNOST_V@TO_TASKTRACKER10 pos_hist
+      on pos_hist.kod = shs.position_id
+
+    left join kbs.spr_department@TO_TASKTRACKER10 dep_hist
+      on dep_hist.id = shs.department_id
+
+    /* старе (fallback) */
+    left join KBS.SPR_DOLZNOST_V@TO_TASKTRACKER10 ps
+      on ps.kod = p.dolznost
+
+    /* mark_by_chief */
+    left join kbs.personal@TO_TASKTRACKER10 chief
+      on chief.tab_no = sh.mark_by_chief
+     and chief.priznak is null
+
+    left join KBS.SPR_DOLZNOST_V@TO_TASKTRACKER10 chief_ps
+      on chief_ps.kod = sh.chief_position
+
+    where sh.signright_id = p_signright_id
+    order by sh.sdate desc, sh.id desc; -- ✅ щоб FETCH брав останній підпис
+
+  return rc;
+end;
+```
+
+✅ Результат: для старих записів `shs` буде NULL → `coalesce(...)` поверне як і раніше `ps.name` та `p.tseh_short`.
+
+---
+
+## 2) Картка: щоб і в лівій колонці були історичні дані (коли SR = табельний)
+
+Зараз у тебе “табельний без позиції/департаменту” тягне `fetch_executor_by_tabno(...)` → це *поточні* дані з `Personal`.
+
+Щоб було **історично**:
+
+* **порахуй `l_have_sign`** і **витягни `sign_history_rc` один раз ДО лівої колонки**,
+* у гілці `elsif l_list_tab_no is not null then` — якщо `l_have_sign = 'Y'`, виводь `l_by/l_posada/l_dep`.
+
+### 2.1. Витягнути історію ПЕРЕД лівою колонкою (і потім перевикористати)
+
+```plsql
+-- Чи є підпис (історія) - підніми вище, ДО рендера лівої колонки
+l_have_sign := has_any_signature(l_signature_id);
+
+if l_have_sign = 'Y' then
+  declare
+    rc sys_refcursor;
+  begin
+    rc := sign_history_rc(l_signature_id);
+    fetch rc into
+      l_sdate, l_stime, l_by, l_posada, l_dep, l_note, l_status,
+      l_chief_pib, l_chief_posada, l_chief_department;
+    close rc;
+  end;
+end if;
+```
+
+### 2.2. Ліва колонка: табельний → або історично (якщо підпис є), або як було (якщо підпису нема)
+
+Заміни гілку `elsif l_list_tab_no is not null then` на:
+
+```plsql
+elsif l_list_tab_no is not null then
+  if l_have_sign = 'Y' then
+    -- ✅ показуємо ІСТОРИЧНО (з sign_history_rc)
+    append(p_buf,
+       '<span class="l-list-pib">'||h(l_by)||'</span><br />'||
+       '<span class="l-list-position">'||h(l_posada)||'</span>'||
+       '<span class="l-list-dep">, '||h(nvl(l_dep,''))||'</span>'
+    );
+  else
+    -- як було раніше (поточні дані з Personal)
+    append(p_buf,
+       '<span class="l-list-pib">'||h(l_executor_pib)||'</span><br />'||
+       '<span class="l-list-position">'||h(l_user_pos)||'</span>'||
+       '<span>, '||h(nvl(l_user_dep,''))||'</span>'
+    );
+  end if;
+```
+
+### 2.3. Блок “показуємо історію підпису” — тепер НЕ треба знову викликати cursor
+
+Ти вже маєш `l_sdate/l_stime/l_by/l_posada/l_dep/...` — просто використовуй їх, без повторного `rc := sign_history_rc(...)`.
+
+---
+
+Якщо хочеш, я можу ще так само **підчепити unit/uchastok** у цей же механізм (або скласти один рядок “департамент / unit / uchastok”), але мені потрібні назви довідників unit/uchastok у твоїй схемі (як ти вже показав для `SPR_DOLZNOST_V` і `spr_department`).

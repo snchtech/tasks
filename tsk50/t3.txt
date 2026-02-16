@@ -1,0 +1,102 @@
+Так, тут найкраще “підчепити” snapshot **в CTE `executor_sign`**, бо далі в `executor_info` ти вже використовуєш `es.exec_dolznost / es.exec_tseh_short` — і HTML автоматично почне показувати історичні дані.
+
+Нижче — **фрагмент, який треба вставити/замінити** у твоєму `executor_sign AS (...)` (скрін 1).
+
+---
+
+## 1) `executor_sign`: додаємо LEFT JOIN на snapshot + довідники, і робимо fallback
+
+```sql
+executor_sign AS (
+  SELECT
+    h.signright_id,
+    h.signer_by,
+    h.signer_date,
+    h.sdate,
+    h.mark_by_chief,
+    h.chief_position,
+
+    -- виконавець (ПІБ)
+    us.familia   AS exec_familia,
+    us.imya      AS exec_imya,
+    us.otchestvo AS exec_otchestvo,
+
+    /* ✅ ІСТОРИЧНІ ДАНІ (якщо є snapshot), інакше як було раніше */
+    COALESCE(pos_hist.name, us.spr_dolznost)     AS exec_dolznost,
+    COALESCE(dep_hist.short_name, us.tseh_short) AS exec_tseh_short,
+
+    -- керівник/хто "зафіксував"
+    uc.familia   AS chief_familia,
+    uc.imya      AS chief_imya,
+    uc.otchestvo AS chief_otchestvo,
+
+    /* (опційно) chief_position у тебе вже є як число -> можна підтягнути назву посади з довідника */
+    COALESCE(pos_chief.name, uc.spr_dolznost)    AS chief_dolznost,
+    uc.tseh_short                                AS chief_tseh_short,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY h.signright_id
+      ORDER BY h.sdate DESC, h.id DESC
+    ) AS rn
+
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+
+  JOIN KBS.Personal@TO_TASKTRACKER10 us
+    ON us.tab_no = h.signer_by
+   AND us.priznak IS NULL
+
+  /* ✅ нова таблиця snapshot */
+  LEFT JOIN TaskTracker.SIGNHISTORY_USER_SNAPSHOT@TO_TASKTRACKER10 shs
+    ON shs.signhist_id = h.id
+
+  /* ✅ розшифровка історичних ID у назви (приклад як у твоєму коді) */
+  LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos_hist
+    ON pos_hist.kod = shs.position_id
+
+  LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep_hist
+    ON dep_hist.id = shs.department_id
+
+  /* керівник */
+  LEFT JOIN KBS.Personal@TO_TASKTRACKER10 uc
+    ON uc.tab_no = h.mark_by_chief
+   AND uc.priznak IS NULL
+
+  /* (опційно) підтягнути назву посади керівника по chief_position */
+  LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos_chief
+    ON pos_chief.kod = h.chief_position
+)
+```
+
+✅ **Що це дає:**
+
+* Для **нових** записів, де є `SIGNHISTORY_USER_SNAPSHOT` → показуємо **історичну** посаду/департамент (через довідники).
+* Для **старих** записів (до створення snapshot), де `shs` = NULL → `COALESCE(...)` поверне старі поля `us.spr_dolznost / us.tseh_short`, тобто **вивід буде як раніше**.
+
+---
+
+## 2) `executor_info`: нічого міняти не треба (майже)
+
+На твоєму скріні 4 ти вже виводиш:
+
+```sql
+es.exec_dolznost || ' ' || es.exec_tseh_short
+```
+
+Після зміни `executor_sign` це автоматично стане **історичним**, а якщо snapshot нема — буде як було.
+
+---
+
+## 3) Якщо захочеш ще й UNIT / UCHASTOK (шаблон)
+
+Ти можеш так само додати:
+
+```sql
+LEFT JOIN <unit_dict>  u_hist ON u_hist.id  = shs.unit_id
+LEFT JOIN <uch_dict>   uch_h  ON uch_h.id   = shs.uchastok_id
+```
+
+і зробити `COALESCE(u_hist.short_name, <старе поле>)` — але назви таблиць довідників unit/uchastok ти мені не показав, тому залишив шаблоном.
+
+---
+
+Якщо надішлеш наступні скріни з місцями, де ще формується **ПІБ/посада/підрозділ** (окрім `executor_sign`), я так само точково покажу, **куди саме** додати `LEFT JOIN ... SNAPSHOT` і які `COALESCE` поставити, щоб не ламати старі дані.

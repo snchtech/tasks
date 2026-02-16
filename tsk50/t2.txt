@@ -1,0 +1,129 @@
+Так — найпростіше це робити **в тому ж APEX-процесі**, де ти вставляєш запис у `SIGNATUREHISTORY`: одразу після `INSERT ... RETURNING id INTO ...` вставляєш snapshot.
+
+### Варіант 1 — звичайний INSERT після вставки в SIGNATUREHISTORY
+
+```sql
+DECLARE
+  l_signhist_id   SIGNATUREHISTORY.ID%TYPE;
+
+  l_position_id   NUMBER;
+  l_department_id NUMBER;
+  l_unit_id       NUMBER;
+  l_uchastok_id   NUMBER;
+BEGIN
+  /* 1) Ставимо відмітку (створюємо запис у SIGNATUREHISTORY) */
+  INSERT INTO SIGNATUREHISTORY (
+      SIGNRIGHT_ID,
+      OLD_SIGNHIST_ID,
+      NEW_STATUS_ID,
+      SIGNER_BY,
+      SIGNER_DATE,
+      NOTE,
+      SDATE,
+      MARK_BY_CHIEF,
+      CHIEF_POSITION
+  )
+  VALUES (
+      :P6_SIGNRIGHT_ID,         -- приклад: item/параметр з signright_id
+      :P6_OLD_SIGNHIST_ID,      -- якщо треба
+      :P6_NEW_STATUS_ID,        -- статус після відмітки
+      :APP_USER,                -- або :P0_CUR_USER_ID / табельний, як у тебе заведено
+      SYSTIMESTAMP,
+      :P6_NOTE,
+      SYSDATE,
+      :P6_MARK_BY_CHIEF,
+      :P6_CHIEF_POSITION
+  )
+  RETURNING ID INTO l_signhist_id;
+
+  /* 2) Визначаємо, які атрибути зберігати: CUR чи NEW (заміщення) */
+  IF NVL(:P0_SUBSTITUTION_MODE, 0) = 0 THEN
+    l_position_id   := :P0_CUR_USER_POSITION;
+    l_department_id := :P0_CUR_USER_DEPARTMENT;
+    l_unit_id       := :P0_CUR_USER_UNIT;
+    l_uchastok_id   := :P0_CUR_UCHASTOK;
+  ELSE
+    l_position_id   := :P0_NEW_POSITION_ID;
+    l_department_id := :P0_NEW_DEPARTMENT_ID;
+    l_unit_id       := :P0_NEW_UNIT_ID;
+    l_uchastok_id   := :P0_NEW_UCHASTOK;
+  END IF;
+
+  /* 3) Пишемо snapshot */
+  INSERT INTO SIGNHISTORY_USER_SNAPSHOT (
+      ID,
+      SIGNHIST_ID,
+      POSITION_ID,
+      DEPARTMENT_ID,
+      UNIT_ID,
+      UCHASTOK_ID
+  )
+  VALUES (
+      SIGNHISTORY_USER_SNAPSHOT_SEQ.NEXTVAL,
+      l_signhist_id,
+      l_position_id,
+      l_department_id,
+      l_unit_id,
+      l_uchastok_id
+  );
+
+END;
+/
+```
+
+### Варіант 2 — через MERGE (якщо хочеш “insert або update” без помилки по UNIQUE(SIGNHIST_ID))
+
+```sql
+DECLARE
+  l_signhist_id   SIGNATUREHISTORY.ID%TYPE;
+
+  l_position_id   NUMBER;
+  l_department_id NUMBER;
+  l_unit_id       NUMBER;
+  l_uchastok_id   NUMBER;
+BEGIN
+  INSERT INTO SIGNATUREHISTORY (
+    SIGNRIGHT_ID, NEW_STATUS_ID, SIGNER_BY, SIGNER_DATE, NOTE, SDATE
+  )
+  VALUES (
+    :P6_SIGNRIGHT_ID, :P6_NEW_STATUS_ID, :APP_USER, SYSTIMESTAMP, :P6_NOTE, SYSDATE
+  )
+  RETURNING ID INTO l_signhist_id;
+
+  IF NVL(:P0_SUBSTITUTION_MODE, 0) = 0 THEN
+    l_position_id   := :P0_CUR_USER_POSITION;
+    l_department_id := :P0_CUR_USER_DEPARTMENT;
+    l_unit_id       := :P0_CUR_USER_UNIT;
+    l_uchastok_id   := :P0_CUR_UCHASTOK;
+  ELSE
+    l_position_id   := :P0_NEW_POSITION_ID;
+    l_department_id := :P0_NEW_DEPARTMENT_ID;
+    l_unit_id       := :P0_NEW_UNIT_ID;
+    l_uchastok_id   := :P0_NEW_UCHASTOK;
+  END IF;
+
+  MERGE INTO SIGNHISTORY_USER_SNAPSHOT t
+  USING (SELECT l_signhist_id signhist_id,
+                l_position_id position_id,
+                l_department_id department_id,
+                l_unit_id unit_id,
+                l_uchastok_id uchastok_id
+           FROM dual) s
+  ON (t.SIGNHIST_ID = s.SIGNHIST_ID)
+  WHEN MATCHED THEN UPDATE SET
+       t.POSITION_ID   = s.POSITION_ID,
+       t.DEPARTMENT_ID = s.DEPARTMENT_ID,
+       t.UNIT_ID       = s.UNIT_ID,
+       t.UCHASTOK_ID   = s.UCHASTOK_ID
+  WHEN NOT MATCHED THEN INSERT (
+       ID, SIGNHIST_ID, POSITION_ID, DEPARTMENT_ID, UNIT_ID, UCHASTOK_ID
+  ) VALUES (
+       SIGNHISTORY_USER_SNAPSHOT_SEQ.NEXTVAL,
+       s.SIGNHIST_ID, s.POSITION_ID, s.DEPARTMENT_ID, s.UNIT_ID, s.UCHASTOK_ID
+  );
+
+END;
+/
+```
+
+Якщо скажеш, **де саме** у тебе зараз ставиться відмітка (процес сторінки, package procedure, AJAX process) — підлаштую приклад під твій реальний виклик і твої item’и/параметри (наприклад, якщо `SIGNER_BY` у тебе не `APP_USER`, а табельний `USER_TABNO`).

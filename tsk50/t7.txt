@@ -1,0 +1,172 @@
+Так, робимо **Підхід B**: все історичне (ПІБ/посада/цех/дата/mark_by_chief) підтягнемо **JOIN-ом прямо в `OPEN confirm_list FOR`**, щоб у циклі ти тільки `FETCH ... INTO ...` і одразу `HTP.P(...)`.
+
+Нижче — готовий шаблон. Я залишив твої “планові” поля з колекції (position/dep/unit/tab_no/shift…) + додав “історичні” з `SIGNATUREHISTORY` за `l_sg_history_id` (в тебе це `c016`).
+
+---
+
+## 1) OPEN confirm_list FOR — з JOIN на історію
+
+> **Умови:**
+>
+> * `c016 = SIGNATUREHISTORY.ID` (твій `l_sg_history_id`).
+> * `c013 = substage_id` (у тебе так і є).
+> * `c001 = list_id` (id позиції маршруту).
+> * `c002/c003/c014/c015/...` — як у твоєму коді (залишив “як є”).
+
+```plsql
+OPEN confirm_list FOR
+  SELECT
+      c.seq_id,
+
+      -- ======= планові дані позиції маршруту (як у тебе) =======
+      c.c001 as list_id,
+      c.c002 as list_position,
+      c.c003 as list_department,
+      c.c014 as list_unit,
+      c.c015 as list_tab_no,
+      c.c025 as list_uchastok,
+      c.c030 as sr_symbol,
+      c.c032 as list_shift_unit,
+      c.c031 as list_shift_position,
+
+      -- до виконання (як у тебе)
+      c.c022 as subtask_execute_ttl,
+
+      -- ======= ключ на історію підпису =======
+      to_number(c.c016) as sg_history_id,
+
+      -- ======= історичні дані (з SIGNATUREHISTORY) =======
+      to_char(sh.signer_date, 'dd.mm.yyyy') as sg_date,
+      to_char(sh.signer_date, 'hh24:mi')    as sg_time,
+      sh.new_status_id                      as sg_status_id,
+      sh.note                               as sg_note,
+
+      -- хто виконав (основний signer_by)
+      p.familia || ' ' || substr(p.imya,1,1) || '. ' || substr(p.otchestvo,1,1) || '.' as sg_pib,
+      ps.name                               as sg_posada,
+      p.tseh_short                          as sg_department,
+
+      -- mark_by_chief / chief_position (якщо є)
+      chief.familia || ' ' || substr(chief.imya,1,1) || '. ' || substr(chief.otchestvo,1,1) || '.' as sh_mark_chief,
+      chief_ps.name                         as sh_chief_posada,
+      chief.tseh_short                      as sh_chief_department
+
+  FROM apex_collections c
+
+  -- ======= JOIN на історію тільки якщо є c016 =======
+  LEFT JOIN tasktracker.signaturehistory@to_tasktracker10 sh
+    ON sh.id = to_number(c.c016)
+
+  LEFT JOIN kbs.personal@to_tasktracker10 p
+    ON p.tab_no = sh.signer_by
+   AND p.priznak IS NULL
+
+  LEFT JOIN kbs.spr_dolznost_v@to_tasktracker10 ps
+    ON ps.kod = p.dolznost
+
+  LEFT JOIN kbs.personal@to_tasktracker10 chief
+    ON chief.tab_no = sh.mark_by_chief
+   AND chief.priznak IS NULL
+
+  LEFT JOIN kbs.spr_dolznost_v@to_tasktracker10 chief_ps
+    ON chief_ps.kod = sh.chief_position
+
+  WHERE c.collection_name = 'ADD_PERMIT_' || l_stage_id || '_' || l_substage_id
+    AND c.c013 = l_substage_id
+
+  ORDER BY to_number(c.c006), to_number(c.seq_id);
+```
+
+---
+
+## 2) FETCH INTO — нові змінні + порядок
+
+Тепер у циклі `FETCH confirm_list INTO ...` просто додай нові змінні (історія):
+
+```plsql
+FETCH confirm_list INTO
+  l_seq_id,
+  l_list_id,
+  l_list_position,
+  l_list_department,
+  l_list_unit,
+  l_list_tab_no,
+  l_list_uchastok,
+  l_sr_symbol,
+  l_list_shift_unit,
+  l_list_shift_position,
+  l_subtask_execute_ttl,
+
+  l_sg_history_id,
+  l_sg_date,
+  l_sg_time,
+  l_sg_status_id,
+  l_sg_note,
+
+  l_sg_pib,
+  l_sg_posada,
+  l_sg_department,
+
+  l_sh_mark_chief,
+  l_sh_chief_posada,
+  l_sh_chief_department;
+```
+
+> Якщо хочеш — можеш об’єднати дату/час одразу в SELECT як `sg_date_time`, але так читабельніше.
+
+---
+
+## 3) Вивід в `<li>` — тепер тільки з JOIN-даних
+
+Там де в тебе було:
+
+* `l_sg_lastname / l_sg_firstname / l_sg_fth`
+* `l_sg_posada / l_sg_department / l_sg_date`
+* `l_sh_mark_chief`
+
+Тепер робиш так:
+
+```plsql
+IF l_sg_history_id IS NOT NULL THEN
+  -- є підпис (історія)
+  HTP.P('<span class="list-signer-info">');
+
+  IF l_sh_mark_chief IS NOT NULL THEN
+    HTP.P('<span class="list-signer-info_pib"><strong>Зафіксовано: </strong>'||h(l_sh_mark_chief)||'</span>');
+    HTP.P('<span class="list-signer-info__pos">'||h(nvl(l_sh_chief_posada,''))||
+          CASE WHEN l_sh_chief_department IS NOT NULL THEN ' • '||h(l_sh_chief_department) END||
+          '</span>');
+
+    HTP.P('<span class="list-signer-info_pib"><strong>Виконано: </strong>'||h(l_sg_pib)||'</span>');
+    HTP.P('<span class="list-signer-info__pos">'||h(nvl(l_sg_posada,''))||
+          CASE WHEN l_sg_department IS NOT NULL THEN ' • '||h(l_sg_department) END||
+          '</span>');
+  ELSE
+    HTP.P('<span class="list-signer-info_pib"><strong>Підпис: </strong>'||h(l_sg_pib)||'</span>');
+    HTP.P('<span class="list-signer-info__pos">'||h(nvl(l_sg_posada,''))||
+          CASE WHEN l_sg_department IS NOT NULL THEN ' • '||h(l_sg_department) END||
+          '</span>');
+  END IF;
+
+  HTP.P('<span class="list-signer-info__date">'||h(l_sg_date||' '||l_sg_time)||'</span>');
+  HTP.P('</span>');
+END IF;
+```
+
+---
+
+## 4) Дрібні важливі моменти
+
+1. **to_number(c.c016)**: якщо є шанс, що там не число або пробіли — краще:
+
+```sql
+to_number(nullif(trim(c.c016), ''))
+```
+
+2. Якщо ти хочеш брати **не ID історії**, а “останній запис по signright_id” — тоді JOIN робимо не по `sh.id`, а через підзапит з `ROW_NUMBER()`. Але в твоєму випадку (маршрут) **ID історії в колекції — ідеально**.
+
+3. Якщо `signaturehistory` на DBLink і записи можуть бути “тяжкі” — цей JOIN все одно буде швидше, ніж виклик refcursor у циклі.
+
+---
+
+Якщо скинеш *точні відповідності* що в твоїй колекції в `c001..c032` (або просто 1 скрін `SELECT c001..c032` з одного рядка), я піджену `SELECT` під твої назви **1-в-1**, щоб ти без перестановок `FETCH INTO` вставив і поїхало.

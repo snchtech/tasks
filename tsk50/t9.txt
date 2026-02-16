@@ -1,0 +1,126 @@
+Так, тут треба зробити **те саме, що з `SIGNATUREHISTORY`**: у `TASK_VIEWED` зберігати **“знімок контексту” на момент ознайомлення**, щоб потім **не залежати від поточного стану `KBS.PERSONAL`** (бо людина може змінити посаду/підрозділ тощо).
+
+Найзручніша схема: **залишаємо `USER_ID` як “хто натиснув”**, а додаємо окремі поля **“в якому контексті/від чийого імені” + атрибути цього контексту**.
+
+---
+
+## 1) DDL: додай “історичні” колонки в `TASK_VIEWED`
+
+```sql
+ALTER TABLE TaskTracker.TASK_VIEWED ADD (
+  VIEWED_AS_USER_ID   NUMBER,  -- за кого/від чийого імені (якщо заміщення) або = USER_ID
+  CTX_POSITION_ID     NUMBER,
+  CTX_DEPARTMENT_ID   NUMBER,
+  CTX_UNIT_ID         NUMBER,
+  CTX_UCHASTOK_ID     NUMBER
+);
+
+-- бажано індекси під твої типові перевірки
+CREATE INDEX TT_TV_I1 ON TaskTracker.TASK_VIEWED (TASK_ID, DATE_VIEWED DESC);
+CREATE INDEX TT_TV_I2 ON TaskTracker.TASK_VIEWED (TASK_ID, VIEWED_AS_USER_ID);
+```
+
+> Якщо хочеш 100% “замороження” не тільки ID, а й назв (на випадок перейменування довідників) — можна додати ще `CTX_POSITION_TXT`, `CTX_DEPARTMENT_TXT`, … і писати туди текст на момент ознайомлення. Але для твоєї вимоги (“користувач змінить посаду”) достатньо ID.
+
+---
+
+## 2) Вставка в `TASK_VIEWED`: фіксуємо контекст один раз при кліку
+
+### Варіант (рекомендую): передавати контекст з APEX (бо він у тебе вже є для compute_role_match)
+
+У процесі/пакеті, який пише `TASK_VIEWED`, просто передай 4 нові значення та `VIEWED_AS_USER_ID`.
+
+**Приклад APEX-процесу:**
+
+```plsql
+declare
+  l_viewed_as_user_id number;
+begin
+  -- якщо є заміщення/“від імені” – сюди ставиш TAB_NO того, “за кого”
+  l_viewed_as_user_id := nvl(:P6_BYNAME_USER_ID, :P0_TAB_NO);
+
+  insert into TaskTracker.TASK_VIEWED (
+    id, user_id, task_id, date_viewed, substitution_id,
+    shift_number, shift_symbol, shift_start, shift_end,
+    viewed_as_user_id, ctx_position_id, ctx_department_id, ctx_unit_id, ctx_uchastok_id
+  ) values (
+    tasktracker.seq_task_viewed.nextval,
+    :P0_TAB_NO, :P6_TASK_ID, sysdate, :P6_SUBSTITUTION_ID,
+    :P6_SHIFT_NUMBER, :P6_SHIFT_SYMBOL, :P6_SHIFT_START_DATE, :P6_SHIFT_END_DATE,
+    l_viewed_as_user_id, :P0_CTX_POSITION_ID, :P0_CTX_DEPARTMENT_ID, :P0_CTX_UNIT_ID, :P0_CTX_UCHASTOK_ID
+  );
+end;
+```
+
+> Тут ключове: **`CTX_*` береш з того самого “контексту користувача”, який ти вже використовуєш для перевірок** (position/department/unit/uchastok), і фіксуєш у таблиці назавжди.
+
+### Якщо хочеш автоматично визначати `VIEWED_AS_USER_ID` з `SUBSTITUTION_ID`
+
+Тоді просто в пакеті робиш `select ... into l_viewed_as_user_id` з твоєї таблиці заміщень (я не знаю точну назву/поля — підставиш свої).
+
+---
+
+## 3) Онови CTE `viewed_today`: більше не беремо посаду з `KBS.PERSONAL`
+
+Було (у тебе): `JOIN personal us ON us.tab_no = tv.user_id` і `us.spr_dolznost/us.tseh_short`.
+
+Має стати: **ім’я можна брати по `VIEWED_AS_USER_ID`, а посаду/деп/unit/uchastok — тільки з `tv.ctx_*`**.
+
+Приклад (таблиці довідників підставиш свої назви):
+
+```sql
+viewed_today as (
+  select
+    tv.task_id,
+
+    (u.familia || ' ' ||
+     substr(u.imya,1,1) || '. ' ||
+     substr(u.otchestvo,1,1) || '. ' ||
+     nvl(pos.name, '') || ', ' ||
+     nvl(dep.short_name, '') ||
+     case when tv.ctx_unit_id is not null then ', ' || un.name end ||
+     case when tv.ctx_uchastok_id is not null then ', ' || uch.name end ||
+     ' (' || to_char(tv.date_viewed, 'DD.MM.YYYY HH24:MI') || ')'
+    ) as viewed_by,
+
+    row_number() over (
+      partition by tv.task_id
+      order by tv.date_viewed desc
+    ) as rn
+
+  from TaskTracker.TASK_VIEWED@TO_TASKTRACKER10 tv
+
+  left join KBS.PERSONAL@TO_TASKTRACKER10 u
+    on u.tab_no = tv.viewed_as_user_id
+   and u.priznak is null
+
+  left join KBS.SPR_DOLZNOST_V@TO_TASKTRACKER10 pos
+    on pos.kod = tv.ctx_position_id
+
+  left join KBS.SPR_DEPARTMENT@TO_TASKTRACKER10 dep
+    on dep.id = tv.ctx_department_id
+
+  left join TaskTracker.UNIT@TO_TASKTRACKER10 un
+    on un.id = tv.ctx_unit_id
+
+  left join TaskTracker.UCHASTOK@TO_TASKTRACKER10 uch
+    on uch.id = tv.ctx_uchastok_id
+
+  where trunc(tv.date_viewed) = trunc(sysdate)
+)
+```
+
+✅ Тепер якщо користувач через місяць змінив посаду — **вивід залишиться “як було на момент ознайомлення”**, бо береться з `TASK_VIEWED.CTX_POSITION_ID`, а не з актуального `PERSONAL`.
+
+---
+
+## Важливий момент про “старі записи”
+
+Для вже існуючих рядків в `TASK_VIEWED` ти **не відновиш історичну посаду “на той момент”**, якщо у тебе немає історичної таблиці кадрових змін. Їх можна:
+
+* або залишити без `CTX_*` (NULL),
+* або одноразово заповнити “поточними” значеннями (але це не буде історія).
+
+---
+
+Якщо скажеш, **де саме ти зараз береш `unit_id` та `uchastok_id` для контексту (яка view/таблиця/функція, або це items на Global Page)** — я дам готовий `INSERT`/процедуру, яка автоматично тягне всі 4 поля для `VIEWED_AS_USER_ID` (включно із заміщенням) без ручних параметрів.

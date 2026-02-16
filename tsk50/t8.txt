@@ -1,0 +1,146 @@
+Ок — логіка така: **у колонці `creator` треба завжди будувати “фактичного автора/видавця” з `SIGNATUREHISTORY` (останній релевантний запис по `sr.id`)**, а **`SIGNATURERIGHTS` лишати як fallback**, якщо історії ще немає.
+
+Нижче — робочий варіант (міняє саме те, що робить код “історичним”):
+
+1. **`creator_sign`** бере **останній** запис історії по `signright_id` (як у тебе в `last_sign_exec`), бажано з фільтром `new_status_id is not null` (щоб не ловити “порожні”/службові записи).
+2. У **`creator_info`** блок **“Створено:”** і **“Видано:”** формуються **з `cs.*`**, а не з `sr.user_tabno` (або з `sr` лише якщо `cs` ще нема).
+
+---
+
+### 1) Онови CTE `creator_sign` (історичний “останній підпис”)
+
+```sql
+creator_sign AS (
+  SELECT *
+  FROM (
+    SELECT
+      h.signright_id,
+      h.signer_by,
+      -- ВАЖЛИВО: для показу і для сортування краще один “факт-дату”
+      NVL(h.signer_date, h.sdate) AS sign_dt,
+
+      -- якщо треба відсікати “непідписні” записи
+      h.new_status_id,
+
+      us.familia      AS signer_familia,
+      us.imya         AS signer_imya,
+      us.otchestvo    AS signer_otchestvo,
+      us.spr_dolznost AS signer_dolznost,
+      us.tseh_short   AS signer_tseh_short,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY h.signright_id
+        ORDER BY NVL(h.signer_date, h.sdate) DESC, h.id DESC
+      ) AS rn
+    FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+    LEFT JOIN KBS.PERSONAL@TO_TASKTRACKER10 us
+      ON us.tab_no = h.signer_by
+     AND us.priznak IS NULL
+    WHERE h.new_status_id IS NOT NULL
+  )
+  WHERE rn = 1
+),
+```
+
+> Якщо тобі треба брати “останній запис взагалі” (навіть без зміни статусу) — просто прибери `WHERE h.new_status_id IS NOT NULL`.
+
+---
+
+### 2) Онови `creator_info`: “Створено” і “Видано” з історії, `sr` — тільки fallback
+
+Нижче — шматок саме з HTML-логікою (залишай свої JOIN-и до `pos1/bb/dep/u2`, я їх не ламаю — лише міняю пріоритет):
+
+```sql
+creator_info AS (
+  SELECT *
+  FROM (
+    SELECT
+      sr.task_id,
+
+      '<span class="task_creator">' ||
+
+      -- ====== СТВОРЕНО ======
+      '<span class="exctr-ttl">Створено:</span><br />' ||
+      RTRIM(
+        CASE
+          -- 1) якщо є історія — показуємо фактичного (cs)
+          WHEN cs.signer_by IS NOT NULL THEN
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya,1,1) || '.' ||
+            SUBSTR(cs.signer_otchestvo,1,1) || '.'
+
+          -- 2) fallback на sr.user_tabno (як було)
+          WHEN sr.user_tabno IS NOT NULL THEN
+            u2.familia || ' ' ||
+            SUBSTR(u2.imya,1,1) || '.' ||
+            SUBSTR(u2.otchestvo,1,1) || '.'
+          ELSE
+            ''
+        END ||
+
+        -- Посада/підрозділ: якщо є cs — беремо з cs, інакше з твоїх довідників (bb/dep)
+        CASE
+          WHEN NVL(cs.signer_dolznost, bb.name) IS NOT NULL THEN ', ' ELSE '' END ||
+        NVL(cs.signer_dolznost, bb.name) ||
+
+        CASE
+          WHEN NVL(cs.signer_tseh_short, dep.short_name) IS NOT NULL THEN ', ' ELSE '' END ||
+        NVL(cs.signer_tseh_short, dep.short_name)
+
+      , ', ') ||
+      '</span><br />' ||
+
+      -- ====== ВИДАНО (факт підпису + дата) ======
+      CASE
+        WHEN cs.signer_by IS NOT NULL THEN
+          '<span class="signer_info">' ||
+            '<span class="exctr-ttl">Видано:</span><br />' ||
+            cs.signer_familia || ' ' ||
+            SUBSTR(cs.signer_imya,1,1) || '.' ||
+            SUBSTR(cs.signer_otchestvo,1,1) || '. ' ||
+            NVL(cs.signer_dolznost,'') || ' ' ||
+            NVL(cs.signer_tseh_short,'') || ' ' ||
+            TO_CHAR(cs.sign_dt, 'DD.MM.YYYY HH24:MI') ||
+          '</span>'
+        ELSE
+          NULL
+      END ||
+
+      '</span>' AS creator_info_html,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY sr.task_id
+        ORDER BY sr.STAGES_ID ASC, sr.SORT_ORDER ASC, sr.ID ASC
+      ) AS rn_priority
+
+    FROM TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+    LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos1
+      ON pos1.kod = sr.position_id
+    LEFT JOIN kbs.spr_dolznost_base@TO_TASKTRACKER10 bb
+      ON bb.id = pos1.id_base
+    LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep
+      ON dep.id = sr.department_id
+    LEFT JOIN kbs.personal@TO_TASKTRACKER10 u2
+      ON u2.tab_no = sr.user_tabno
+     AND u2.priznak IS NULL
+
+    -- Ось ключ: приєднуємо “останній історичний”
+    LEFT JOIN creator_sign cs
+      ON cs.signright_id = sr.id
+
+    WHERE sr.stages_id = 2
+  )
+  WHERE rn_priority = 1
+),
+```
+
+---
+
+### Що це дає (і чому це “історично правильно”)
+
+* Якщо **підписав не той**, хто стоїть у `sr.user_tabno` (заміщення, “від імені”, роль тощо) — ти побачиш **фактичного підписанта** з `SIGNATUREHISTORY`.
+* Дата/час теж беруться **з історії** (`sign_dt`), а не “з права/маршруту”.
+
+---
+
+Якщо хочеш — я піджену цей блок під твій точний формат “як було” (із твоїм CASE “якщо підписав той самий → показати лише час”, і з `mark_by_chief/chief_position` у creator-колонці так само, як ти вже зробила в картці). Просто скажи: **у creator колонці треба показувати “Зафіксовано/Виконано” чи лише “Видано”.**

@@ -1,0 +1,234 @@
+Ок — логіка однакова для обох сторінок: **не брати ПІБ/посаду/цех із “планових” SR/колекції**, а **тягнути їх із `SIGNATUREHISTORY`** (остання/потрібна історична відмітка), уже з урахуванням `MARK_BY_CHIEF` + `CHIEF_POSITION`.
+
+Нижче даю “склейку”, яку можна просто вставляти.
+
+---
+
+## 1) Функції для отримання історії (рекомендую 2 варіанти)
+
+### 1.1. Остання історична відмітка по `SIGNRIGHT_ID` (для картки)
+
+> **Критично:** порядок має бути `SIGNER_DATE desc, ID desc`, інакше `FETCH rc` забере не той запис.
+
+```plsql
+function sign_history_last_rc(p_signright_id in number)
+  return sys_refcursor
+is
+  rc sys_refcursor;
+begin
+  open rc for
+    select *
+    from (
+      select
+        to_char(sh.signer_date, 'dd.mm.yyyy') as sdatev,
+        to_char(sh.signer_date, 'hh24:mi')   as stimev,
+
+        p.familia || ' ' || substr(p.imya,1,1) || '. ' || substr(p.otchestvo,1,1) || '.' as signer_by,
+        ps.name as posada,
+        p.tseh_short as depart,
+
+        sh.note,
+        sh.new_status_id,
+
+        -- для mark_by_chief
+        chief.familia || ' ' || substr(chief.imya,1,1) || '. ' || substr(chief.otchestvo,1,1) || '.' as chief_pib,
+        chief_ps.name as chief_posada,
+        chief.tseh_short as chief_depart
+      from tasktracker.signaturehistory@to_tasktracker10 sh
+      left join kbs.personal@to_tasktracker10 p
+        on p.tab_no = sh.signer_by and p.priznak is null
+      left join kbs.spr_dolznost_v@to_tasktracker10 ps
+        on ps.kod = p.dolznost
+
+      left join kbs.personal@to_tasktracker10 chief
+        on chief.tab_no = sh.mark_by_chief and chief.priznak is null
+      left join kbs.spr_dolznost_v@to_tasktracker10 chief_ps
+        on chief_ps.kod = sh.chief_position
+
+      where sh.signright_id = p_signright_id
+      order by sh.signer_date desc nulls last, sh.id desc
+    )
+    where rownum = 1;
+
+  return rc;
+end;
+```
+
+### 1.2. Історична відмітка **по `SIGNATUREHISTORY.ID`** (для сторінки формування маршруту)
+
+> У тебе в колекції вже є `l_sg_history_id` — найпростіше й найправильніше брати дані по ньому.
+
+```plsql
+function sign_history_by_id_rc(p_history_id in number)
+  return sys_refcursor
+is
+  rc sys_refcursor;
+begin
+  open rc for
+    select
+      to_char(sh.signer_date, 'dd.mm.yyyy') as sdatev,
+      to_char(sh.signer_date, 'hh24:mi')   as stimev,
+
+      p.familia || ' ' || substr(p.imya,1,1) || '. ' || substr(p.otchestvo,1,1) || '.' as signer_by,
+      ps.name as posada,
+      p.tseh_short as depart,
+
+      sh.note,
+      sh.new_status_id,
+
+      chief.familia || ' ' || substr(chief.imya,1,1) || '. ' || substr(chief.otchestvo,1,1) || '.' as chief_pib,
+      chief_ps.name as chief_posada,
+      chief.tseh_short as chief_depart
+    from tasktracker.signaturehistory@to_tasktracker10 sh
+    left join kbs.personal@to_tasktracker10 p
+      on p.tab_no = sh.signer_by and p.priznak is null
+    left join kbs.spr_dolznost_v@to_tasktracker10 ps
+      on ps.kod = p.dolznost
+
+    left join kbs.personal@to_tasktracker10 chief
+      on chief.tab_no = sh.mark_by_chief and chief.priznak is null
+    left join kbs.spr_dolznost_v@to_tasktracker10 chief_ps
+      on chief_ps.kod = sh.chief_position
+    where sh.id = p_history_id;
+
+  return rc;
+end;
+```
+
+---
+
+## 2) Переробка **картки відміток** (щоб брала історичні дані)
+
+У твоєму блоці `if l_have_sign = 'Y' then ...` просто заміни виклик:
+
+* було: `rc := sign_history_rc(l_signature_id);`
+* стане: `rc := sign_history_last_rc(l_signature_id);`
+
+і далі — як у тебе, але важливо: **виводь саме `l_by/l_posada/l_dep` із SH**, а не “планові”.
+
+Приклад (твій код майже такий — я лиш довів до акуратного виводу):
+
+```plsql
+rc := sign_history_last_rc(l_signature_id);
+fetch rc into l_sdate, l_stime, l_by, l_posada, l_dep, l_note, l_status,
+             l_chief_pib, l_chief_posada, l_chief_department;
+close rc;
+
+append(p_buf, '<div class="c-cart-date-time"><span class="cell-content">');
+append(p_buf, '<span class="confirm-sign-attributes_date">'||h(l_sdate)||'<br />'||h(l_stime)||'</span>');
+append(p_buf, '</span></div>');
+
+append(p_buf, '<div class="c-cart-pib"><span class="cell-content">');
+
+if l_chief_pib is not null then
+  append(p_buf,
+    '<span class="confirm-sign-attributes_by"><u>Зафіксовано</u>: <strong>'||h(l_chief_pib)||'</strong></span>'||
+    '<span class="confirm-sign-attributes_posada"> '||
+      h(nvl(l_chief_posada,''))||case when l_chief_department is not null then ', '||h(l_chief_department) end||
+    '</span>'||
+    '<span class="delim-exc"></span>'||
+    '<span class="confirm-sign-attributes_by"><u>Виконано</u>: <strong>'||h(l_by)||'</strong></span>'||
+    '<span class="confirm-sign-attributes_posada"> '||
+      h(nvl(l_posada,''))||case when l_dep is not null then ', '||h(l_dep) end||
+    '</span>'
+  );
+else
+  if l_by is not null then
+    append(p_buf, '<span class="confirm-sign-attributes_by"><strong>'||h(l_by)||'</strong></span>');
+  end if;
+
+  if l_posada is not null or l_dep is not null then
+    append(p_buf,
+      '<span class="confirm-sign-attributes_posada">'||
+        h(nvl(l_posada,''))||case when l_dep is not null then ', '||h(l_dep) end||
+      '</span>'
+    );
+  end if;
+end if;
+
+append(p_buf, '</span></div>');
+```
+
+---
+
+## 3) Переробка **сторінки формування маршруту відміток**
+
+Тут у тебе є 2 підходи. Я раджу **підхід А**.
+
+### Підхід А (кращий): нічого “ПІБ/посада/цех/дата” не тягнути з колекції, а добирати по `l_sg_history_id` через `sign_history_by_id_rc`
+
+У блоці:
+
+```plsql
+IF l_sg_history_id IS NOT NULL THEN
+  ...
+  -- зараз ти HTP.P(...) з l_sg_lastname/l_sg_posada/...
+END IF;
+```
+
+Заміни на:
+
+```plsql
+if l_sg_history_id is not null then
+  declare
+    rc sys_refcursor;
+    l_sdate varchar2(10);
+    l_stime varchar2(5);
+    l_by    varchar2(255);
+    l_pos   varchar2(1000);
+    l_dep   varchar2(255);
+    l_note  varchar2(4000);
+    l_stat  number;
+
+    l_chief_pib  varchar2(255);
+    l_chief_pos  varchar2(1000);
+    l_chief_dep  varchar2(255);
+  begin
+    rc := sign_history_by_id_rc(to_number(l_sg_history_id));
+    fetch rc into l_sdate, l_stime, l_by, l_pos, l_dep, l_note, l_stat,
+                 l_chief_pib, l_chief_pos, l_chief_dep;
+    close rc;
+
+    htp.p('<li data-cl-order="'||l_order_counter||'" data-sq-ord="'||l_list_id||'" class="confirm-list-li__not-active">');
+    htp.p('<span class="number"></span><span class="pos-info">');
+
+    -- (планова частина: позиція/dep/unit або табельний/shift) лишається як у тебе
+
+    htp.p('</span>'); -- закрили pos-info
+
+    -- історичний підпис (реальні дані з SIGNATUREHISTORY)
+    htp.p('<span class="list-signer-info">');
+
+    if l_chief_pib is not null then
+      htp.p('<span class="list-signer-info_pib"><strong>Зафіксовано: </strong>'||h(l_chief_pib)||'</span>');
+      htp.p('<span class="list-signer-info__pos">'||h(nvl(l_chief_pos,''))||
+            case when l_chief_dep is not null then ' • '||h(l_chief_dep) end||'</span>');
+
+      htp.p('<span class="list-signer-info_pib"><strong>Виконано: </strong>'||h(l_by)||'</span>');
+      htp.p('<span class="list-signer-info__pos">'||h(nvl(l_pos,''))||
+            case when l_dep is not null then ' • '||h(l_dep) end||'</span>');
+    else
+      htp.p('<span class="list-signer-info_pib"><strong>Підпис: </strong>'||h(l_by)||'</span>');
+      htp.p('<span class="list-signer-info__pos">'||h(nvl(l_pos,''))||
+            case when l_dep is not null then ' • '||h(l_dep) end||'</span>');
+    end if;
+
+    htp.p('<span class="list-signer-info__date">'||h(l_sdate||' '||l_stime)||'</span>');
+    htp.p('</span>'); -- list-signer-info
+
+    htp.p('</li>');
+  end;
+end if;
+```
+
+✅ Плюс: більше не треба підтримувати `c014..c019` у колекції (прізвище/посада/дата), вони завжди будуть **актуальні** з історії.
+
+---
+
+### Підхід B: добирати історію JOIN-ом прямо в `OPEN confirm_list FOR ...`
+
+Якщо хочеш — скажи, і я дам готовий `OPEN confirm_list FOR` (з `LEFT JOIN signaturehistory ... personal ...`), щоб взагалі не робити `sign_history_by_id_rc` у циклі.
+
+---
+
+Якщо ти підтвердиш, що `c013` у твоїй колекції = **ID запису в `SIGNATUREHISTORY`**, то я дам тобі ще “чистий” рефактор: **викинути з колекції всі `l_sg_*` поля**, лишити тільки ідентифікатор, і всю візуалізацію будувати з історії.

@@ -1,0 +1,50 @@
+Ось базовий DDL для нової таблиці-“знімка” (snapshot), яка зберігатиме **SIGNATUREHISTORY.ID** + історичні **POSITION_ID / DEPARTMENT_ID / UNIT_ID / UCHASTOK_ID**.
+
+```sql
+-- 1) Таблиця snapshot для історичних атрибутів підпису
+CREATE TABLE SIGNHISTORY_USER_SNAPSHOT (
+    ID            NUMBER        NOT NULL,
+    SIGNHIST_ID   NUMBER        NOT NULL,  -- FK на SIGNATUREHISTORY.ID
+
+    POSITION_ID   NUMBER,
+    DEPARTMENT_ID NUMBER,
+    UNIT_ID       NUMBER,
+    UCHASTOK_ID   NUMBER,
+
+    CONSTRAINT PK_SH_USER_SNAPSHOT
+        PRIMARY KEY (ID),
+
+    CONSTRAINT UK_SH_USER_SNAPSHOT_SIGNHIST
+        UNIQUE (SIGNHIST_ID),
+
+    CONSTRAINT FK_SH_USER_SNAPSHOT_SIGNHIST
+        FOREIGN KEY (SIGNHIST_ID)
+        REFERENCES SIGNATUREHISTORY (ID)
+);
+
+-- (Опційно) Коментарі
+COMMENT ON TABLE  SIGNHISTORY_USER_SNAPSHOT IS 'Snapshot історичних атрибутів (pos/dep/unit/uchastok) для рядка SIGNATUREHISTORY';
+COMMENT ON COLUMN SIGNHISTORY_USER_SNAPSHOT.SIGNHIST_ID IS 'Посилання на SIGNATUREHISTORY.ID';
+```
+
+### Генерація PK (варіант для Oracle без IDENTITY, сумісний зі старими версіями)
+
+```sql
+-- 2) Sequence
+CREATE SEQUENCE SIGNHISTORY_USER_SNAPSHOT_SEQ
+  START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+
+-- 3) Trigger на автозаповнення ID
+CREATE OR REPLACE TRIGGER BI_SH_USER_SNAPSHOT
+BEFORE INSERT ON SIGNHISTORY_USER_SNAPSHOT
+FOR EACH ROW
+WHEN (NEW.ID IS NULL)
+BEGIN
+  SELECT SIGNHISTORY_USER_SNAPSHOT_SEQ.NEXTVAL
+    INTO :NEW.ID
+    FROM dual;
+END;
+/
+```
+
+> Логіка вибору значень із ваших item’ів (CUR vs NEW) буде вже в **процесі/тригері вставки** після створення запису в `SIGNATUREHISTORY`: якщо `P0_SUBSTITUTION_MODE = 0` — пишете `P0_cur_*`, якщо `= 1` — `P0_new_*`.

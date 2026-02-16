@@ -1,0 +1,111 @@
+Ок, для **звіту шаблонів** логіка така сама: “історичні” дані можна підчепити до **останнього підпису** (`last_sign_exec`), а далі в HTML робити **fallback** на старі поля, якщо snapshot ще не існує.
+
+Нижче — **точкові фрагменти**, які ти вставляєш у свій SQL.
+
+---
+
+## 1) Дороби `last_sign_exec`: додай `signhist_id`
+
+Тобі потрібно мати `h.id`, щоб потім приєднати snapshot.
+
+```sql
+last_sign_exec AS (
+  SELECT *
+  FROM (
+    SELECT
+      h.id          AS signhist_id,        -- ✅ додали
+      h.signright_id,
+      h.signer_by,
+      h.signer_date,
+      ROW_NUMBER() OVER (
+        PARTITION BY h.signright_id
+        ORDER BY h.sdate DESC, h.id DESC
+      ) AS rn
+    FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+    WHERE h.new_status_id IS NOT NULL
+  )
+  WHERE rn = 1
+),
+```
+
+---
+
+## 2) У “Виконано” (твій підзапит в `executor_info`) — додай JOIN-и на snapshot + довідники
+
+Зараз у тебе там є:
+
+```sql
+FROM last_sign_exec le
+JOIN KBS.Personal@To_Tasktracker10 us ON us.TAB_NO = le.SIGNER_BY AND us.priznak IS NULL
+WHERE le.SIGNRIGHT_ID = e.signright_id
+FETCH FIRST ROW ONLY
+```
+
+Заміни на:
+
+```sql
+FROM last_sign_exec le
+JOIN KBS.Personal@TO_TASKTRACKER10 us
+  ON us.TAB_NO = le.SIGNER_BY
+ AND us.priznak IS NULL
+
+-- ✅ snapshot (може бути NULL для старих записів)
+LEFT JOIN TaskTracker.SIGNHISTORY_USER_SNAPSHOT@TO_TASKTRACKER10 shs
+  ON shs.signhist_id = le.signhist_id
+
+-- ✅ розшифровка історичних ID у назви (як у твоїх join-ах)
+LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos_hist
+  ON pos_hist.kod = shs.position_id
+
+LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep_hist
+  ON dep_hist.id = shs.department_id
+
+WHERE le.SIGNRIGHT_ID = e.signright_id
+FETCH FIRST ROW ONLY
+```
+
+---
+
+## 3) У самому HTML-рядку “Виконано” — робимо fallback через `COALESCE`
+
+Там, де ти виводиш ПІБ (і за потреби додаєш посаду/підрозділ), використовуй:
+
+```sql
+COALESCE(pos_hist.name, us.spr_dolznost)       -- ✅ якщо немає snapshot -> старе поле
+COALESCE(dep_hist.short_name, us.tseh_short)   -- ✅ якщо немає snapshot -> старе поле
+```
+
+Наприклад, у твоїй гілці `ELSE` (де показуєш людину) заміни фрагмент на щось таке:
+
+```sql
+'<span class="signer_info"><span class="exctr-ttl">Виконано:</span><br />' ||
+us.familia || ' ' ||
+SUBSTR(us.imya,1,1) || '. ' ||
+SUBSTR(us.otchestvo,1,1) || '.'
+|| ', ' || COALESCE(pos_hist.name, us.spr_dolznost)
+|| ', ' || COALESCE(dep_hist.short_name, us.tseh_short)
+|| ', ' || TO_CHAR(le.signer_date, 'DD.MM.YYYY HH24:MI') ||
+'</span>'
+```
+
+✅ Так ти отримаєш:
+
+* **нові записи** → покажуть історичні pos/dep з snapshot;
+* **старі записи (без snapshot)** → покажуть як раніше (з `Personal`).
+
+---
+
+### Якщо хочеш ще UNIT / UCHASTOK
+
+Робиш аналогічно:
+
+```sql
+LEFT JOIN <unit_dict>@TO_TASKTRACKER10 u_hist ON u_hist.id = shs.unit_id
+LEFT JOIN <uch_dict>@TO_TASKTRACKER10  uch_h  ON uch_h.id = shs.uchastok_id
+```
+
+і виводиш `COALESCE(u_hist.name, <старе_поле>)`. (Тільки скажи назви довідників unit/uchastok.)
+
+---
+
+Якщо скинеш повністю CTE `sr_exec e` (де формується `e.position_name / e.department_name`) — я підкажу, чи є сенс там теж додати `COALESCE`, щоб прибрати дублювання `u3.spr_dolznost/u3.tseh_short` і виводити рівно те, що треба.
