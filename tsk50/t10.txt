@@ -1,0 +1,258 @@
+Зрозумів: це **сторінка маршруту**, яка читає **APEX_COLLECTION `ADD_PERMIT_...`**, і ти хочеш, щоб **для вже підписаних рядків** підтягувались **історичні (snapshot) position/department/unit/uchastok**, а не “поточні” з `personal/spr_*`. Зараз у тебе вивід “підписано” йде через `sign_history_rc(...)`, але вона (або твоя поточна логіка) фактично відновлює посаду/підрозділ **з поточних довідників/персоналу**, тому після змін у користувача ти бачиш “порожньо / не те”.
+
+Найчистіше рішення тут — **підтягнути історію JOIN-ом прямо в `OPEN confirm_list FOR ...`** (той самий підхід B), і **в циклі взагалі не викликати `sign_history_rc`**.
+
+Нижче даю “готовий каркас” під твій `ADD_PERMIT_...`, який:
+
+* читає рядки колекції як ти робиш зараз,
+* **LEFT JOIN** до `SIGNATUREHISTORY`,
+* **LEFT JOIN** до `SNAPSHOT` (назву/поля підставиш свої),
+* повертає вже готові `hist_*` поля для правої колонки (і за потреби — для лівої, якщо рядок уже виконано).
+
+---
+
+## 1) Додай змінні під історичні поля
+
+У `DECLARE` додай:
+
+```plsql
+l_hist_sdate      varchar2(10);
+l_hist_stime      varchar2(5);
+l_hist_by         varchar2(4000);
+l_hist_pos        varchar2(4000);
+l_hist_dep        varchar2(4000);
+
+l_hist_chief_pib  varchar2(4000);
+l_hist_chief_pos  varchar2(4000);
+l_hist_chief_dep  varchar2(4000);
+```
+
+---
+
+## 2) Перероби `OPEN confirm_list FOR ...` (JOIN signaturehistory + snapshot)
+
+> ⚠️ ВАЖЛИВО: ти маєш визначитись, що лежить у `c013`:
+>
+> * **Варіант A:** `c013 = SIGNATUREHISTORY.ID`
+> * **Варіант B:** `c013 = SIGNATURERIGHTS.ID` (тоді треба брати “останній” запис з історії)
+
+Я даю обидва варіанти в одному місці — просто залиш один.
+
+```plsql
+OPEN confirm_list FOR
+WITH col AS (
+  SELECT
+    seq_id                      AS list_id,
+    c001                        AS list_position,
+    c002                        AS list_department,
+    c003                        AS list_unit,
+
+    c013                        AS sh_key,        -- або history_id, або signright_id (див. нижче)
+    c014                        AS sg_lastname,
+    c015                        AS sg_firstname,
+    c016                        AS sg_fth,
+    c017                        AS sg_posada,
+    c018                        AS sg_department,
+    c019                        AS sg_date,
+
+    c008                        AS list_tab_no,
+    c022                        AS subtask_execute_ttl,
+    c024                        AS list_uchastok,
+    c025                        AS sh_mark_chief,
+    c027                        AS sr_symbol,
+    c030                        AS list_shift_unit,
+    c032                        AS list_shift_position,
+
+    c006                        AS grp_ord
+  FROM apex_collections
+  WHERE collection_name = 'ADD_PERMIT_' || l_stage_id || '_' || l_substage_id
+    AND c004 = l_substage_id
+),
+
+/* ====== ВИБЕРИ ОДИН ВАРІАНТ ПРИЄДНАННЯ HISTORY ====== */
+
+/* --- ВАРІАНТ A: c013 = SIGNATUREHISTORY.ID --- */
+hx AS (
+  SELECT h.*
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+),
+
+/* --- ВАРІАНТ B: c013 = SIGNATURERIGHTS.ID (беремо останній запис) ---
+hx AS (
+  SELECT h.*,
+         ROW_NUMBER() OVER (PARTITION BY h.signright_id ORDER BY h.sdate DESC, h.id DESC) rn
+  FROM TaskTracker.SIGNATUREHISTORY@TO_TASKTRACKER10 h
+)
+*/
+
+SELECT
+  /* колекція */
+  c.list_id,
+  c.list_position,
+  c.list_department,
+  c.list_unit,
+
+  TO_NUMBER(c.sh_key)           AS sg_history_id,  -- лишаємо як NUMBER для IF
+  c.sg_lastname,
+  c.sg_firstname,
+  c.sg_fth,
+  c.sg_posada,
+  c.sg_department,
+  c.sg_date,
+
+  TO_NUMBER(c.list_tab_no)      AS list_tab_no,
+  c.subtask_execute_ttl,
+  c.list_uchastok,
+  c.sh_mark_chief,
+  c.sr_symbol,
+  c.list_shift_unit,
+  c.list_shift_position,
+
+  /* ====== ІСТОРИЧНІ ПОЛЯ (права колонка) ====== */
+  TO_CHAR(h.sdate, 'DD.MM.YYYY') AS hist_sdate,
+  TO_CHAR(h.sdate, 'HH24:MI')    AS hist_stime,
+
+  /* ПІБ того, хто виконав (можеш брати з snapshot, а якщо нема — fallback до personal) */
+  NVL(snp.signer_pib,
+      us.familia || ' ' || SUBSTR(us.imya,1,1) || '.' || SUBSTR(us.otchestvo,1,1) || '.'
+  ) AS hist_by,
+
+  /* Посада/підрозділ НА МОМЕНТ ВІДМІТКИ */
+  NVL(snp.signer_pos_name, bb.name)       AS hist_pos,
+  NVL(snp.signer_dep_name, dep.short_name) AS hist_dep,
+
+  /* “Зафіксовано:” (якщо є) */
+  snp.chief_pib       AS hist_chief_pib,
+  snp.chief_pos_name  AS hist_chief_pos,
+  snp.chief_dep_name  AS hist_chief_dep
+
+FROM col c
+
+/* ==== JOIN на history ==== */
+LEFT JOIN hx h
+  ON (
+       /* ВАРІАНТ A */
+       h.id = TO_NUMBER(c.sh_key)
+
+       /* ВАРІАНТ B (розкоментуй hx з rn і заміни на це):
+       h.signright_id = TO_NUMBER(c.sh_key) AND h.rn = 1
+       */
+     )
+
+/* ==== SNAPSHOT (підстав СВОЮ назву таблиці та поля) ==== */
+LEFT JOIN TaskTracker.SIGNATUREHISTORY_SNAPSHOT@TO_TASKTRACKER10 snp
+  ON snp.sign_history_id = h.id
+
+/* fallback-джерела, якщо десь у snapshot нема ПІБ або назв */
+LEFT JOIN KBS.personal@TO_TASKTRACKER10 us
+  ON us.tab_no = h.signer_by
+ AND us.priznak IS NULL
+
+LEFT JOIN KBS.spr_dolznost@TO_TASKTRACKER10 pos
+  ON pos.kod = snp.signer_position_id
+LEFT JOIN KBS.spr_dolznost_base@TO_TASKTRACKER10 bb
+  ON bb.id = pos.id_base
+
+LEFT JOIN KBS.spr_department@TO_TASKTRACKER10 dep
+  ON dep.id = snp.signer_department_id
+
+ORDER BY TO_NUMBER(c.grp_ord), TO_NUMBER(c.list_id);
+```
+
+> **Що треба підставити під себе:**
+> `TaskTracker.SIGNATUREHISTORY_SNAPSHOT...` і поля `signer_position_id / signer_dep... / signer_pos_name ...` — назви залежать від твоєї snapshot-таблиці. Логіка — та сама.
+
+---
+
+## 3) Онови `FETCH ... INTO ...` (додай `hist_*` в кінець)
+
+Після твоїх поточних змінних додай нові:
+
+```plsql
+FETCH confirm_list INTO
+  l_list_id, l_list_position, l_list_department, l_list_unit,
+  l_sg_history_id, l_sg_lastname, l_sg_firstname, l_sg_fth,
+  l_sg_posada, l_sg_department, l_sg_date,
+  l_list_tab_no, l_subtask_execute_ttl, l_list_uchastok, l_sh_mark_chief,
+  l_sr_symbol, l_list_shift_unit, l_list_shift_position,
+
+  l_hist_sdate, l_hist_stime, l_hist_by, l_hist_pos, l_hist_dep,
+  l_hist_chief_pib, l_hist_chief_pos, l_hist_chief_dep;
+
+EXIT WHEN confirm_list%NOTFOUND;
+```
+
+---
+
+## 4) Прибери `sign_history_rc(...)` і використовуй `hist_*`
+
+Оцей блок:
+
+```plsql
+IF l_sg_history_id IS NOT NULL THEN
+  rc := tasktracker.CONFIRM_CART_PKG.sign_history_rc(to_number(l_sg_history_id));
+  fetch rc into ...
+  close rc;
+END IF;
+```
+
+**заміни** на:
+
+```plsql
+IF l_sg_history_id IS NOT NULL THEN
+  l_sdate := l_hist_sdate;
+  l_stime := l_hist_stime;
+
+  l_by    := l_hist_by;
+  l_pos   := l_hist_pos;
+  l_dep   := l_hist_dep;
+
+  l_chief_pib := l_hist_chief_pib;
+  l_chief_pos := l_hist_chief_pos;
+  l_chief_dep := l_hist_chief_dep;
+END IF;
+```
+
+Після цього твій HTML-блок “Підпис/Зафіксовано/Виконано” почне друкувати **саме snapshot-дані**, бо `l_pos/l_dep` тепер історичні.
+
+---
+
+## 5) Якщо хочеш, щоб “ліва колонка” теж не брала поточні дані після виконання
+
+Там де ти робиш fallback по `tab_no` через `SELECT ... FROM personal ...`, додай просту умову:
+
+```plsql
+IF l_list_position IS NULL
+   AND l_list_department IS NULL
+   AND l_list_unit IS NULL
+   AND l_sr_symbol IS NULL
+   AND l_list_tab_no IS NOT NULL
+THEN
+  IF l_sg_history_id IS NOT NULL THEN
+    -- рядок уже виконано -> беремо історичне
+    l_executor_pib := l_by;      -- або l_hist_by
+    l_user_pos     := NVL(l_pos, 'Невідома посада');
+    l_user_dep     := NVL(l_dep, 'Невідомий відділ');
+  ELSE
+    -- рядок ще не виконано -> твій поточний SELECT по personal
+    ...
+  END IF;
+END IF;
+```
+
+---
+
+## 6) Швидка перевірка, щоб не “мовчало”
+
+Прямо в циклі на 1–2 рядки (тимчасово):
+
+```plsql
+apex_debug.info('ADD_PERMIT row: list_id='||l_list_id||' sh_key='||l_sg_history_id||' tab_no='||l_list_tab_no);
+apex_debug.info('HIST: by='||substr(l_hist_by,1,80)||' pos='||substr(l_hist_pos,1,80)||' dep='||substr(l_hist_dep,1,80));
+```
+
+Якщо `hist_*` порожні — 99% що **не той ключ у `c013`** (тоді перемикаєшся на Варіант B і джойниш по `signright_id`), або **не співпали назви/поля snapshot**.
+
+---
+
+Якщо скинеш **назву snapshot-таблиці** і **її поля** (хоча б: `sign_history_id`, `position_id`, `department_id`, `unit_id`, `uchastok_id`, і чи є окремо “chief”), я підставлю їх у цей SQL **1-в-1 під твою схему**, щоб ти просто вставив і воно запрацювало без підгонки.

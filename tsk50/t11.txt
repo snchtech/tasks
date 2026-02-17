@@ -1,0 +1,163 @@
+Так, це робиться дуже просто і **з мінімальними змінами**: ти залишаєш усі свої `HTP.P(...)`, курсори, `OPEN confirm_list FOR ...` як є, але переносиш весь “великий” блок у **процедуру пакета**, а в регіоні лишаєш тільки виклик цієї процедури.
+
+Нижче даю робочу схему “як є” для **PL/SQL Dynamic Content region** (тобто нічого не треба міняти в типі регіону).
+
+---
+
+## 1) Створи пакет (spec)
+
+SQL Workshop → SQL Commands:
+
+```sql
+CREATE OR REPLACE PACKAGE tasktracker_route_pkg AS
+  -- мінімальний варіант: читає значення з APEX items через v('...')
+  PROCEDURE render_route;
+
+  -- універсальніший (на майбутнє): можна викликати з будь-де, передавши параметри
+  PROCEDURE render_route(
+    p_task_id      IN NUMBER,
+    p_page_list_id IN NUMBER,
+    p_order_count  IN NUMBER
+  );
+END tasktracker_route_pkg;
+/
+```
+
+---
+
+## 2) Створи пакет (body) і перенеси туди код
+
+> Тут принцип такий:
+>
+> * У **процедуру `render_route(p_...)`** вставляєш майже 1-в-1 увесь твій нинішній код з регіону (DECLARE/BEGIN/END).
+> * Де в тебе було `l_source_id := v('P4_TASK_ID')` — просто береш `p_task_id`, і т.д.
+
+```sql
+CREATE OR REPLACE PACKAGE BODY tasktracker_route_pkg AS
+
+  PROCEDURE render_route IS
+  BEGIN
+    -- мінімальні зміни: беремо з APEX session state і викликаємо параметричну версію
+    render_route(
+      p_task_id      => TO_NUMBER(v('P4_TASK_ID')),
+      p_page_list_id => TO_NUMBER(v('P0_PAGE_LIST_ID')),
+      p_order_count  => TO_NUMBER(v('P4_ORDER_COUNT'))
+    );
+  END render_route;
+
+
+  PROCEDURE render_route(
+    p_task_id      IN NUMBER,
+    p_page_list_id IN NUMBER,
+    p_order_count  IN NUMBER
+  ) IS
+    /* ======= сюди переносиш свій DECLARE зі сторінки ======= */
+    l_stage                 NUMBER;
+    l_stage_id              NUMBER;
+    l_sub_stage             NUMBER;
+    l_substage_id           NUMBER;
+    l_counter_stage         NUMBER := 0;
+    l_counter_substage      NUMBER := 0;
+
+    l_list_id               NUMBER;
+    l_list_text             VARCHAR2(255);
+    l_list_position         VARCHAR2(255);
+    l_list_department       VARCHAR2(255);
+    l_list_unit             VARCHAR2(255);
+    l_list_tab_no           NUMBER;
+
+    l_dep_unit              VARCHAR2(255);
+    l_order_counter         NUMBER := 0;
+
+    confirm_stage           SYS_REFCURSOR;
+    confirm_substage        SYS_REFCURSOR;
+    confirm_list            SYS_REFCURSOR;
+
+    l_stage_title           VARCHAR2(255);
+    l_current_stage         NUMBER;
+    l_substage_title        VARCHAR2(255);
+    l_current_substage      NUMBER;
+
+    l_app_id                NUMBER;
+    l_sg_history_id         NUMBER;
+
+    -- ... і ВСІ інші твої змінні як у регіоні ...
+  BEGIN
+    /* ======= сюди переносиш свій BEGIN…END зі сторінки ======= */
+
+    l_app_id   := TO_NUMBER(v('APP_ID'));
+    l_stage    := p_order_count;   -- було v('P4_ORDER_COUNT')
+    -- l_source_id := p_task_id;   -- було v('P4_TASK_ID')
+    -- l_page_list_id := p_page_list_id; -- було v('P0_PAGE_LIST_ID')
+
+    -- Далі просто твій код формування HTML:
+    -- HTP.P('<div ...>');
+    -- OPEN confirm_stage FOR ...
+    -- LOOP ... FETCH ... HTP.P ... END LOOP;
+
+    -- ВАЖЛИВО: заміни місця, де ти брав page items, на параметри:
+    --   :P4_TASK_ID / v('P4_TASK_ID')  -> p_task_id
+    --   :P0_PAGE_LIST_ID / v('P0_PAGE_LIST_ID') -> p_page_list_id
+    --   :P4_ORDER_COUNT / v('P4_ORDER_COUNT') -> p_order_count
+
+  END render_route;
+
+END tasktracker_route_pkg;
+/
+```
+
+✅ На цьому етапі твій код уже “виведений” з регіону, і ліміт символів більше не заважатиме.
+
+---
+
+## 3) Заміні код у PL/SQL Dynamic Content region на 3 рядки
+
+У регіоні “маршрут відміток” залиш:
+
+```plsql
+BEGIN
+  tasktracker_route_pkg.render_route(
+    p_task_id      => :P4_TASK_ID,
+    p_page_list_id => :P0_PAGE_LIST_ID,
+    p_order_count  => :P4_ORDER_COUNT
+  );
+END;
+```
+
+Або ще коротше (якщо хочеш взагалі без параметрів):
+
+```plsql
+BEGIN
+  tasktracker_route_pkg.render_route;
+END;
+```
+
+---
+
+## 4) Що робити, щоб “мінімально не ламало” твій код
+
+1. **Не переписуй HTP.P** — просто перенеси як є.
+2. Де в коді використовуються `v('ITEM')` — воно і в пакеті працюватиме, але краще (і чистіше) поступово перейти на параметри (як я показав).
+3. Якщо в пакеті є посилання на об’єкти через DB link — це теж ок, права ті самі, що й у регіоні (бо виконується в тому ж parsing schema).
+
+---
+
+## 5) Маленький бонус для структурування (необов’язково, але дуже корисно)
+
+Після того як перенесеш 1-в-1, можна (пізніше) розбити на підпроцедури, не чіпаючи логіку:
+
+```plsql
+PROCEDURE render_stage(...);
+PROCEDURE render_substage(...);
+PROCEDURE render_list(...);
+```
+
+Але це вже “другий крок”.
+
+---
+
+Якщо хочеш — я зроблю тобі **готовий пакет “під твій реальний код”**: ти просто кинь сюди текстом (або файлом) **весь код регіону** (без скрінів), і я:
+
+* вставлю його в `tasktracker_route_pkg.render_route`,
+* акуратно заміню `v('...')`/`:P...` на параметри,
+* і підкажу, де саме найчастіше вилітають помилки компіляції при перенесенні (типи, курсори, scope змінних).
