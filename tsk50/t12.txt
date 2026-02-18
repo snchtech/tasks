@@ -1,0 +1,136 @@
+Зрозуміло. Тобі треба **не міняти логіку `signed_info`**, а просто підставляти **історичні “атрибути посади/підрозділу/unit/uchastok”** з `SIGNHISTORY_USER_SNAPSHOT`, *якщо snapshot є*, інакше — залишати поточні поля з `KBS.PERSONAL` (як зараз).
+
+Найчистіше (і зазвичай це ще й лікує дублювання рядків) зробити так:
+
+1. брати **останній запис** `SIGNATUREHISTORY` по `SIGNRIGHT_ID` (через `ROW_NUMBER()`),
+2. `LEFT JOIN` на `SIGNHISTORY_USER_SNAPSHOT` по `sh.id`,
+3. у `signed_info` використовувати `COALESCE(…snapshot…, …personal…)`.
+
+Нижче — **готовий патч** під твій фрагмент.
+
+---
+
+## 1) Додай “останній history” (CTE) і підключи snapshot
+
+```sql
+WITH sh_last AS (
+  SELECT
+      sh.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY sh.signright_id
+        ORDER BY sh.sdate DESC, sh.id DESC
+      ) rn
+  FROM TaskTracker.signaturehistory@TO_TASKTRACKER10 sh
+)
+SELECT
+  /* ... твої інші колонки ... */
+
+  (CASE
+     /* ===== ВАРІАНТ: зафіксовано керівником ===== */
+     WHEN sh.mark_by_chief IS NOT NULL
+      AND sh.signer_date IS NOT NULL
+     THEN
+       'Зафіксовано: ' ||
+       p2.familia || ' ' ||
+       SUBSTR(p2.imya,1,1) || '. ' ||
+       SUBSTR(p2.otchestvo,1,1) || '.<br />' ||
+
+       /* посада керівника: історії для керівника в snapshot нема -> беремо те, що вже зафіксовано в history (CHIEF_POSITION) */
+       COALESCE(sh.chief_position, p2.spr_dolznost) || '<br />' ||
+       p2.tseh_short || '<br />' ||
+
+       'Виконано: ' ||
+       p.familia || ' ' ||
+       SUBSTR(p.imya,1,1) || '. ' ||
+       SUBSTR(p.otchestvo,1,1) || '.<br />' ||
+
+       /* тут уже підтягуємо історичні атрибути виконавця зі snapshot, якщо є */
+       COALESCE(pos_s.name, p.spr_dolznost) || '<br />' ||
+       COALESCE(dep_s.short_name, p.tseh_short) ||
+       CASE WHEN un_s.unit_name IS NOT NULL THEN '<br />' || un_s.unit_name END ||
+       CASE WHEN uch_s.uch_name IS NOT NULL THEN '<br />' || uch_s.uch_name END ||
+       '<br />' ||
+       TO_CHAR(sh.signer_date, 'dd.mm.yyyy hh24:mi')
+
+     /* ===== ВАРІАНТ: підписав безпосередньо користувач ===== */
+     WHEN sh.mark_by_chief IS NULL
+      AND sh.signer_date IS NOT NULL
+     THEN
+       p.familia || ' ' ||
+       SUBSTR(p.imya,1,1) || '. ' ||
+       SUBSTR(p.otchestvo,1,1) || '.<br />' ||
+
+       COALESCE(pos_s.name, p.spr_dolznost) || '<br />' ||
+       COALESCE(dep_s.short_name, p.tseh_short) ||
+       CASE WHEN un_s.unit_name IS NOT NULL THEN '<br />' || un_s.unit_name END ||
+       CASE WHEN uch_s.uch_name IS NOT NULL THEN '<br />' || uch_s.uch_name END ||
+       '<br />' ||
+       TO_CHAR(sh.signer_date, 'dd.mm.yyyy hh24:mi')
+
+     ELSE
+       NULL
+   END) AS signed_info
+
+FROM subtask_tree st
+
+LEFT JOIN TaskTracker.signaturerights@TO_TASKTRACKER10 sr
+  ON sr.subtask_id = st.sbtsk_id
+
+/* беремо тільки ОСТАННІЙ запис історії */
+LEFT JOIN sh_last sh
+  ON sh.signright_id = sr.id
+ AND sh.rn = 1
+
+/* snapshot по конкретному history */
+LEFT JOIN TaskTracker.signhistory_user_snapshot@TO_TASKTRACKER10 ss
+  ON ss.signhist_id = sh.id
+
+/* довідники для snapshot (атрибути на момент підпису) */
+LEFT JOIN kbs.spr_dolznost@TO_TASKTRACKER10 pos_s
+  ON pos_s.kod = ss.position_id
+
+LEFT JOIN kbs.spr_department@TO_TASKTRACKER10 dep_s
+  ON dep_s.id = ss.department_id
+
+/* якщо у тебе є довідники для unit/uchastok — підстав свої назви таблиць/полів */
+LEFT JOIN TaskTracker.unit@TO_TASKTRACKER10 un_s
+  ON un_s.id = ss.unit_id
+
+LEFT JOIN TaskTracker.uchastok@TO_TASKTRACKER10 uch_s
+  ON uch_s.id = ss.uchastok_id
+
+/* ПІБ беремо з personal (snapshot не містить ПІБ) */
+LEFT JOIN KBS.personal@TO_TASKTRACKER10 p
+  ON sh.signer_by = p.tab_no
+ AND p.priznak IS NULL
+
+LEFT JOIN KBS.personal@TO_TASKTRACKER10 p2
+  ON sh.mark_by_chief = p2.tab_no
+ AND p2.priznak IS NULL
+
+WHERE st.task_mode = 0
+ORDER BY path_b;
+```
+
+### Що тут важливо
+
+* `COALESCE(pos_s.name, p.spr_dolznost)` — якщо є snapshot → показуємо **історичну посаду**, інакше — як зараз.
+* Аналогічно для підрозділу/unit/uchastok.
+* `sh_last` (rn=1) — майже завжди потрібен, бо інакше `LEFT JOIN signaturehistory` дає кілька рядків на один `sr.id`.
+
+---
+
+## 2) Якщо тобі треба історія **і для керівника** також
+
+З твоєю поточною структурою `SIGNHISTORY_USER_SNAPSHOT` це **неможливо коректно**, бо snapshot не має “role/user_type”, і не містить двох наборів атрибутів.
+
+Мінімальний варіант на майбутнє:
+
+* або додати в `SIGNHISTORY_USER_SNAPSHOT` колонки `USER_TABNO` + `ROLE_CODE` (`SIGNER`/`CHIEF`) і зберігати **2 рядки** на один `SIGNHIST_ID`,
+* або зробити другу таблицю `SIGNHISTORY_CHIEF_SNAPSHOT`.
+
+А поки — для керівника ти вже правильно береш `CHIEF_POSITION` (це якраз історичне текстове поле).
+
+---
+
+Якщо скажеш, **як у тебе реально називаються** довідники `UNIT` і `UCHASTOK` (таблиця/поле з назвою), я підставлю їх у код “під ключ”, щоб ти просто скопіювала запит в IG без ручних правок.
