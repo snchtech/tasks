@@ -1,0 +1,158 @@
+Окей 👌 тепер зробимо **безпечну модель shift**, щоб:
+
+* користувач НЕ міг отримати доступ до чужого department
+* shift працював тільки в межах дозволеної зони
+* не зламати ACL
+* не відкрити security-дірку
+
+---
+
+# 🎯 Проблема
+
+Зараз якщо написати:
+
+```plsql
+if :P0_SHIFT_UNIT is not null and p_unit_id = :P0_SHIFT_UNIT then
+   return true;
+end if;
+```
+
+це означає:
+
+> будь-який shift_unit = доступ
+
+Це небезпечно ❗
+
+---
+
+# ✅ Правильна модель безпеки
+
+Shift має працювати тільки якщо:
+
+1️⃣ Unit належить тому ж department
+2️⃣ Користувач має право працювати в цьому department
+3️⃣ Unit реально існує
+
+---
+
+# 🛡 Крок 1 — Перевірка unit через БД
+
+Приклад безпечної перевірки:
+
+```plsql
+function is_shift_unit_allowed(p_unit_id number) return boolean is
+   l_cnt number;
+begin
+   if :P0_SHIFT_UNIT is null then
+      return false;
+   end if;
+
+   select count(*)
+   into l_cnt
+   from unit u
+   where u.id = :P0_SHIFT_UNIT
+     and u.department_id = :P0_CUR_USER_DEPARTMENT; -- або ctx_department
+
+   return l_cnt > 0;
+end;
+```
+
+---
+
+# 🛡 Крок 2 — Оновлена has_unit_role (безпечна)
+
+```plsql
+function has_unit_role(p_unit_id number) return boolean is
+begin
+
+   if p_unit_id is null then
+      return true;
+   end if;
+
+   -- 🔒 SHIFT override тільки якщо дозволений
+   if :P0_SHIFT_UNIT is not null 
+      and p_unit_id = :P0_SHIFT_UNIT
+      and is_shift_unit_allowed(p_unit_id)
+   then
+      return true;
+   end if;
+
+   -- стандартна логіка
+   if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles, '~'), 'U_'||p_unit_id) > 0;
+   else
+      return apex_acl.has_user_role(P_app_id, P_app_user, 'U_'||p_unit_id);
+   end if;
+
+end;
+```
+
+---
+
+# 🛡 Крок 3 — Додатковий контроль (ще краще)
+
+Щоб shift не дозволяв вихід за department у signaturerights:
+
+У твоїй перевірці ролі додати:
+
+```plsql
+and p_list_department_id = :P0_CUR_USER_DEPARTMENT
+```
+
+---
+
+# 🧠 Архітектурно правильно
+
+Shift повинен:
+
+* змінювати тільки unit
+* не змінювати department
+* не обходити access_level
+* не обходити position
+* не обходити ACL
+
+---
+
+# 🏆 Найкраща модель (Enterprise-рівень)
+
+1️⃣ На сторінці 13 LOV для P13_SHIFT_UNIT:
+
+```sql
+select unit_name d, id r
+from unit
+where department_id = :P0_CUR_USER_DEPARTMENT
+```
+
+Тоді користувач фізично не зможе вибрати чужий unit.
+
+2️⃣ У функції — тільки перевірка співпадіння.
+
+---
+
+# 🔐 Тепер логіка безпеки така:
+
+| Сценарій                  | Результат                            |
+| ------------------------- | ------------------------------------ |
+| Shift в межах department  | OK                                   |
+| Shift з іншого department | Заборонено                           |
+| Немає shift               | працює стара логіка                  |
+| Немає ACL                 | shift не дає доступу поза department |
+
+---
+
+# ⚠ Дуже важливо
+
+Shift не повинен заміняти department_id.
+
+Ніколи.
+
+---
+
+# 💬 Хочеш наступний крок?
+
+Я можу:
+
+* показати як зробити shift ще безпечнішим через EXISTS з access_control
+* або намалювати повну схему безпеки (ACL + substitution + shift)
+
+Що цікавіше?

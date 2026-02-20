@@ -1,0 +1,159 @@
+Добре 👍
+Тоді логіку треба трохи перебудувати правильно з архітектурної точки зору.
+
+Тепер:
+
+* ❌ не перевіряємо на пусте значення
+* ✅ працюємо по `department_id`
+* ✅ unit визначаємо залежно від department
+* ✅ JS керує тільки UI
+
+---
+
+# 1️⃣ Серверна логіка (по department)
+
+Тобто unit беремо з:
+
+* `P0_CUR_USER_UNIT` якщо `P0_SUBSTITUTION_MODE = 0`
+* `P0_NEW_UNIT_ID` якщо `= 1`
+
+Але **тільки якщо department відповідає потрібним**
+
+Припустимо у тебе є item:
+
+```
+P13_DEPARTMENT_ID
+```
+
+---
+
+## 🔹 Before Header Process (Page 13)
+
+```plsql
+BEGIN
+
+   IF :P0_SUBSTITUTION_MODE = 0 THEN
+      :P13_SHIFT_UNIT := :P0_CUR_USER_UNIT;
+   ELSE
+      :P13_SHIFT_UNIT := :P0_NEW_UNIT_ID;
+   END IF;
+
+END;
+```
+
+(логіку відбору по department краще винести в JS, поясню нижче чому)
+
+---
+
+# 2️⃣ JS — керування по department
+
+Тепер ми не перевіряємо unit на пустоту.
+
+Ми дивимось на:
+
+```
+P13_DEPARTMENT_ID
+```
+
+І вже по ньому керуємо P13_SHIFT_UNIT.
+
+---
+
+## 🔹 Оновлена функція
+
+```javascript
+function controlShiftUnit() {
+
+    var dept = $v('P13_DEPARTMENT_ID');
+    var item = apex.item('P13_SHIFT_UNIT');
+
+    // 1215, 1216 → disabled
+    if (dept === '1215' || dept === '1216') {
+        item.show();
+        item.disable();
+    }
+    // 1217 → enabled
+    else if (dept === '1217') {
+        item.show();
+        item.enable();
+    }
+    // інші → приховати
+    else {
+        item.hide();
+    }
+}
+```
+
+---
+
+# 3️⃣ Dynamic Action
+
+### Event:
+
+* Page Load
+* Change → P13_DEPARTMENT_ID
+
+True Action:
+
+```
+Execute JavaScript Code
+controlShiftUnit();
+```
+
+---
+
+# ❗ Чому department перевіряти в JS краще
+
+Бо:
+
+* department може змінюватися без submit
+* немає зайвих ajax-запитів
+* UI реагує миттєво
+
+---
+
+# 4️⃣ Якщо треба ще жорсткіше (архітектурно правильно)
+
+Можна взагалі не привʼязувати до конкретних ID в коді.
+
+Краще створити JS-масив:
+
+```javascript
+var disabledDepartments = ['1215','1216'];
+var enabledDepartments = ['1217'];
+```
+
+І тоді:
+
+```javascript
+function controlShiftUnit() {
+
+    var dept = $v('P13_DEPARTMENT_ID');
+    var item = apex.item('P13_SHIFT_UNIT');
+
+    if (disabledDepartments.includes(dept)) {
+        item.show();
+        item.disable();
+    }
+    else if (enabledDepartments.includes(dept)) {
+        item.show();
+        item.enable();
+    }
+    else {
+        item.hide();
+    }
+}
+```
+
+---
+
+# 🎯 Фінальна логіка
+
+1️⃣ PL/SQL визначає unit (заміщення)
+2️⃣ JS керує видимістю по department
+3️⃣ Пусте значення не обробляємо
+4️⃣ Ніяких зайвих submit
+
+---
+
+Якщо хочеш — можу ще показати варіант, де department перевіряється через SQL в LOV самого `P13_SHIFT_UNIT`, і тоді JS взагалі не потрібен.

@@ -1,0 +1,193 @@
+Добре, розкладемо рішення правильно з точки зору архітектури APEX:
+логіка визначення unit → сервер (PL/SQL),
+логіка UI (enable/disable/hide) → клієнт (JS).
+
+---
+
+# 1️⃣ Item P13_SHIFT_UNIT
+
+Тип: **Select List**
+LOV:
+
+```sql
+SELECT unit_name d, id r
+FROM unit
+ORDER BY unit_name
+```
+
+---
+
+# 2️⃣ Серверна логіка визначення поточного UNIT
+
+Ти правильно мислиш — визначення unit краще робити в PL/SQL, бо items hidden.
+
+## 🔹 Процес Before Header (Page 13)
+
+Створити Process → **Before Header**
+
+```plsql
+BEGIN
+   IF :P0_SUBSTITUTION_MODE = 0 THEN
+      :P13_SHIFT_UNIT := :P0_CUR_USER_UNIT;
+   ELSIF :P0_SUBSTITUTION_MODE = 1 THEN
+      :P13_SHIFT_UNIT := :P0_NEW_UNIT_ID;
+   ELSE
+      :P13_SHIFT_UNIT := NULL;
+   END IF;
+END;
+```
+
+✅ Таким чином при відкритті сторінки P13_SHIFT_UNIT вже матиме правильне значення.
+
+---
+
+# 3️⃣ JS логіка керування відображенням
+
+Тепер UI-логіка.
+
+Треба:
+
+* якщо 1215 або 1216 → disabled
+* якщо 1217 → enabled
+* інакше → hide
+
+---
+
+## 🔹 Dynamic Action
+
+Event:
+
+* **Page Load**
+* * Change → P13_SHIFT_UNIT (щоб реагувало при зміні)
+
+Action: Execute JavaScript Code
+
+---
+
+## 🔹 JS код
+
+```javascript
+(function () {
+
+    var unit = $v('P13_SHIFT_UNIT');
+
+    var item = apex.item('P13_SHIFT_UNIT');
+
+    if (!unit) {
+        item.hide();
+        return;
+    }
+
+    if (unit === '1215' || unit === '1216') {
+        item.show();
+        item.disable();
+    }
+    else if (unit === '1217') {
+        item.show();
+        item.enable();
+    }
+    else {
+        item.hide();
+    }
+
+})();
+```
+
+---
+
+# 4️⃣ Важливо
+
+🔹 Якщо item приховується, краще очистити значення:
+
+```javascript
+item.setValue('');
+```
+
+додати перед `item.hide();`
+
+---
+
+# 5️⃣ Якщо P0_SUBSTITUTION_MODE може змінюватися без перезавантаження
+
+Тоді треба:
+
+Dynamic Action
+Event: Change → P0_SUBSTITUTION_MODE
+
+True Action 1:
+→ Execute PL/SQL Code
+
+```plsql
+BEGIN
+   IF :P0_SUBSTITUTION_MODE = 0 THEN
+      :P13_SHIFT_UNIT := :P0_CUR_USER_UNIT;
+   ELSE
+      :P13_SHIFT_UNIT := :P0_NEW_UNIT_ID;
+   END IF;
+END;
+```
+
+Items to Submit:
+
+* P0_SUBSTITUTION_MODE
+* P0_CUR_USER_UNIT
+* P0_NEW_UNIT_ID
+
+Items to Return:
+
+* P13_SHIFT_UNIT
+
+True Action 2:
+→ Execute JS (той самий код керування)
+
+---
+
+# 6️⃣ Архітектурна порада
+
+Краще винести логіку перевірки unit у функцію:
+
+```javascript
+function controlShiftUnit() {
+
+    var unit = $v('P13_SHIFT_UNIT');
+    var item = apex.item('P13_SHIFT_UNIT');
+
+    if (!unit) {
+        item.setValue('');
+        item.hide();
+        return;
+    }
+
+    if (unit === '1215' || unit === '1216') {
+        item.show();
+        item.disable();
+    }
+    else if (unit === '1217') {
+        item.show();
+        item.enable();
+    }
+    else {
+        item.setValue('');
+        item.hide();
+    }
+}
+```
+
+І тоді просто викликати:
+
+```javascript
+controlShiftUnit();
+```
+
+---
+
+# 🎯 Що в результаті
+
+✔ сервер визначає unit
+✔ клієнт керує відображенням
+✔ працює при заміщенні
+✔ працює при зміні режиму
+
+---
+
+Якщо хочеш — можу зробити ще більш правильний варіант через CSS-клас `.is-disabled` замість стандартного disable (щоб виглядало мʼякше в UI).

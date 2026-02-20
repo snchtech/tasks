@@ -1,0 +1,172 @@
+Оце вже критичний момент ⚠
+Тут ми залазимо прямо в security-механізм кнопки підпису.
+
+Твоє завдання:
+
+> Якщо вибраний `P0_SHIFT_UNIT`, то перевірка по unit повинна проходити незалежно від ACL-ролі.
+
+Тобто логіка стає:
+
+```
+Unit дозволено, якщо:
+   - або ACL дозволяє
+   - або вибрано shift_unit і він співпадає з потрібним unit
+```
+
+І це треба зробити без поломки substitution-режиму.
+
+---
+
+# 🧠 Головний принцип
+
+Shift — це override.
+Але він не повинен зламати перевірку position / department / tabno.
+
+Міняємо тільки unit-частину.
+
+---
+
+# ✅ 1️⃣ Оновлена has_unit_role
+
+Було:
+
+```plsql
+function has_unit_role(p_unit_id number) return boolean is
+begin
+   if p_unit_id is null then 
+      return true;
+   end if;
+
+   if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles, '~'), 'U_'||p_unit_id) > 0;
+   else
+      return apex_acl.has_user_role(P_app_id, P_app_user, 'U_'||p_unit_id);
+   end if;
+end;
+```
+
+---
+
+## 🔥 Стає:
+
+```plsql
+function has_unit_role(p_unit_id number) return boolean is
+begin
+
+   -- якщо unit не заданий у списку
+   if p_unit_id is null then
+      return true;
+   end if;
+
+   -- 🔹 SHIFT OVERRIDE
+   if :P0_SHIFT_UNIT is not null then
+      if p_unit_id = :P0_SHIFT_UNIT then
+         return true;
+      end if;
+   end if;
+
+   -- 🔹 стандартна логіка
+   if p_substitution_mode = 1 then
+      return instr(nvl(p_new_roles, '~'), 'U_'||p_unit_id) > 0;
+   else
+      return apex_acl.has_user_role(P_app_id, P_app_user, 'U_'||p_unit_id);
+   end if;
+
+end;
+```
+
+---
+
+# 🏆 Що це дає
+
+✔ якщо shift не вибраний → нічого не змінилось
+✔ якщо shift вибраний → unit проходить перевірку
+✔ substitution працює як раніше
+✔ ACL не ламається
+
+---
+
+# ✅ 2️⃣ Аналогічно в has_role
+
+Знайти блок:
+
+```plsql
+if p_list_unit_id is not null then 
+```
+
+Було:
+
+```plsql
+if p_substitution_mode = 1 then
+   l_is_unit := instr(nvl(P_new_roles, '~'), 'U_'||p_list_unit_id) > 0;
+else
+   l_is_unit := apex_acl.has_user_role(p_app_id, P_app_user, 'U_'||p_list_unit_id);
+end if;
+```
+
+---
+
+## 🔥 Стає:
+
+```plsql
+if p_list_unit_id is not null then 
+
+   -- SHIFT override
+   if :P0_SHIFT_UNIT is not null 
+      and p_list_unit_id = :P0_SHIFT_UNIT then
+      l_is_unit := true;
+
+   else
+      if p_substitution_mode = 1 then
+         l_is_unit := instr(nvl(P_new_roles, '~'), 'U_'||p_list_unit_id) > 0;
+      else
+         l_is_unit := apex_acl.has_user_role(p_app_id, P_app_user, 'U_'||p_list_unit_id);
+      end if;
+   end if;
+
+end if;
+```
+
+---
+
+# ⚠ ВАЖЛИВО
+
+`:P0_SHIFT_UNIT` має бути в session state
+(ти вже це зробив через Dynamic Action)
+
+---
+
+# 🧩 Чому не варто міняти ACL
+
+ACL = базовий механізм ролей
+Shift = runtime override
+
+Змішувати їх у базі не варто.
+
+---
+
+# 🎯 Тепер логіка кнопки буде:
+
+| Умова                      | Результат    |
+| -------------------------- | ------------ |
+| Є роль ACL                 | кнопка       |
+| Немає ролі ACL             | немає кнопки |
+| Немає ACL але є shift_unit | кнопка       |
+| Немає нічого               | немає        |
+
+---
+
+# 🚨 Але одне стратегічне питання
+
+Shift дає доступ до проставлення підпису.
+
+Чи це точно безпечно?
+
+Тобто користувач може обрати будь-який shift_unit?
+Чи список обмежений?
+
+Якщо список не обмежений — це потенційна security-дірка.
+
+---
+
+Якщо хочеш — можу показати, як зробити shift перевірку безпечнішою (щоб він працював тільки в межах department користувача).

@@ -1,0 +1,72 @@
+Добре 👍
+Тобі потрібно аналогічний `CASE`, але з урахуванням `P0_SHIFT_UNIT`, щоб він мав пріоритет.
+
+Ось правильний варіант.
+
+---
+
+# 🔹 Варіант 1 — Shift має найвищий пріоритет
+
+(найбільш логічний варіант для override)
+
+```sql
+CASE
+    WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+    WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+    ELSE :P0_CUR_USER_UNIT
+END AS unit_id
+```
+
+✔ Якщо користувач обрав shift → використовується він
+✔ Якщо shift не вибрано → працює стара логіка
+✔ Нічого не ламається
+
+---
+
+# 🔹 Варіант 2 — Shift працює тільки в режимі заміщення
+
+Якщо ти хочеш, щоб shift враховувався лише коли `P0_SUBSTITUTION_MODE = 1`:
+
+```sql
+CASE
+    WHEN :P0_SUBSTITUTION_MODE = 1 
+         AND :P0_SHIFT_UNIT IS NOT NULL
+    THEN :P0_SHIFT_UNIT
+    WHEN :P0_SUBSTITUTION_MODE = 1 
+    THEN :P0_NEW_UNIT_ID
+    ELSE :P0_CUR_USER_UNIT
+END AS unit_id
+```
+
+---
+
+# 🔹 Варіант 3 — Мінімально втручальний (по аналогії з твоїм)
+
+Ти просив "по аналогії", максимально близько до оригіналу:
+
+```sql
+CASE
+    WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+    WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+    ELSE :P0_CUR_USER_UNIT
+END AS unit_id
+```
+
+(це той самий варіант 1, просто без зайвої логіки)
+
+---
+
+# 🎯 Рекомендація
+
+Я б радив **варіант 1**.
+
+Він:
+
+* логічний
+* прозорий
+* не створює прихованої поведінки
+* легко підтримується
+
+---
+
+Якщо хочеш — можу ще показати, як красиво інтегрувати це у твій CTE `uc` без дублювання логіки по всьому запиту.

@@ -1,0 +1,171 @@
+Ти мислиш абсолютно правильно ✅
+У твоїй ситуації **не можна ламати існуючу модель uc.unit_id**, бо вона вже інтегрована в доступи (і там складна логіка access_level 1/2/3).
+
+Найбезпечніша архітектура:
+
+👉 Додати глобальний item `P0_SHIFT_UNIT`
+👉 При зміні `P13_SHIFT_UNIT` записувати значення в `P0_SHIFT_UNIT`
+👉 В доступах просто додати додаткову умову
+
+Це мінімально інвазивно і контрольовано.
+
+---
+
+# 1️⃣ Створити глобальний item
+
+На Global Page (Page 0):
+
+```
+P0_SHIFT_UNIT
+Type: Hidden
+Maintain Session State: Yes
+```
+
+---
+
+# 2️⃣ Dynamic Action — Change P13_SHIFT_UNIT
+
+Event:
+
+```
+Change
+Item: P13_SHIFT_UNIT
+```
+
+---
+
+## True Action 1 → Execute JavaScript Code
+
+```javascript
+var shiftUnit = $v('P13_SHIFT_UNIT');
+
+// якщо порожнє → очищаємо глобальний
+if (!shiftUnit) {
+    apex.item('P0_SHIFT_UNIT').setValue('');
+} else {
+    apex.item('P0_SHIFT_UNIT').setValue(shiftUnit);
+}
+```
+
+⚠ Важливо: цього недостатньо — бо це тільки клієнтська зміна.
+
+---
+
+## True Action 2 → Submit Page Items
+
+Action:
+
+```
+Submit Page
+Items to Submit:
+P0_SHIFT_UNIT
+```
+
+або краще (щоб не reload сторінки):
+
+---
+
+## True Action 2 (краще) → Execute PL/SQL Code (AJAX)
+
+```plsql
+:P0_SHIFT_UNIT := :P13_SHIFT_UNIT;
+```
+
+Items to Submit:
+
+```
+P13_SHIFT_UNIT
+```
+
+Items to Return:
+
+```
+P0_SHIFT_UNIT
+```
+
+✔ Це оновить session state без перезавантаження.
+
+---
+
+# 3️⃣ Тепер у твоїй access логіці
+
+Ти зараз маєш перевірки типу:
+
+```sql
+AND (uc.unit_id IS NULL OR sr.unit_id = uc.unit_id)
+```
+
+Ми НЕ міняємо uc.unit_id.
+
+Ми додаємо окрему гілку:
+
+---
+
+## 🔹 Правильна безпечна умова
+
+```sql
+AND (
+      (uc.unit_id IS NULL OR sr.unit_id = uc.unit_id)
+      OR
+      (:P0_SHIFT_UNIT IS NOT NULL AND sr.unit_id = :P0_SHIFT_UNIT)
+    )
+```
+
+---
+
+# 4️⃣ В EXIST-блоках аналогічно
+
+Було:
+
+```sql
+AND (uc.unit_id IS NULL OR t1.unit_id = uc.unit_id)
+```
+
+Стає:
+
+```sql
+AND (
+      (uc.unit_id IS NULL OR t1.unit_id = uc.unit_id)
+      OR
+      (:P0_SHIFT_UNIT IS NOT NULL AND t1.unit_id = :P0_SHIFT_UNIT)
+    )
+```
+
+---
+
+# 5️⃣ Важлива тонкість
+
+Якщо `P0_SHIFT_UNIT` = NULL
+— нова гілка автоматично не спрацює
+— логіка працює як раніше
+
+Тобто ти не ламаєш існуючий механізм.
+
+---
+
+# 6️⃣ Якщо треба ще чистіше (архітектурно)
+
+Можна переписати uc.unit_id один раз у WITH:
+
+```sql
+CASE
+   WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+   WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+   ELSE :P0_CUR_USER_UNIT
+END AS unit_id
+```
+
+Але ти казав не хочеш влазити — тому попередній варіант безпечніший.
+
+---
+
+# 🎯 Що ти отримуєш
+
+✔ Повністю збережену стару логіку
+✔ Додатковий override через shift
+✔ Ніяких змін у access_level
+✔ Глобальний контроль через один item
+
+---
+
+Якщо хочеш — можу показати варіант, де shift-режим повністю перехоплює доступ (тобто має вищий пріоритет ніж uc.unit_id). Це вже трохи інша модель безпеки.
