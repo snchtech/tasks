@@ -1,0 +1,80 @@
+Ось акуратна логіка для Oracle (APEX), яку можна використати як:
+
+* або прямо в `INSERT`
+* або в `UPDATE`
+* або як окремий PL/SQL блок
+
+---
+
+## ✅ Варіант 1 — Найпростіше через `CASE` (рекомендований)
+
+### 🔹 Вставка (INSERT)
+
+```sql
+INSERT INTO your_table (unit_id)
+VALUES (
+    CASE
+        WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 0 THEN :P0_CUR_USER_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+        ELSE NULL
+    END
+);
+```
+
+---
+
+### 🔹 Оновлення (UPDATE)
+
+```sql
+UPDATE your_table
+SET unit_id =
+    CASE
+        WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 0 THEN :P0_CUR_USER_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+        ELSE NULL
+    END
+WHERE id = :P0_ID;
+```
+
+---
+
+## ✅ Варіант 2 — Через PL/SQL (якщо треба додаткова логіка)
+
+```plsql
+DECLARE
+    l_unit_id NUMBER;
+BEGIN
+    IF :P0_SHIFT_UNIT IS NOT NULL THEN
+        l_unit_id := :P0_SHIFT_UNIT;
+
+    ELSE
+        IF :P0_SUBSTITUTION_MODE = 0 THEN
+            l_unit_id := :P0_CUR_USER_UNIT;
+        ELSIF :P0_SUBSTITUTION_MODE = 1 THEN
+            l_unit_id := :P0_NEW_UNIT_ID;
+        ELSE
+            l_unit_id := NULL;
+        END IF;
+    END IF;
+
+    INSERT INTO your_table (unit_id)
+    VALUES (l_unit_id);
+
+END;
+```
+
+---
+
+## 🔎 Який варіант краще?
+
+| Ситуація                        | Рішення                      |
+| ------------------------------- | ---------------------------- |
+| Просто записати значення        | ✅ `CASE`                     |
+| Є складна додаткова логіка      | ✅ PL/SQL                     |
+| Використовується в APEX Process | ✅ `CASE` (чистіше і коротше) |
+
+---
+
+Якщо хочеш — можу адаптувати це одразу під твій конкретний `TASKS` / `SIGNATURERIGHTS` / іншу таблицю з правильними колонками.

@@ -1,0 +1,158 @@
+Добре, розкладемо логіку акуратно і правильно для APEX (page 0).
+
+Тобі потрібно:
+
+1. Визначити "активний unit"
+
+   * якщо `P0_SHIFT_UNIT` ≠ null → беремо його
+   * інакше:
+
+     * якщо `P0_SUBSTITUTION_MODE = 0` → беремо `P0_CUR_USER_UNIT`
+     * якщо `P0_SUBSTITUTION_MODE = 1` → беремо `P0_NEW_UNIT_ID`
+
+2. По цьому unit отримати `unit_name` з таблиці `UNIT`
+
+3. Записати:
+
+   * у `P0_SHIFT_UNIT_NAME`
+   * у label `P0_SHIFT_INFO` (в дужках)
+
+---
+
+# ✅ Правильне рішення (чисте і стабільне)
+
+Рекомендую зробити це через **AJAX Callback + JS**, щоб не дублювати SQL.
+
+---
+
+# 🔹 КРОК 1. AJAX Process на Global Page (Page 0)
+
+Створи Process:
+Type: **Ajax Callback**
+Name: `GET_UNIT_NAME`
+
+```plsql
+DECLARE
+    l_unit_id   NUMBER;
+    l_unit_name VARCHAR2(200);
+BEGIN
+
+    -- 1️⃣ визначаємо unit
+    IF :P0_SHIFT_UNIT IS NOT NULL THEN
+        l_unit_id := :P0_SHIFT_UNIT;
+
+    ELSIF :P0_SUBSTITUTION_MODE = 0 THEN
+        l_unit_id := :P0_CUR_USER_UNIT;
+
+    ELSIF :P0_SUBSTITUTION_MODE = 1 THEN
+        l_unit_id := :P0_NEW_UNIT_ID;
+
+    END IF;
+
+    -- 2️⃣ отримуємо назву
+    IF l_unit_id IS NOT NULL THEN
+        SELECT unit_name
+        INTO l_unit_name
+        FROM unit
+        WHERE id = l_unit_id;
+    END IF;
+
+    -- 3️⃣ повертаємо JSON
+    apex_json.open_object;
+    apex_json.write('unit_id', l_unit_id);
+    apex_json.write('unit_name', l_unit_name);
+    apex_json.close_object;
+
+END;
+```
+
+---
+
+# 🔹 КРОК 2. JS функція
+
+Додай у Page 0 → Function and Global Variable Declaration:
+
+```javascript
+function refreshShiftInfo() {
+
+    apex.server.process(
+        "GET_UNIT_NAME",
+        {},
+        {
+            success: function (pData) {
+
+                if (pData.unit_id) {
+                    apex.item("P0_SHIFT_UNIT_NAME").setValue(pData.unit_name);
+
+                    // вставляємо в label у дужках
+                    $("#P0_SHIFT_INFO_LABEL")
+                        .text($("#P0_SHIFT_INFO_LABEL").text().split(" (")[0] 
+                              + " (" + pData.unit_name + ")");
+                }
+            }
+        }
+    );
+}
+```
+
+---
+
+# 🔹 КРОК 3. Dynamic Actions
+
+### 1️⃣ On Page Load
+
+Event: Page Load
+True Action: Execute JavaScript Code
+
+```javascript
+refreshShiftInfo();
+```
+
+---
+
+### 2️⃣ On Change P0_SHIFT_UNIT
+
+Event: Change
+Item: P0_SHIFT_UNIT
+True Action: Execute JavaScript Code
+
+```javascript
+refreshShiftInfo();
+```
+
+---
+
+# 🔹 Що буде відбуватись
+
+При завантаженні:
+
+* Якщо P0_SHIFT_UNIT ≠ null → він використовується
+* Інакше логіка substitution_mode
+* Повертається правильний unit_name
+* Записується в:
+
+  * P0_SHIFT_UNIT_NAME
+  * label P0_SHIFT_INFO → (Назва)
+
+---
+
+# ⚠️ Важливо щодо label
+
+APEX генерує label id як:
+
+```
+P0_SHIFT_INFO_LABEL
+```
+
+Але краще перевір через Inspect.
+
+---
+
+# ✅ Якщо хочеш максимально простіше (без AJAX)
+
+Можна зробити через Set Value (SQL) в Dynamic Action, але тоді доведеться дублювати SQL у двох місцях (On Load + Change).
+AJAX-варіант чистіший.
+
+---
+
+Якщо хочеш — можу зробити ще більш елегантний варіант без jQuery, тільки через apex.item().setLabel(), щоб було сучасніше і без split тексту.

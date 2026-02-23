@@ -1,0 +1,133 @@
+Добре 👍 тоді робимо **чисто через Dynamic Actions**, без Ajax Callback і без Processing.
+
+Це можна зробити красиво через **Set Value (SQL Statement)**.
+
+---
+
+# ✅ Логіка
+
+Нам потрібно:
+
+1. Визначити актуальний `unit_id`
+   Пріоритет:
+
+   * `P0_SHIFT_UNIT`
+   * інакше по `P0_SUBSTITUTION_MODE`
+
+2. Отримати `unit_name`
+
+3. Записати:
+
+   * в `P0_SHIFT_UNIT_NAME`
+   * в label `P0_SHIFT_INFO`
+
+---
+
+# 🔹 КРОК 1 — Dynamic Action "INIT SHIFT INFO"
+
+### Event:
+
+* Page Load
+
+### True Action 1:
+
+**Set Value**
+
+* Set Type: SQL Statement
+* Affected Item: `P0_SHIFT_UNIT_NAME`
+* Page Items to Submit:
+
+  ```
+  P0_SHIFT_UNIT,
+  P0_SUBSTITUTION_MODE,
+  P0_CUR_USER_UNIT,
+  P0_NEW_UNIT_ID
+  ```
+
+### SQL:
+
+```sql
+SELECT u.unit_name
+FROM unit u
+WHERE u.id = 
+    CASE
+        WHEN :P0_SHIFT_UNIT IS NOT NULL THEN :P0_SHIFT_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 0 THEN :P0_CUR_USER_UNIT
+        WHEN :P0_SUBSTITUTION_MODE = 1 THEN :P0_NEW_UNIT_ID
+    END
+```
+
+---
+
+# 🔹 КРОК 2 — Change на P0_SHIFT_UNIT
+
+Створи ще одну Dynamic Action:
+
+### Event:
+
+* Change
+* Item: `P0_SHIFT_UNIT`
+
+True Action → той самий Set Value (можна скопіювати)
+
+---
+
+# 🔹 КРОК 3 — Оновлення label
+
+Після Set Value додай другу True Action:
+
+### Action:
+
+Execute JavaScript Code
+
+```javascript
+var unitName = $v("P0_SHIFT_UNIT_NAME");
+
+if (unitName) {
+    var baseLabel = "Зміна"; // або твій базовий текст label
+    $("#P0_SHIFT_INFO_LABEL").text(baseLabel + " (" + unitName + ")");
+}
+```
+
+⚠ Якщо label уже має текст, і ти не хочеш його перезаписувати жорстко:
+
+```javascript
+var unitName = $v("P0_SHIFT_UNIT_NAME");
+
+if (unitName) {
+    var lbl = $("#P0_SHIFT_INFO_LABEL");
+    var base = lbl.text().split(" (")[0];
+    lbl.text(base + " (" + unitName + ")");
+}
+```
+
+---
+
+# 🎯 Що тепер відбувається
+
+При Page Load:
+
+* визначається правильний unit
+* отримується unit_name
+* оновлюється label
+
+При Change P0_SHIFT_UNIT:
+
+* одразу перераховується
+* label оновлюється
+
+---
+
+# 🔥 Бонус (професійний варіант)
+
+Якщо хочеш ще акуратніше — можна:
+
+* створити **Hidden item P0_EFFECTIVE_UNIT_ID**
+* першим Set Value визначати тільки ID
+* другим Set Value отримувати name
+
+Це робить логіку чистішою і простішою для підтримки.
+
+---
+
+Якщо хочеш — можу намалювати тобі схему DA крок за кроком, щоб ти буквально клацнула в APEX і все запрацювало без експериментів.
