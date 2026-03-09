@@ -1,0 +1,426 @@
+У вас досить складна, але **дуже правильна модель**:
+
+* ієрархічні підзавдання
+* порядок (`subtask_order`)
+* дані зберігаються в **APEX_COLLECTION**
+* IG використовується як **viewer**
+
+Тут є два реальні підходи, які застосовують у workflow-системах.
+
+Я поясню обидва і скажу **який краще для вашої моделі**.
+
+---
+
+# 1️⃣ Правильна модель сортування для ієрархії
+
+У вас вже є:
+
+```
+SEQ_ID   – ключ
+C005     – parent_id
+C006     – subtask_order
+```
+
+Тобто фактично:
+
+```
+ORDER = C006
+PARENT = C005
+```
+
+Тоді **правильне правило сортування**:
+
+### Рівень 1
+
+```
+parent_id IS NULL
+ORDER BY subtask_order
+```
+
+### Рівень 2
+
+```
+parent_id = X
+ORDER BY subtask_order
+```
+
+### Рівень 3
+
+```
+parent_id = Y
+ORDER BY subtask_order
+```
+
+Тобто **сортування відбувається тільки всередині одного parent**.
+
+---
+
+# 2️⃣ Що має відбуватись при drag
+
+### Якщо рухаємо **батьківський запис**
+
+```
+A
+  A1
+  A2
+
+B
+  B1
+  B2
+```
+
+Перетягнули:
+
+```
+B
+  B1
+  B2
+
+A
+  A1
+  A2
+```
+
+Міняється **тільки порядок батьків**
+
+```
+A.subtask_order
+B.subtask_order
+```
+
+---
+
+### Якщо рухаємо **дочірній**
+
+```
+A
+  A1
+  A2
+  A3
+```
+
+Перетягнули:
+
+```
+A
+  A3
+  A1
+  A2
+```
+
+Оновлюється порядок:
+
+```
+A1
+A2
+A3
+```
+
+---
+
+# 3️⃣ Як це зробити технічно
+
+Найкраще рішення:
+
+### ✔ jQuery sortable
+
+### ✔ drag-handle
+
+### ✔ AJAX update
+
+---
+
+# 4️⃣ HTML drag handle (у вас вже є)
+
+```
+<span class="drag-handle">☰</span>
+```
+
+Це правильно.
+
+---
+
+# 5️⃣ JS для сортування
+
+В **Execute when Page Loads**
+
+```javascript
+initSubtaskSorting();
+```
+
+---
+
+### JS функція
+
+```javascript
+function initSubtaskSorting(){
+
+    $("#subtasksReport_0 tbody").sortable({
+
+        handle: ".drag-handle",
+        axis: "y",
+
+        update: function(event, ui){
+
+            let order = [];
+
+            $("#subtasksReport_0 tbody tr").each(function(index){
+
+                let id = $(this).data("id");
+
+                order.push({
+                    id: id,
+                    order: index + 1
+                });
+
+            });
+
+            apex.server.process(
+                "SAVE_SUBTASK_ORDER",
+                {
+                    x01: JSON.stringify(order)
+                },
+                {
+                    success: function(){
+                        apex.region("subtasksReport_0").refresh();
+                    }
+                }
+            );
+
+        }
+
+    });
+
+}
+```
+
+---
+
+# 6️⃣ Ajax Process
+
+```
+SAVE_SUBTASK_ORDER
+```
+
+```plsql
+DECLARE
+
+    l_json CLOB := apex_application.g_x01;
+
+BEGIN
+
+FOR rec IN (
+    SELECT *
+    FROM JSON_TABLE(
+        l_json,
+        '$[*]'
+        COLUMNS (
+            seq_id NUMBER PATH '$.id',
+            ord NUMBER PATH '$.order'
+        )
+    )
+)
+LOOP
+
+    apex_collection.update_member_attribute(
+        p_collection_name => 'TASK_SUBTASKS_COLLECTION',
+        p_seq             => rec.seq_id,
+        p_attr_number     => 6,
+        p_attr_value      => rec.ord
+    );
+
+END LOOP;
+
+END;
+```
+
+---
+
+# 7️⃣ Важливе обмеження
+
+Ваш поточний JS сортує **всі рядки разом**, але для ієрархії це не зовсім правильно.
+
+Треба обмежити drag:
+
+```
+можна рухати тільки між siblings
+```
+
+тобто:
+
+```
+same parent_id
+```
+
+---
+
+# 8️⃣ Кращий варіант для ієрархії
+
+Замість `sortable` використати:
+
+### ⭐ jQuery NestedSortable
+
+Він підтримує:
+
+✔ tree
+✔ children
+✔ parent move
+
+---
+
+### Приклад
+
+```
+A
+  A1
+  A2
+
+B
+  B1
+```
+
+Drag:
+
+```
+A2 → B
+```
+
+---
+
+# 9️⃣ NestedSortable JS
+
+```javascript
+$("#subtasksReport_0 tbody").nestedSortable({
+
+    handle: ".drag-handle",
+    items: "tr",
+    toleranceElement: "> div",
+    maxLevels: 10,
+
+    update: function(){
+
+        let data = $(this).nestedSortable("toArray");
+
+        apex.server.process(
+            "SAVE_SUBTASK_TREE",
+            {
+                x01: JSON.stringify(data)
+            },
+            {
+                success:function(){
+                    apex.region("subtasksReport_0").refresh();
+                }
+            }
+        );
+
+    }
+
+});
+```
+
+---
+
+# 🔟 Але у вас є нюанс
+
+Ваш IG:
+
+```
+не має <ul><li>
+```
+
+NestedSortable працює з:
+
+```
+ul li
+```
+
+---
+
+# ⭐ Тому для APEX найкраща практика
+
+✔ **drag тільки всередині одного рівня**
+
+---
+
+# Реалізація
+
+JS:
+
+```
+group by parent_id
+```
+
+і створюємо sortable для кожної групи.
+
+---
+
+# Альтернатива (дуже популярна в workflow)
+
+Замість drag:
+
+### кнопки
+
+```
+⬆ Move Up
+⬇ Move Down
+```
+
+Переваги:
+
+✔ простіше
+✔ без JS library
+✔ стабільніше
+
+---
+
+# Приклад SQL кнопок
+
+```
+CASE
+WHEN subtask_order > 1
+THEN '<button class="move-up" data-id="'||seq_id||'">↑</button>'
+END
+```
+
+---
+
+# AJAX
+
+```
+swap subtask_order
+```
+
+---
+
+# ⭐ Моя рекомендація для вашої системи
+
+Оскільки у вас:
+
+* ієрархія
+* APEX collection
+* Interactive Grid
+
+найстабільніша архітектура:
+
+### ✔ Move Up / Move Down
+
+### ✔ reorder within parent
+
+### ✔ AJAX swap
+
+Це використовують:
+
+* Jira
+* ServiceNow
+* Camunda
+
+---
+
+# Якщо хочете — я можу показати **дуже сильну реалізацію drag-sorting для APEX**, яку використовують у **workflow системах з тисячами задач**.
+
+Вона:
+
+✔ підтримує **ієрархію**
+✔ працює в **Interactive Grid**
+✔ не ламає refresh APEX
+✔ не використовує nestedSortable.

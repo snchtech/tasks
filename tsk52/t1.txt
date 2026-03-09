@@ -1,0 +1,261 @@
+Так, у вас правильна ідея: **перед `Submit Page` на кнопці “Додати виконавця” треба примусово зберегти поточні стани перемикачів через Ajax**, і лише після успішного збереження робити submit.
+
+Інакше `submit page` перезавантажує сторінку, а перемикачі знову малюються з БД у стані “всі послідовні”.
+
+## Що саме треба зробити
+
+На кнопці **“Додати виконавця”**:
+
+1. залишити ваші DA `Execute server-side / Clear / Set value`, якщо вони потрібні;
+2. **замість стандартного `Submit Page`** поставити `Execute JavaScript Code`;
+3. у цьому JS:
+
+   * зібрати всі `.stage-toggle-input`,
+   * відправити їх у ваш On Demand Process `ADD_CONFIRM_LIST_TO_DB_TABLE`,
+   * і вже в `success` виконати `apex.submit(...)`.
+
+---
+
+# 1. Зробіть окрему JS-функцію
+
+Її можна покласти в Function and Global Variable Declaration сторінки.
+
+```javascript
+function collectStageModes() {
+    const stagesData = [];
+
+    document.querySelectorAll(".stage-toggle-input").forEach(function(item) {
+        stagesData.push({
+            id: Number(item.getAttribute("data-stage-id")),
+            mode: item.checked ? 1 : 0
+        });
+    });
+
+    return stagesData;
+}
+
+function saveStageModesBeforeSubmit(pRequest) {
+    const taskMode = apex.item("P4_TASK_MODE").getValue();
+    const taskID   = apex.item("P4_TASK_ID").getValue();
+    const stagesData = collectStageModes();
+
+    apex.server.process(
+        "ADD_CONFIRM_LIST_TO_DB_TABLE",
+        {
+            x01: taskID,
+            x02: taskMode,
+            x03: JSON.stringify(stagesData)
+        },
+        {
+            dataType: "text",
+            success: function(pData) {
+                apex.submit({ request: pRequest });
+            },
+            error: function(jqXHR, textStatus, errorThrown) {
+                apex.message.clearErrors();
+                apex.message.showErrors([
+                    {
+                        type: "error",
+                        location: "page",
+                        message: "Не вдалося зберегти налаштування етапів перед додаванням виконавця.",
+                        unsafe: false
+                    }
+                ]);
+            }
+        }
+    );
+}
+```
+
+---
+
+# 2. На Dynamic Action кнопки “Додати виконавця”
+
+## Було
+
+* Execute Server-side
+* Clear
+* Set Value
+* **Submit Page**
+
+## Треба
+
+* Execute Server-side
+* Clear
+* Set Value
+* **Execute JavaScript Code**
+
+Код:
+
+```javascript
+saveStageModesBeforeSubmit("ADD_EXECUTOR");
+```
+
+де `ADD_EXECUTOR` — це ваш request, який раніше виконувався через Submit Page.
+Якщо у вас request не використовувався, можна дати будь-який свій, наприклад:
+
+```javascript
+saveStageModesBeforeSubmit("AFTER_ADD_EXECUTOR");
+```
+
+і вже в умовах page processing орієнтуватися на нього.
+
+---
+
+# 3. Важливий момент по PL/SQL процесу
+
+У вашому Ajax process краще **не покладатися на `:P4_TASK_ID`**, а брати `apex_application.g_x01`, `g_x02`, `g_x03`.
+
+Бо під час Ajax-запиту session state сторінки не завжди той, який ви очікуєте.
+
+Ось правильніша схема процесу `ADD_CONFIRM_LIST_TO_DB_TABLE`:
+
+```plsql
+DECLARE
+    l_task_id         NUMBER := TO_NUMBER(apex_application.g_x01);
+    l_task_mode       NUMBER := TO_NUMBER(apex_application.g_x02);
+    l_json            CLOB   := apex_application.g_x03;
+
+    l_values          apex_json.t_values;
+    l_count           PLS_INTEGER;
+
+    l_stage_sign_id   NUMBER;
+    l_stage_sign_mode NUMBER;
+BEGIN
+    apex_json.parse(
+        p_values => l_values,
+        p_source => l_json
+    );
+
+    l_count := apex_json.get_count(
+        p_path   => '.',
+        p_values => l_values
+    );
+
+    apex_debug.info('l_count=' || l_count);
+
+    FOR i IN 1 .. l_count LOOP
+        l_stage_sign_id := apex_json.get_number(
+            p_path   => '[%d].id',
+            p0       => i,
+            p_values => l_values
+        );
+
+        l_stage_sign_mode := apex_json.get_number(
+            p_path   => '[%d].mode',
+            p0       => i,
+            p_values => l_values
+        );
+
+        apex_debug.info('ID=' || l_stage_sign_id || ', MODE=' || l_stage_sign_mode);
+
+        UPDATE TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+           SET sr.stage_mode = l_stage_sign_mode
+         WHERE sr.task_id = l_task_id
+           AND sr.stages_id IN (
+                SELECT d.id
+                  FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+                 START WITH d.id = l_stage_sign_id
+                CONNECT BY PRIOR d.id = d.parent_stage_id
+           );
+    END LOOP;
+
+    -- Якщо у вашому середовищі для DB link потрібен явний COMMIT:
+    COMMIT;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        apex_debug.info('ERROR: ' || SQLERRM);
+        RAISE;
+END;
+```
+
+---
+
+# 4. Чому це спрацює
+
+Тепер логіка буде така:
+
+1. користувач перемкнув етапи;
+2. натиснув “Додати виконавця”;
+3. спочатку JS зчитує **поточні стани перемикачів з DOM**;
+4. Ajax process одразу записує їх у БД;
+5. тільки після цього виконується `submit page`;
+6. сторінка перезавантажується вже з **оновленими stage_mode**.
+
+Тобто налаштування більше не “збиваються”.
+
+---
+
+# 5. Що ще краще, ніж submit
+
+Найкращий варіант архітектурно — **взагалі не робити `Submit Page` після додавання виконавця**, а замість цього:
+
+* робити Ajax-запис виконавця,
+* потім `apex.region(...).refresh()` потрібного регіону,
+* і окремо refresh блоку маршрутів/етапів.
+
+Тоді сторінка не перезавантажується і проблема з перемикачами зникає повністю.
+
+Але якщо зараз хочете мінімальне доопрацювання без перебудови сторінки, то варіант **“Ajax save stage_mode → success → submit”** є правильним і практичним.
+
+---
+
+# 6. Практична порада по порядку DA
+
+Якщо у вас зараз `Clear` або `Set Value` можуть зачіпати елементи, від яких залежить JS, то ставте новий JS-крок:
+
+* або **перед Clear**,
+* або після всіх дій, які не змінюють `.stage-toggle-input`.
+
+Головне правило:
+**зберігати stage toggle треба в той момент, коли вони ще мають актуальний стан у DOM**.
+
+---
+
+# 7. Готовий короткий варіант для DA
+
+Якщо вам не хочеться виносити в окремі функції, можна прямо в DA вставити:
+
+```javascript
+const taskMode = apex.item("P4_TASK_MODE").getValue();
+const taskID   = apex.item("P4_TASK_ID").getValue();
+
+let stagesData = [];
+
+document.querySelectorAll(".stage-toggle-input").forEach(function(item) {
+    stagesData.push({
+        id: Number(item.getAttribute("data-stage-id")),
+        mode: item.checked ? 1 : 0
+    });
+});
+
+apex.server.process(
+    "ADD_CONFIRM_LIST_TO_DB_TABLE",
+    {
+        x01: taskID,
+        x02: taskMode,
+        x03: JSON.stringify(stagesData)
+    },
+    {
+        dataType: "text",
+        success: function() {
+            apex.submit({ request: "ADD_EXECUTOR" });
+        },
+        error: function() {
+            apex.message.showErrors([
+                {
+                    type: "error",
+                    location: "page",
+                    message: "Помилка збереження маршруту відміток перед submit.",
+                    unsafe: false
+                }
+            ]);
+        }
+    }
+);
+```
+
+---
+
+Якщо хочете, я можу далі дати вам **точну схему Dynamic Action по кроках для APEX**: який Action має бути першим, який другим, і де саме прибрати `Submit Page`, щоб ви просто повторили в Page Designer.

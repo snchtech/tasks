@@ -1,0 +1,246 @@
+Чудова ідея — **обмежити кнопки ↑ ↓ залежно від позиції**. Це справді усуває більшість помилок користувача і спрощує серверну логіку. Нижче покажу **як правильно зробити це в Interactive Grid**, включно зі стилізацією під **Material UI (MUI-подібний вигляд)**.
+
+---
+
+# 1. SQL: визначаємо позицію підзавдання серед siblings
+
+Щоб знати, яке підзавдання **перше / останнє**, потрібно порахувати позицію всередині одного `parent`.
+
+Додайте у свій CTE або фінальний SELECT:
+
+```sql
+ROW_NUMBER() OVER (
+  PARTITION BY parent_seq_id 
+  ORDER BY subtask_order
+) AS rn,
+COUNT(*) OVER (
+  PARTITION BY parent_seq_id
+) AS total_in_parent
+```
+
+---
+
+# 2. Формуємо кнопки ↑ ↓
+
+Тепер у SELECT додаємо колонку з HTML.
+
+```sql
+CASE
+WHEN rn = 1 AND total_in_parent > 1 THEN
+    '<button class="mui-move-btn move-down"
+        data-id="'||seq_id||'"
+        data-parent="'||parent_seq_id||'"
+        data-dir="DOWN">
+        ↓
+    </button>'
+
+WHEN rn = total_in_parent AND total_in_parent > 1 THEN
+    '<button class="mui-move-btn move-up"
+        data-id="'||seq_id||'"
+        data-parent="'||parent_seq_id||'"
+        data-dir="UP">
+        ↑
+    </button>'
+
+WHEN total_in_parent > 1 THEN
+    '<button class="mui-move-btn move-up"
+        data-id="'||seq_id||'"
+        data-parent="'||parent_seq_id||'"
+        data-dir="UP">
+        ↑
+    </button>
+
+     <button class="mui-move-btn move-down"
+        data-id="'||seq_id||'"
+        data-parent="'||parent_seq_id||'"
+        data-dir="DOWN">
+        ↓
+    </button>'
+END AS move_buttons
+```
+
+---
+
+# 3. Колонка в Interactive Grid
+
+В IG:
+
+```
+Column Type = Plain Text
+Escape special characters = No
+```
+
+Назва колонки, наприклад:
+
+```
+MOVE
+```
+
+---
+
+# 4. JS обробник кнопок
+
+У **Execute when Page Loads**
+
+```javascript
+$(document).on("click",".mui-move-btn",function(){
+
+    let id=$(this).data("id");
+    let parent=$(this).data("parent");
+    let dir=$(this).data("dir");
+
+    apex.server.process(
+        "MOVE_SUBTASK",
+        {
+            x01:id,
+            x02:parent,
+            x03:dir
+        },
+        {
+            success:function(){
+
+                apex.region("subtasksReport_0").refresh();
+
+            }
+        }
+    );
+
+});
+```
+
+---
+
+# 5. CSS стилізація під Material UI
+
+Додайте CSS у сторінку.
+
+```css
+.mui-move-btn{
+
+  border:none;
+  background:#f5f5f5;
+  color:#555;
+
+  width:28px;
+  height:28px;
+
+  border-radius:4px;
+
+  margin-right:4px;
+
+  font-size:14px;
+  font-weight:600;
+
+  cursor:pointer;
+
+  transition:all .15s ease;
+}
+
+.mui-move-btn:hover{
+
+  background:#1976d2;
+  color:white;
+
+}
+
+.mui-move-btn:active{
+
+  transform:scale(.92);
+
+}
+```
+
+---
+
+# 6. Вигляд кнопок
+
+У гріді це виглядатиме приблизно так:
+
+```
+↑
+↓
+```
+
+або
+
+```
+↑ ↓
+```
+
+у колонці.
+
+---
+
+# 7. Покращення UX
+
+Можна додати **іконки замість стрілок**.
+
+```html
+<span class="material-icons">arrow_upward</span>
+```
+
+або
+
+```html
+<span class="material-icons">arrow_downward</span>
+```
+
+---
+
+# 8. Щоб IG виглядав чистіше
+
+Додайте стилі для колонки:
+
+```css
+td[headers="MOVE"]{
+
+  text-align:center;
+
+}
+```
+
+---
+
+# 9. Ще одна корисна річ
+
+Щоб кнопки виглядали як **MUI icon buttons**:
+
+```css
+.mui-move-btn{
+
+  background:transparent;
+
+}
+```
+
+hover:
+
+```css
+.mui-move-btn:hover{
+
+  background:rgba(25,118,210,.08);
+  color:#1976d2;
+
+}
+```
+
+Це практично **Material UI style**.
+
+---
+
+# ⭐ Результат
+
+У вас буде:
+
+| Позиція | Кнопки |
+| ------- | ------ |
+| перше   | ↓      |
+| середні | ↑ ↓    |
+| останнє | ↑      |
+
+і переміщення працюватиме **тільки між siblings**.
+
+---
+
+💡 Якщо хочете, я покажу ще **одну дуже корисну річ для вашого журналу завдань**:
+як зробити **миттєву нумерацію підзавдань (1, 1.1, 1.1.1) без CONNECT BY**, і ваш SQL стане **в 4 рази простішим і швидшим**.

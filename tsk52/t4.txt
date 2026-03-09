@@ -1,0 +1,181 @@
+Так, у вашому випадку (PL/SQL Dynamic Content) **це навіть простіше зробити правильно**, ніж у звичайному HTML.
+Проблема тільки в одному: **елементи створюються динамічно після рендеру сторінки**, тому стандартний `addEventListener` не завжди працює.
+
+Правильний підхід — **event delegation через jQuery `.on()`**.
+
+---
+
+# 1. Найкращий варіант — Global JS listener
+
+У **Page → Function and Global Variable Declaration** або в **Execute when Page Loads** вставте:
+
+```javascript
+$(document).on("change", ".stage-toggle-input", function(){
+
+    const stageId = $(this).data("stage-id");
+    const mode    = this.checked ? 1 : 0;
+    const taskId  = $v("P4_TASK_ID");
+
+    apex.server.process(
+        "SAVE_STAGE_SEQUENCE_MODE",
+        {
+            x01: taskId,
+            x02: stageId,
+            x03: mode
+        },
+        {
+            dataType: "text"
+        }
+    );
+
+});
+```
+
+---
+
+# 2. Ajax Process (набагато простіший)
+
+Оскільки тепер передається **тільки один stage**, JSON більше не потрібен.
+
+Назва процесу:
+
+```
+SAVE_STAGE_SEQUENCE_MODE
+```
+
+```plsql
+DECLARE
+
+    l_task_id NUMBER := TO_NUMBER(apex_application.g_x01);
+    l_stage_id NUMBER := TO_NUMBER(apex_application.g_x02);
+    l_mode NUMBER := TO_NUMBER(apex_application.g_x03);
+
+BEGIN
+
+    UPDATE TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+       SET sr.stage_mode = l_mode
+     WHERE sr.task_id = l_task_id
+       AND sr.stages_id IN (
+            SELECT d.id
+              FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+             START WITH d.id = l_stage_id
+            CONNECT BY PRIOR d.id = d.parent_stage_id
+       );
+
+END;
+```
+
+---
+
+# 3. Нічого змінювати у вашому HTML не треба
+
+Ваш код PL/SQL вже ідеально підходить:
+
+```html
+<input
+class="stage-toggle-input"
+data-stage-id="..."
+type="checkbox"
+>
+```
+
+Саме `data-stage-id` ми читаємо:
+
+```
+$(this).data("stage-id")
+```
+
+---
+
+# 4. Чому цей варіант ідеальний
+
+Тепер:
+
+1️⃣ користувач клацнув toggle
+2️⃣ **change event** спрацював
+3️⃣ одразу виконався `apex.server.process`
+4️⃣ `stage_mode` зберігся в БД
+
+Тобто:
+
+✔ не потрібно чекати Save
+✔ не потрібно ловити submit
+✔ не можна втратити стан
+✔ UX значно кращий
+
+---
+
+# 5. Маленька оптимізація (дуже рекомендую)
+
+Щоб уникнути **10 ajax викликів при швидкому клацанні**, можна зробити debounce.
+
+```javascript
+let stageSaveTimer;
+
+$(document).on("change", ".stage-toggle-input", function(){
+
+    const el = this;
+
+    clearTimeout(stageSaveTimer);
+
+    stageSaveTimer = setTimeout(function(){
+
+        const stageId = $(el).data("stage-id");
+        const mode    = el.checked ? 1 : 0;
+        const taskId  = $v("P4_TASK_ID");
+
+        apex.server.process(
+            "SAVE_STAGE_SEQUENCE_MODE",
+            {
+                x01: taskId,
+                x02: stageId,
+                x03: mode
+            }
+        );
+
+    },200);
+
+});
+```
+
+---
+
+# 6. Ще одна важлива річ
+
+У вашому HTML є:
+
+```html
+onchange="this.value = this.checked ? '1' : '0';"
+```
+
+Це **вже не потрібно**, бо ми читаємо `checked`.
+
+Можете сміливо прибрати:
+
+```html
+onchange="..."
+```
+
+---
+
+# 7. Бонус (що зробить систему дуже стабільною)
+
+Якщо ваш **PL/SQL Dynamic Content region інколи refresh**, потрібно додати:
+
+```javascript
+apex.jQuery(document).on("apexafterrefresh", function(){
+   // listener вже є, нічого робити не треба
+});
+```
+
+Але у вашому випадку навіть це не потрібно, бо `.on()` працює глобально.
+
+---
+
+✅ **Результат:**
+перемикачі одразу записуються в БД при зміні і **ніколи не зіб'ються при submit**.
+
+---
+
+Якщо хочете, я ще покажу **один дуже сильний UX-трюк для таких toggle-маршрутів**, який роблять у системах workflow (SAP / Jira / ServiceNow).
+Він дозволяє **візуально показувати паралельні гілки маршруту** і сильно покращує зрозумілість для користувача.

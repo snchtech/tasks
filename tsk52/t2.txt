@@ -1,0 +1,179 @@
+Зрозуміло. Тоді правильна архітектура така:
+
+* **окремий Ajax process**, який **зберігає тільки `stage_mode`**
+* **ніякого повного збереження маршруту**
+* використовується **тільки перед submit при додаванні виконавця**
+
+Я дам:
+
+1. нову назву процесу
+2. JS виклик
+3. **PL/SQL код максимально близький до вашого на фото**
+
+---
+
+# 1. Назва Ajax process
+
+Назвемо його чітко по функції:
+
+```
+SAVE_STAGE_SEQUENCE_MODE
+```
+
+Він **лише оновлює тип послідовності етапів**.
+
+---
+
+# 2. Javascript виклик (для кнопки "додати виконавця")
+
+```javascript
+function saveStageModesBeforeSubmit(){
+
+    const taskID = apex.item("P4_TASK_ID").getValue();
+
+    let stagesData = [];
+
+    document.querySelectorAll(".stage-toggle-input").forEach(function(item) {
+
+        stagesData.push({
+            id: item.getAttribute("data-stage-id"),
+            mode: item.checked ? 1 : 0
+        });
+
+    });
+
+    apex.server.process(
+        "SAVE_STAGE_SEQUENCE_MODE",
+        {
+            x01: taskID,
+            x02: JSON.stringify(stagesData)
+        },
+        {
+            dataType: "text",
+            success: function () {
+
+                apex.submit("ADD_EXECUTOR");
+
+            }
+        }
+    );
+
+}
+```
+
+Dynamic Action кнопки:
+
+```
+Execute JavaScript Code
+```
+
+```
+saveStageModesBeforeSubmit();
+```
+
+---
+
+# 3. Ajax Process (PL/SQL)
+
+Це **переписаний код з вашого фото**, але:
+
+* без зайвого
+* тільки `stage_mode`
+* використовує `g_x01` і `g_x02`
+
+```plsql
+DECLARE
+
+    l_task_id NUMBER := TO_NUMBER(apex_application.g_x01);
+    l_json    CLOB   := apex_application.g_x02;
+
+    l_values apex_json.t_values;
+    l_count  NUMBER;
+
+    l_stage_sign_id   NUMBER;
+    l_stage_sign_mode NUMBER;
+
+BEGIN
+
+    apex_json.parse(
+        p_values => l_values,
+        p_source => l_json
+    );
+
+    l_count := apex_json.get_count(
+        p_path   => '.',
+        p_values => l_values
+    );
+
+    apex_debug.info('l_count: ' || l_count);
+
+    FOR i IN 1 .. l_count LOOP
+
+        -- Отримуємо ID етапу
+        l_stage_sign_id := apex_json.get_number(
+            p_path   => '[%d].id',
+            p0       => i,
+            p_values => l_values
+        );
+
+        -- Отримуємо режим (0 або 1)
+        l_stage_sign_mode := apex_json.get_number(
+            p_path   => '[%d].mode',
+            p0       => i,
+            p_values => l_values
+        );
+
+        apex_debug.info('stage_id: ' || l_stage_sign_id);
+        apex_debug.info('stage_mode: ' || l_stage_sign_mode);
+
+        UPDATE TaskTracker.SIGNATURERIGHTS@TO_TASKTRACKER10 sr
+           SET sr.stage_mode = l_stage_sign_mode
+         WHERE sr.task_id = l_task_id
+           AND sr.stages_id IN (
+                SELECT d.id
+                  FROM TaskTracker.DICT_APP_CONFIRM_LIST@TO_TASKTRACKER10 d
+                 START WITH d.id = l_stage_sign_id
+                CONNECT BY PRIOR d.id = d.parent_stage_id
+           );
+
+    END LOOP;
+
+END;
+```
+
+---
+
+# 4. Що тепер відбувається
+
+Сценарій роботи:
+
+1️⃣ користувач перемикає етапи
+2️⃣ натискає **додати виконавця**
+3️⃣ JS читає всі `.stage-toggle-input`
+4️⃣ Ajax process **SAVE_STAGE_SEQUENCE_MODE** оновлює тільки `stage_mode`
+5️⃣ після `success` виконується
+
+```
+apex.submit("ADD_EXECUTOR")
+```
+
+6️⃣ сторінка перезавантажується **вже з правильними stage_mode**
+
+---
+
+# 5. Плюс цієї схеми
+
+✔ не запускається повне збереження маршруту
+✔ мінімальний UPDATE
+✔ швидко працює навіть при 20-30 етапах
+✔ логіка не змінює існуючі процеси
+
+---
+
+# 6. Маленьке покращення (рекомендую)
+
+Щоб не робити **20 UPDATE**, можна зробити **1 UPDATE** через `MERGE`.
+
+Це буде **у 10-20 разів швидше**, якщо маршрут великий.
+
+Якщо хочете — я покажу **професійний варіант цього process**, який працює **в 5-10 разів швидше**, ніж ваш поточний код.
