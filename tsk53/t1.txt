@@ -1,0 +1,291 @@
+Так, це можна зробити.
+
+## 1. Як замінити `Select List` на `LOV Multiple Select` в Oracle APEX
+
+Для твого випадку найзручніше зазвичай використовувати **Popup LOV** з мультивибором.
+
+### Варіант через Popup LOV
+
+1. Відкрий потрібний item, наприклад `P4_SHIFT_SELECTOR`.
+2. У властивості **Type** вибери **Popup LOV**.
+3. У блоці **Settings**:
+
+   * **Multiple Values** = `Yes`
+   * **Separator** = `:`
+4. У **List of Values** залиш той самий SQL-запит, який був для одного значення, наприклад:
+
+   ```sql
+   select shift_name, shift_id
+   from shifts
+   order by shift_name
+   ```
+
+   де:
+
+   * перша колонка — що показувати,
+   * друга — що зберігати.
+
+### Що буде в item після вибору
+
+Після вибору кількох значень item буде містити рядок такого типу:
+
+```text
+50:100:103
+```
+
+### Якщо хочеш саме список з чекбоксами
+
+Можна ще використати:
+
+* **Select Many**
+* або **Shuttle**
+
+Але для APEX-процесів і стандартної роботи з LOV найчастіше зручніше саме **Popup LOV + Multiple Values = Yes**.
+
+---
+
+## 2. Як змінити код, щоб обробити `50:100:103` і записати кожне значення окремим рядком у колекцію
+
+У тебе тепер `:P4_SHIFT_SELECTOR` містить не одне число, а список через `:`.
+
+Тому логіка має бути така:
+
+1. Розбити рядок `:P4_SHIFT_SELECTOR` на масив.
+2. Пройтись циклом по кожному id.
+3. Для кожного id виконати `APEX_COLLECTION.ADD_MEMBER`.
+4. `p_ord_counter` збільшувати на кожній ітерації.
+
+---
+
+# Рекомендований підхід
+
+В APEX для цього зручно використати:
+
+```sql
+apex_string.split(:P4_SHIFT_SELECTOR, ':')
+```
+
+---
+
+# Як переробити твій код
+
+Нижче даю готову схему, адаптовану під твій випадок.
+
+## Оновлений PL/SQL-блок
+
+```sql
+declare
+    p_order           number;
+    p_step            number;
+    p_source_id       number;
+    p_ord_counter     number;
+    p_user_tabno      number;
+    p_executor        varchar2(500);
+    l_collection_name varchar2(100);
+
+    l_shift_ids       apex_t_varchar2;
+    l_shift_id        varchar2(100);
+begin
+    p_order     := :P4_ORDER;
+    p_step      := :P4_STEP;
+    p_source_id := :P4_TASK_ID;
+
+    l_collection_name := 'ADD_PERMIT_' || p_order || '_' || p_step;
+
+    apex_util.set_session_state('P4_CHECK_REFRESH', '1');
+
+    if not apex_collection.collection_exists(l_collection_name) then
+        apex_collection.create_collection(l_collection_name);
+    end if;
+
+    ------------------------------------------------------------------
+    -- Оновлюємо порядок існуючих записів у колекції
+    ------------------------------------------------------------------
+    begin
+        for t in (
+            select ac.seq_id,
+                   row_number() over (order by ac.c006 nulls last, ac.seq_id) as rn
+              from apex_collections ac
+             where ac.collection_name = l_collection_name
+        )
+        loop
+            apex_collection.update_member_attribute(
+                p_collection_name => l_collection_name,
+                p_seq             => t.seq_id,
+                p_attr_number     => 6,
+                p_attr_value      => to_char(t.rn)
+            );
+        end loop;
+    exception
+        when others then
+            dbms_output.put_line('Помилка під час оновлення колекції: ' || sqlerrm);
+            raise;
+    end;
+
+    ------------------------------------------------------------------
+    -- Визначаємо наступний порядковий номер
+    ------------------------------------------------------------------
+    select nvl(max(to_number(c006)), 0) + 1
+      into p_ord_counter
+      from apex_collections
+     where collection_name = l_collection_name;
+
+    if :P4_PIB_TITLE is not null then
+        :P4_DEPARTMENT_TITLE := null;
+    end if;
+
+    ------------------------------------------------------------------
+    -- Розбиваємо MULTI SELECT item на список id
+    ------------------------------------------------------------------
+    l_shift_ids := apex_string.split(:P4_SHIFT_SELECTOR, ':');
+
+    ------------------------------------------------------------------
+    -- Для кожного shift id додаємо окремий запис у колекцію
+    ------------------------------------------------------------------
+    for i in 1 .. l_shift_ids.count loop
+        l_shift_id := trim(l_shift_ids(i));
+
+        if l_shift_id is not null then
+            apex_collection.add_member(
+                p_collection_name => l_collection_name,
+                p_c001            => :P4_POSITION_TITLE,
+                p_c002            => :P4_DEPARTMENT_TITLE,
+                p_c003            => :P4_UNIT_TITLE,
+                p_c004            => :P4_STEP,
+                p_c005            => null,
+                p_c006            => p_ord_counter,
+                p_c007            => p_source_id,
+                p_c008            => :P4_PIB_USER,
+                p_c009            => :P4_POSITION,
+                p_c010            => :P4_DEPARTMENT,
+                p_c011            => :P4_UNIT,
+                p_c014            => :P4_PIB_TITLE,
+                p_c020            => :P4_SUBTASK_EXECUTOR,
+                p_c021            => :P4_TASK_MODE,
+                p_c022            => :P4_SBTSK_EXECTR_TITLE,
+                p_c023            => to_number(:P4_UCHASTOK),
+                p_c024            => :P4_UCHASTOK_TITLE,
+
+                -- Ось тут уже записуємо КОЖЕН shift окремо
+                p_c026            => l_shift_id,
+
+                -- Якщо ці поля однакові для всіх вибраних змін,
+                -- залишаємо як є з page items
+                p_c027            => case
+                                        when :P4_SHIFT_NAME is not null
+                                        then :P4_SHIFT_NAME || ' (' || :P4_SHIFT_DEPARTMENT_NAME || ')'
+                                        else null
+                                     end,
+                p_c028            => :P4_SHIFT_DEPARTMENT,
+                p_c029            => :P4_SHIFT_UNIT,
+                p_c030            => :P4_SHIFT_UNIT_TITLE,
+                p_c031            => :P4_SHIFT_POSITION,
+                p_c032            => :P4_SHIFT_POSITION_TITLE
+            );
+
+            p_ord_counter := p_ord_counter + 1;
+        end if;
+    end loop;
+end;
+```
+
+---
+
+# Що саме змінилось
+
+## Було
+
+Раніше ти додавав один запис:
+
+```sql
+p_c026 => :P4_SHIFT_SELECTOR
+```
+
+## Стало
+
+Тепер:
+
+* `:P4_SHIFT_SELECTOR = '50:100:103'`
+* через `apex_string.split` отримуємо масив:
+
+  * `50`
+  * `100`
+  * `103`
+* цикл тричі викликає `apex_collection.add_member(...)`
+
+У результаті в колекції буде **3 окремі записи**.
+
+---
+
+# Важливий момент по display item / назвах зміни
+
+У тебе зараз є:
+
+```sql
+p_c027 => case when :P4_SHIFT_NAME is not null then ... end
+p_c028 => :P4_SHIFT_DEPARTMENT
+p_c029 => :P4_SHIFT_UNIT
+p_c030 => :P4_SHIFT_UNIT_TITLE
+p_c031 => :P4_SHIFT_POSITION
+p_c032 => :P4_SHIFT_POSITION_TITLE
+```
+
+Це спрацює коректно **лише якщо ці значення однакові для всіх вибраних змін**, як ти і написав.
+
+Але якщо в майбутньому для кожної зміни:
+
+* `SHIFT_NAME`
+* `SHIFT_UNIT`
+* `SHIFT_POSITION`
+
+можуть бути різні, тоді в циклі треба буде не брати їх із page items, а робити `select ... into ... where shift_id = l_shift_id`.
+
+---
+
+# Що ще треба змінити в APEX після переходу на Multi Select
+
+## 1. Page Item
+
+Для `P4_SHIFT_SELECTOR`:
+
+* **Type** = `Popup LOV`
+* **Multiple Values** = `Yes`
+* **Separator** = `:`
+
+## 2. Dynamic Actions
+
+Якщо в тебе були Dynamic Action типу:
+
+* `Change` по `P4_SHIFT_SELECTOR`
+* які заповнювали `P4_SHIFT_NAME`, `P4_SHIFT_UNIT`, `P4_SHIFT_POSITION`
+
+то після мультивибору вони можуть вже не працювати так, як раніше, бо item тепер повертає список, а не одне значення.
+
+Тут є 2 варіанти:
+
+* або взагалі не заповнювати ці поля автоматично,
+* або робити окрему логіку для множинного вибору.
+
+---
+
+# Практична порада
+
+Якщо тобі треба тільки:
+
+* зберегти **кілька shift id**
+* а всі інші поля однакові
+
+то найпростіше:
+
+1. змінити item на multi LOV,
+2. розбити значення через `apex_string.split`,
+3. у циклі вставляти по одному запису.
+
+Саме це я показав вище.
+
+---
+
+# Якщо хочеш, я можу наступним повідомленням дати тобі
+
+1. **готовий повністю переписаний твій блок PL/SQL без скорочень**,
+2. або **варіант, де для кожного `shift_id` окремо підтягуються `shift_name / unit / position` із таблиці**.

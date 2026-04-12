@@ -1,0 +1,126 @@
+Так, це можна зробити **лише для однієї конкретної dialog page**, не зачіпаючи інші модальні вікна.
+
+У APEX найзручніше зробити це через **JavaScript на самій цій dialog page**:
+
+* сховати кнопку **Close (X)**,
+* вимкнути закриття по **Escape**.
+
+---
+
+## Що зробити
+
+Відкрий **саме ту dialog page**, для якої треба заборонити закриття.
+
+Далі:
+
+**Page Designer → Page → JavaScript → Execute when Page Loads**
+
+Встав цей код:
+
+```javascript
+(function () {
+    var topApex = apex.util.getTopApex(),
+        top$ = topApex.jQuery,
+        dlg$ = top$(window.frameElement).closest(".ui-dialog"),
+        content$ = dlg$.find(".ui-dialog-content"),
+        ns = ".lockDialog_" + $v("pFlowId") + "_" + $v("pFlowStepId");
+
+    // Ховаємо кнопку X тільки у цього діалога
+    dlg$.find(".ui-dialog-titlebar-close").hide();
+
+    // Забороняємо закриття по Escape тільки у цього діалога
+    if (content$.length) {
+        content$.dialog("option", "closeOnEscape", false);
+    }
+
+    // Додатковий захист від Escape
+    top$(topApex.document).on("keydown" + ns, function (e) {
+        if (e.key === "Escape" && dlg$.is(":visible")) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return false;
+        }
+    });
+
+    // При закритті/вивантаженні сторінки прибираємо обробник
+    window.addEventListener("beforeunload", function () {
+        top$(topApex.document).off("keydown" + ns);
+    });
+})();
+```
+
+---
+
+## Що робить цей код
+
+Він працює **тільки для поточного діалогу**, бо:
+
+* шукає саме той `.ui-dialog`, в якому відкрита ця page,
+* ховає `X` лише в ньому,
+* блокує `Escape` лише поки цей діалог відкритий.
+
+Інші dialog page в APEX будуть працювати як раніше:
+
+* закриватись по `X`,
+* закриватись по `Escape`.
+
+---
+
+## Якщо хочеш ще надійніше сховати кнопку `X`
+
+Іноді `.hide()` достатньо, але можна замість цього повністю прибрати кнопку:
+
+```javascript
+dlg$.find(".ui-dialog-titlebar-close").remove();
+```
+
+Тоді заміни цей рядок:
+
+```javascript
+dlg$.find(".ui-dialog-titlebar-close").hide();
+```
+
+на:
+
+```javascript
+dlg$.find(".ui-dialog-titlebar-close").remove();
+```
+
+---
+
+## Важливий момент
+
+Це спрацює саме для:
+
+* **Modal Dialog Page**
+* стандартного APEX dialog на базі jQuery UI dialog
+
+---
+
+## Якщо діалог відкривається автоматично при завантаженні сторінки
+
+Це не проблема. Код все одно треба вставляти **в саму dialog page**, яка відкривається.
+Тоді щойно вона з’явиться, `X` буде сховано і `Escape` заблоковано.
+
+---
+
+## Якщо треба залишити закриття тільки через кнопку “Продовжити” або “Скасувати”
+
+Цей підхід якраз для цього підходить:
+
+* користувач **не зможе** закрити діалог випадково,
+* але ти зможеш закривати його через свої кнопки, наприклад:
+
+```javascript
+apex.navigation.dialog.close(true, {...});
+```
+
+або стандартною кнопкою Cancel/Close, якщо сам її так налаштуєш.
+
+---
+
+## Ще одна можлива опція
+
+Якщо хочеш, можна ще додатково **заборонити закриття кліком поза модальним вікном**, якщо раптом у тебе десь така поведінка ввімкнена. Зазвичай для modal dialog в APEX це і так неактуально, але за потреби теж можна заблокувати окремо.
+
+Можу одразу дати тобі ще й **готовий варіант для APEX Dynamic Action / Function and Global Variable Declaration**, якщо хочеш оформити це більш акуратно.

@@ -1,0 +1,311 @@
+Добре. Нижче даю **готовий варіант блоку**, де для **кожного `shift_id` окремо** підтягуються дані зміни, і вже вони записуються в колекцію.
+
+Оскільки ти не показав SQL джерело для зміни, я зроблю це як **готовий шаблон**, у який тобі треба буде підставити **свою таблицю / view** і свої реальні назви колонок.
+
+---
+
+## Варіант 2: для кожного `shift_id` окремо читаємо `name / department / unit / position`
+
+```sql
+declare
+    p_order                 number;
+    p_step                  number;
+    p_source_id             number;
+    p_ord_counter           number;
+    p_user_tabno            number;
+    p_executor              varchar2(500);
+    l_collection_name       varchar2(100);
+
+    l_shift_ids             apex_t_varchar2;
+    l_shift_id              varchar2(100);
+
+    -- Дані конкретної зміни
+    l_shift_name            varchar2(500);
+    l_shift_department      number;
+    l_shift_department_name varchar2(500);
+    l_shift_unit            number;
+    l_shift_unit_title      varchar2(500);
+    l_shift_position        number;
+    l_shift_position_title  varchar2(500);
+    l_shift_display         varchar2(1000);
+begin
+    p_order     := :P4_ORDER;
+    p_step      := :P4_STEP;
+    p_source_id := :P4_TASK_ID;
+
+    l_collection_name := 'ADD_PERMIT_' || p_order || '_' || p_step;
+
+    -- Встановлюємо відмітку, що це refresh
+    apex_util.set_session_state('P4_CHECK_REFRESH', '1');
+
+    -- Якщо колекції не існує, створюємо
+    if not apex_collection.collection_exists(l_collection_name) then
+        apex_collection.create_collection(l_collection_name);
+    end if;
+
+    -------------------------------------------------------------------
+    -- Перенумеровуємо існуючі записи в колекції
+    -------------------------------------------------------------------
+    begin
+        for t in (
+            select ac.seq_id,
+                   row_number() over (order by to_number(ac.c006) nulls last, ac.seq_id) as rn
+              from apex_collections ac
+             where ac.collection_name = l_collection_name
+        )
+        loop
+            apex_collection.update_member_attribute(
+                p_collection_name => l_collection_name,
+                p_seq             => t.seq_id,
+                p_attr_number     => 6,
+                p_attr_value      => to_char(t.rn)
+            );
+        end loop;
+    exception
+        when others then
+            dbms_output.put_line('Помилка під час оновлення колекції: ' || sqlerrm);
+            raise;
+    end;
+
+    -------------------------------------------------------------------
+    -- Визначаємо наступний порядковий номер
+    -------------------------------------------------------------------
+    select nvl(max(to_number(c006)), 0) + 1
+      into p_ord_counter
+      from apex_collections
+     where collection_name = l_collection_name;
+
+    if :P4_PIB_TITLE is not null then
+        :P4_DEPARTMENT_TITLE := null;
+    end if;
+
+    -------------------------------------------------------------------
+    -- Розбиваємо список shift id з multi LOV
+    -------------------------------------------------------------------
+    l_shift_ids := apex_string.split(:P4_SHIFT_SELECTOR, ':');
+
+    -------------------------------------------------------------------
+    -- Для кожного shift_id окремо:
+    -- 1) читаємо дані зміни
+    -- 2) додаємо окремий запис у колекцію
+    -------------------------------------------------------------------
+    for i in 1 .. l_shift_ids.count loop
+        l_shift_id := trim(l_shift_ids(i));
+
+        if l_shift_id is not null then
+
+            ----------------------------------------------------------------
+            -- ПІДСТАВ СВОЮ ТАБЛИЦЮ / VIEW ЗІ ЗМІНАМИ
+            ----------------------------------------------------------------
+            begin
+                select
+                    s.shift_name,               -- назва зміни
+                    s.department_id,            -- id департаменту зміни
+                    s.department_name,          -- назва департаменту зміни
+                    s.unit_id,                  -- id unit зміни
+                    s.unit_title,               -- назва unit зміни
+                    s.position_id,              -- id position зміни
+                    s.position_title            -- назва position зміни
+                into
+                    l_shift_name,
+                    l_shift_department,
+                    l_shift_department_name,
+                    l_shift_unit,
+                    l_shift_unit_title,
+                    l_shift_position,
+                    l_shift_position_title
+                from your_shift_source s
+                where s.shift_id = to_number(l_shift_id);
+
+            exception
+                when no_data_found then
+                    raise_application_error(
+                        -20001,
+                        'Не знайдено дані по зміні shift_id = ' || l_shift_id
+                    );
+            end;
+
+            ----------------------------------------------------------------
+            -- Формуємо display значення зміни
+            ----------------------------------------------------------------
+            if l_shift_name is not null then
+                l_shift_display := l_shift_name || ' (' || l_shift_department_name || ')';
+            else
+                l_shift_display := null;
+            end if;
+
+            ----------------------------------------------------------------
+            -- Додаємо окремий запис у колекцію
+            ----------------------------------------------------------------
+            apex_collection.add_member(
+                p_collection_name => l_collection_name,
+                p_c001            => :P4_POSITION_TITLE,
+                p_c002            => :P4_DEPARTMENT_TITLE,
+                p_c003            => :P4_UNIT_TITLE,
+                p_c004            => :P4_STEP,
+                p_c005            => null,
+                p_c006            => p_ord_counter,
+                p_c007            => p_source_id,
+                p_c008            => :P4_PIB_USER,
+                p_c009            => :P4_POSITION,
+                p_c010            => :P4_DEPARTMENT,
+                p_c011            => :P4_UNIT,
+                p_c014            => :P4_PIB_TITLE,
+                p_c020            => :P4_SUBTASK_EXECUTOR,
+                p_c021            => :P4_TASK_MODE,
+                p_c022            => :P4_SBTSK_EXECTR_TITLE,
+                p_c023            => to_number(:P4_UCHASTOK),
+                p_c024            => :P4_UCHASTOK_TITLE,
+
+                -- Дані конкретної вибраної зміни
+                p_c026            => l_shift_id,
+                p_c027            => l_shift_display,
+                p_c028            => l_shift_department,
+                p_c029            => l_shift_unit,
+                p_c030            => l_shift_unit_title,
+                p_c031            => l_shift_position,
+                p_c032            => l_shift_position_title
+            );
+
+            p_ord_counter := p_ord_counter + 1;
+        end if;
+    end loop;
+end;
+/
+```
+
+---
+
+## Що саме тобі треба замінити в цьому блоці
+
+Ось цей фрагмент:
+
+```sql
+from your_shift_source s
+where s.shift_id = to_number(l_shift_id);
+```
+
+Тут треба підставити:
+
+* твою таблицю або view зі змінами,
+* справжні назви колонок.
+
+Наприклад, якщо у тебе джерело LOV зараз таке:
+
+```sql
+select shift_name, shift_id
+from shift_view
+order by shift_name
+```
+
+то блок може виглядати так:
+
+```sql
+select
+    s.shift_name,
+    s.department_id,
+    s.department_name,
+    s.unit_id,
+    s.unit_title,
+    s.position_id,
+    s.position_title
+into
+    l_shift_name,
+    l_shift_department,
+    l_shift_department_name,
+    l_shift_unit,
+    l_shift_unit_title,
+    l_shift_position,
+    l_shift_position_title
+from shift_view s
+where s.shift_id = to_number(l_shift_id);
+```
+
+---
+
+## Що в результаті буде в колекції
+
+Якщо `P4_SHIFT_SELECTOR` містить:
+
+```text
+50:100:103
+```
+
+то цикл 3 рази виконає:
+
+* пошук даних для `50`,
+* пошук даних для `100`,
+* пошук даних для `103`,
+
+і в колекції буде **3 окремі записи**, де:
+
+* `c026` — свій `shift_id`,
+* `c027` — своя назва зміни,
+* `c028..c032` — свої дані цієї конкретної зміни.
+
+---
+
+## Чому цей варіант кращий за попередній
+
+Бо в попередньому варіанті ти дублював:
+
+```sql
+:P4_SHIFT_NAME
+:P4_SHIFT_DEPARTMENT
+:P4_SHIFT_UNIT
+:P4_SHIFT_POSITION
+```
+
+для всіх вибраних змін однаково.
+
+А тут для кожної зміни:
+
+* свій `name`,
+* свій `department`,
+* свій `unit`,
+* свій `position`.
+
+Це правильний варіант для мультивибору.
+
+---
+
+## Ще одна важлива порада
+
+У тебе зараз є рядок:
+
+```sql
+commit;
+```
+
+всередині блоку роботи з колекцією. Для APEX-процесів зазвичай **краще не робити явний `commit` без потреби** всередині такого процесу, якщо немає окремої причини. Часто це потім дає дивну поведінку в ланцюжку процесів. Тут його краще прибрати, якщо він не потрібен саме під твою логіку.
+
+---
+
+## Я б рекомендував фінально зробити так
+
+1. `P4_SHIFT_SELECTOR` перевести на **Popup LOV / Multiple Values = Yes / Separator = :**
+2. У PL/SQL:
+
+   * `apex_string.split(:P4_SHIFT_SELECTOR, ':')`
+   * цикл по значеннях
+   * `select ... into ...` по кожному `shift_id`
+   * `apex_collection.add_member(...)`
+
+---
+
+## Найкраще наступне, що я можу зробити для тебе
+
+Я можу зараз **взяти цей шаблон і перетворити його в повністю готовий код саме під твою структуру**, якщо ти скинеш:
+
+* SQL запит LOV для зміни,
+* або назву таблиці / view, звідки береться зміна,
+* і які саме поля там відповідають за:
+
+  * `shift_id`
+  * `shift_name`
+  * `department_id`
+  * `department_name`
+  * `unit_id`
+  * `unit_title`
+  * `position_id`
+  * `position_title`

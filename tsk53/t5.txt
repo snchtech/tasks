@@ -1,0 +1,175 @@
+Так, це краще зробити **умовно**:
+коли сторінка відкривається автоматично після завантаження — **забороняємо закриття**,
+коли та сама сторінка відкривається з кнопки — **дозволяємо закриття**.
+
+Найчистіший варіант в APEX — передавати в dialog page **режим відкриття** і вже на самій dialog page вмикати або не вмикати блокування.
+
+---
+
+## Ідея
+
+Створи на dialog page прихований item, наприклад:
+
+```text
+PXX_DIALOG_MODE
+```
+
+Можливі значення:
+
+* `LOCKED` — не можна закривати по `X` та `Esc`
+* `NORMAL` — можна закривати стандартно
+
+---
+
+## 1. Створи hidden item
+
+На самій dialog page:
+
+* Item Name: `PXX_DIALOG_MODE`
+* Type: Hidden
+
+де `XX` — номер твоєї dialog page.
+
+---
+
+## 2. При автоматичному відкритті передавай `LOCKED`
+
+Коли відкриваєш це вікно автоматично після завантаження сторінки, передай item значення `LOCKED`.
+
+Якщо відкриваєш через `apex.navigation.dialog(...)`, то передай item у URL / Set Items.
+
+Наприклад, якщо через URL:
+
+```javascript
+apex.navigation.dialog(
+    "f?p=" + $v("pFlowId") + ":10:" + $v("pInstance") + "::NO::P10_DIALOG_MODE:LOCKED",
+    {
+        title: "Вибір зміни",
+        modal: true,
+        width: "800",
+        height: "600"
+    }
+);
+```
+
+---
+
+## 3. При відкритті з кнопки передавай `NORMAL`
+
+Для кнопки відкриття цього ж діалогу передавай:
+
+```javascript
+apex.navigation.dialog(
+    "f?p=" + $v("pFlowId") + ":10:" + $v("pInstance") + "::NO::P10_DIALOG_MODE:NORMAL",
+    {
+        title: "Вибір зміни",
+        modal: true,
+        width: "800",
+        height: "600"
+    }
+);
+```
+
+---
+
+## 4. На самій dialog page зроби JS з умовою
+
+У **Page Designer → Page → JavaScript → Execute when Page Loads**:
+
+```javascript
+(function () {
+    if ($v("P10_DIALOG_MODE") !== "LOCKED") {
+        return;
+    }
+
+    var topApex = apex.util.getTopApex(),
+        top$ = topApex.jQuery,
+        dlg$ = top$(window.frameElement).closest(".ui-dialog"),
+        content$ = dlg$.find(".ui-dialog-content"),
+        ns = ".lockDialog_" + $v("pFlowId") + "_" + $v("pFlowStepId");
+
+    dlg$.find(".ui-dialog-titlebar-close").hide();
+
+    if (content$.length) {
+        content$.dialog("option", "closeOnEscape", false);
+    }
+
+    top$(topApex.document).on("keydown" + ns, function (e) {
+        if (e.key === "Escape" && dlg$.is(":visible")) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return false;
+        }
+    });
+
+    window.addEventListener("beforeunload", function () {
+        top$(topApex.document).off("keydown" + ns);
+    });
+})();
+```
+
+---
+
+## Як це працює
+
+* якщо `P10_DIALOG_MODE = LOCKED`:
+
+  * ховається `X`
+  * блокується `Esc`
+* якщо `P10_DIALOG_MODE = NORMAL`:
+
+  * код нічого не робить
+  * діалог працює стандартно
+
+---
+
+## Якщо відкриваєш через кнопку APEX без ручного JS
+
+Якщо кнопка відкриває dialog через стандартний **Target = Page in this Application**, тоді теж можна передати значення:
+
+У кнопці:
+
+* **Set Items**
+
+  * `P10_DIALOG_MODE` = `NORMAL`
+
+А для автоматичного відкриття:
+
+* перед відкриттям передай `LOCKED`
+
+---
+
+## Альтернатива ще простіша
+
+Якщо автоматичне відкриття завжди відбувається тільки в одному сценарії, можна передавати не `MODE`, а, наприклад:
+
+```text
+P10_FORCE_SHIFT_CHOICE = Y
+```
+
+і вже перевіряти:
+
+```javascript
+if ($v("P10_FORCE_SHIFT_CHOICE") !== "Y") {
+    return;
+}
+```
+
+Це навіть простіше, якщо в тебе лише 2 режими.
+
+---
+
+## Рекомендація
+
+Для твоєї задачі я б зробив саме так:
+
+* `P10_DIALOG_MODE = LOCKED` для автозапуску
+* `P10_DIALOG_MODE = NORMAL` для відкриття з кнопки
+
+Це найгнучкіший і найчистіший спосіб.
+
+Якщо хочеш, я можу далі показати **готово, куди саме в APEX натискати**, якщо:
+
+* діалог відкривається **через branch / redirect**
+* або **через Dynamic Action**
+* або **через JS `apex.navigation.dialog`**
