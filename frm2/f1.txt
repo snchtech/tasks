@@ -1,0 +1,428 @@
+Так, це краще робити саме через **Page 0**, бо тоді значення буде доступне на всіх сторінках і у всіх звітах.
+
+Нижче даю готову схему.
+
+---
+
+## 1. Створити item на Page 0
+
+Створи hidden item:
+
+* **Page**: `0`
+* **Name**: `P0_COORDINATOR`
+* **Type**: `Hidden`
+
+Можеш одразу задати default `0`, але це не обов’язково, якщо DA завжди спрацьовує.
+
+---
+
+## 2. Додати Dynamic Action на Page 0
+
+### Варіант, який найкраще підходить
+
+Створи **Dynamic Action**:
+
+* **Event**: `Page Load`
+
+### True Action
+
+* **Action**: `Execute Server-side Code`
+
+PL/SQL code:
+
+```plsql
+BEGIN
+    IF acl.has_role('external_coordinator') THEN
+        :P0_COORDINATOR := 1;
+    ELSE
+        :P0_COORDINATOR := 0;
+    END IF;
+END;
+```
+
+### Items to Return
+
+Додай:
+
+* `P0_COORDINATOR`
+
+### Items to Submit
+
+нічого не треба, якщо `acl.has_role` не залежить від page item.
+
+---
+
+## 3. Якщо `acl.has_role` у тебе приймає static_id
+
+Ти написав, що роль має **static_id = external_coordinator**.
+Тоді виклик:
+
+```plsql
+acl.has_role('external_coordinator')
+```
+
+підходить, **якщо твоя функція `acl.has_role` перевіряє роль саме по static_id**.
+
+Якщо ж у тебе вона працює не по static_id, а по назві/коду ролі з таблиці, тоді треба передати саме те значення, яке вона очікує.
+
+---
+
+## 4. Логіка фільтрації, яку ти хочеш
+
+Тепер правило таке:
+
+### Для department:
+
+Показуємо **всі department**, якщо:
+
+* `P0_COORDINATOR = 1`
+* **або** `P_REPORT_DEPARTMENTS IS NULL`
+
+Інакше — тільки ті, що передані в `P_REPORT_DEPARTMENTS`.
+
+### Для unit:
+
+Показуємо **всі unit**, якщо:
+
+* `P0_COORDINATOR = 1`
+* **або** `P_CUR_UNIT IS NULL`
+
+Інакше — тільки ті, що передані в `P_CUR_UNIT`.
+
+---
+
+## 5. Готовий шаблон WHERE для звітів
+
+Ось правильний вигляд умов:
+
+```sql
+WHERE 
+    TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+    AND ep.date_end IS NULL
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_REPORT_DEPARTMENTS IS NULL
+        OR ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+    )
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_CUR_UNIT IS NULL
+        OR ep.unit_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+        )
+    )
+```
+
+Це якраз реалізує твою вимогу:
+
+* якщо `P0_COORDINATOR = 1` → обмеження по department/unit взагалі не діють;
+* якщо `P0_COORDINATOR = 0` → далі дивимось на `P_REPORT_DEPARTMENTS` і `P_CUR_UNIT`;
+* якщо вони `NULL` → показуємо всі;
+* якщо не `NULL` → фільтруємо по списку.
+
+---
+
+# 6. Оновлені SQL для всіх трьох звітів
+
+---
+
+## Звіт №1
+
+```sql
+SELECT 
+    ct.name AS company_type_name,
+    c.name  AS company_name,
+    SUM(ep.people_count) AS total_people
+FROM 
+    external_personal ep
+JOIN 
+    company c ON c.id = ep.company_id
+JOIN 
+    company_type ct ON ct.id = c.company_type_id
+WHERE 
+    TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+    AND ep.date_end IS NULL
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_REPORT_DEPARTMENTS IS NULL
+        OR ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+    )
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_CUR_UNIT IS NULL
+        OR ep.unit_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+        )
+    )
+
+GROUP BY 
+    ct.name, c.name
+ORDER BY 
+    ct.name, c.name
+```
+
+---
+
+## Звіт №2
+
+```sql
+SELECT 
+    u.name AS unit_name,
+    ct.name AS company_type_name,
+    CASE 
+        WHEN GROUPING(c.name) = 1 THEN 'Всього'
+        ELSE c.name
+    END AS company_name,
+    SUM(ep.people_count) AS total_people
+FROM 
+    external_personal ep
+JOIN company c       ON c.id = ep.company_id
+JOIN company_type ct ON ct.id = c.company_type_id
+JOIN units u         ON u.id = ep.unit_id
+WHERE 
+    TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+    AND ep.date_end IS NULL
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_REPORT_DEPARTMENTS IS NULL
+        OR ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+        )
+    )
+
+    AND (
+        :P0_COORDINATOR = 1
+        OR :P_CUR_UNIT IS NULL
+        OR ep.unit_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+        )
+    )
+
+GROUP BY 
+    ROLLUP(u.name, ct.name, c.name)
+HAVING 
+    NOT (GROUPING(u.name) = 1 AND GROUPING(ct.name) = 1)
+ORDER BY 
+    u.name,
+    ct.name,
+    company_name
+```
+
+---
+
+## Звіт №3
+
+```sql
+WITH base_data AS (
+    SELECT 
+        u.id            AS unit_id,
+        u.name          AS unit_name,
+        ct.id           AS company_type_id,
+        ct.name         AS company_type_name,
+        c.id            AS company_id,
+        c.name          AS company_name,
+        SUM(ep.people_count) AS total_people,
+        0 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c       ON c.id = ep.company_id
+        JOIN company_type ct ON ct.id = c.company_type_id
+        JOIN units u         ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.date_end IS NULL
+
+        AND (
+            :P0_COORDINATOR = 1
+            OR :P_REPORT_DEPARTMENTS IS NULL
+            OR ep.department_id IN (
+                SELECT TO_NUMBER(column_value)
+                FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+            )
+        )
+
+        AND (
+            :P0_COORDINATOR = 1
+            OR :P_CUR_UNIT IS NULL
+            OR ep.unit_id IN (
+                SELECT TO_NUMBER(column_value)
+                FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+            )
+        )
+
+    GROUP BY 
+        u.id, u.name, ct.id, ct.name, c.id, c.name
+),
+totals AS (
+    SELECT 
+        u.id            AS unit_id,
+        u.name          AS unit_name,
+        NULL            AS company_type_id,
+        NULL            AS company_type_name,
+        NULL            AS company_id,
+        'Всього'        AS company_name,
+        SUM(ep.people_count) AS total_people,
+        1 AS is_total
+    FROM 
+        external_personal ep
+        JOIN company c ON c.id = ep.company_id
+        JOIN units u   ON u.id = ep.unit_id
+    WHERE 
+        TRUNC(ep.date_create) = TRUNC(:P_REPORT_DATE)
+        AND ep.date_end IS NULL
+
+        AND (
+            :P0_COORDINATOR = 1
+            OR :P_REPORT_DEPARTMENTS IS NULL
+            OR ep.department_id IN (
+                SELECT TO_NUMBER(column_value)
+                FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+            )
+        )
+
+        AND (
+            :P0_COORDINATOR = 1
+            OR :P_CUR_UNIT IS NULL
+            OR ep.unit_id IN (
+                SELECT TO_NUMBER(column_value)
+                FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+            )
+        )
+
+    GROUP BY 
+        u.id, u.name
+)
+SELECT * 
+FROM base_data
+UNION ALL
+SELECT * 
+FROM totals
+ORDER BY unit_name, is_total, company_type_name, company_name
+```
+
+---
+
+# 7. Важливий момент про Page 0 item у SQL
+
+Щоб `:P0_COORDINATOR` коректно працював у SQL region source, переконайся, що:
+
+* item `P0_COORDINATOR` реально існує на **Page 0**
+* сторінка, де звіт, бачить цей item
+* якщо звіт оновлюється через submit / redirect / branch — значення item не губиться
+
+Іноді для надійності краще не через DA, а через **Application Item** або через **Before Header process**. Але в твоєму випадку Page 0 теж нормальний варіант.
+
+---
+
+# 8. Що я б радив зробити ще краще
+
+Щоб не залежати від того, чи встиг спрацювати DA до виконання звіту, **надійніше** заповнювати `P0_COORDINATOR` не DA, а **Before Header Process** на Page 0 або на потрібній сторінці.
+
+Наприклад:
+
+```plsql
+BEGIN
+    IF acl.has_role('external_coordinator') THEN
+        :P0_COORDINATOR := 1;
+    ELSE
+        :P0_COORDINATOR := 0;
+    END IF;
+END;
+```
+
+Чому це краще:
+
+* значення встановлюється на сервері до рендеру сторінки;
+* SQL звіт одразу бачить правильне значення;
+* не залежить від client-side lifecycle.
+
+### Тобто:
+
+* **DA Page Load** — працює, якщо тобі ще треба міняти поведінку на клієнті;
+* **Before Header Process** — кращий вибір, якщо item потрібен саме для SQL.
+
+Для твоєї задачі я б радив саме **Before Header Process**.
+
+---
+
+# 9. Найкраща реалізація для тебе
+
+Я б зробив так:
+
+### На Page 0:
+
+* hidden item `P0_COORDINATOR`
+
+### На Page 0 або на цільовій сторінці:
+
+* process **Before Header**
+
+```plsql
+BEGIN
+    :P0_COORDINATOR := CASE 
+                          WHEN acl.has_role('external_coordinator') THEN 1
+                          ELSE 0
+                       END;
+END;
+```
+
+Після цього звіти використовують умови:
+
+```sql
+AND (
+    :P0_COORDINATOR = 1
+    OR :P_REPORT_DEPARTMENTS IS NULL
+    OR ep.department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+    )
+)
+
+AND (
+    :P0_COORDINATOR = 1
+    OR :P_CUR_UNIT IS NULL
+    OR ep.unit_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+    )
+)
+```
+
+---
+
+# 10. Підсумок логіки
+
+Твоя бізнес-логіка після змін буде така:
+
+* `P0_COORDINATOR = 1` → завжди показуємо **всі department і всі unit**
+* `P0_COORDINATOR = 0`:
+
+  * якщо `P_REPORT_DEPARTMENTS IS NULL` → всі department
+  * якщо `P_REPORT_DEPARTMENTS IS NOT NULL` → тільки передані
+  * якщо `P_CUR_UNIT IS NULL` → всі unit
+  * якщо `P_CUR_UNIT IS NOT NULL` → тільки передані
+
+Це повністю відповідає тому, що ти описав.
+
+---
+
+Можу одразу дати тобі ще й готовий варіант:
+
+1. **процесу Before Header для Page 0**,
+2. **Server-side Condition / Read Only логіку для фільтрів**,
+   щоб у координатора ще й самі фільтри department/unit можна було приховати або блокувати.

@@ -1,0 +1,125 @@
+Так, тоді логіка має бути не “всі з `DEPARTMENT`”, а саме:
+
+* якщо `P0_COORDINATOR = 1` → відмітити **всі department, які мають дані в `EXTERNAL_PERSONAL`**
+* якщо `P_REPORT_DEPARTMENTS IS NULL` → теж **усі department, які мають дані в `EXTERNAL_PERSONAL`**
+* якщо передано список ID → відмічати тільки їх
+
+Тобто джерело для автозаповнення чекбоксів — не таблиця `DEPARTMENT`, а `EXTERNAL_PERSONAL`.
+
+---
+
+## 1. LOV для checkbox group
+
+Для самого item `P_REPORT_DEPARTMENTS` SQL можна зробити одразу по тих department, де є дані:
+
+```sql
+SELECT DISTINCT
+       d.name AS display_value,
+       d.id   AS return_value
+FROM external_personal ep
+JOIN department d
+  ON d.id = ep.department_id
+WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+  AND ep.date_end IS NULL
+ORDER BY d.name
+```
+
+Тоді в списку чекбоксів взагалі будуть лише ті department, які актуально присутні в `EXTERNAL_PERSONAL`.
+
+---
+
+## 2. Процес для значення item
+
+На сторінці або на Page 0 зроби **Before Header Process**:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(x.department_id, ':') WITHIN GROUP (ORDER BY x.department_name)
+          INTO l_departments
+          FROM (
+                SELECT DISTINCT
+                       d.id   AS department_id,
+                       d.name AS department_name
+                  FROM external_personal ep
+                  JOIN department d
+                    ON d.id = ep.department_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+               ) x;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+---
+
+## 3. Як це працює
+
+Цей код робить так:
+
+* якщо користувач координатор → автоматично вибираються всі department, що є в `EXTERNAL_PERSONAL`
+* якщо `P_REPORT_DEPARTMENTS` не передано → теж вибираються всі department, що є в `EXTERNAL_PERSONAL`
+* якщо `P_REPORT_DEPARTMENTS` уже передано в URL, наприклад `10:15:18` → процес не переписує значення, і відмічаються тільки вони
+
+---
+
+## 4. Якщо треба враховувати ще `department_id`, доступні користувачу
+
+Якщо ти хочеш, щоб “всі” означало не абсолютно всі записи з `EXTERNAL_PERSONAL`, а лише в межах якихось доступних департаментів — це вже можна окремо додати. Але з того, що ти зараз написав, логіка саме така: **всі department, які присутні в `EXTERNAL_PERSONAL` на дату**.
+
+---
+
+## 5. Аналогічно для unit
+
+Для `P_CUR_UNIT` логіка буде така сама: брати тільки ті `unit`, які є в `EXTERNAL_PERSONAL` на дату, а не всі з таблиці `UNITS`.
+
+Процес буде майже такий самий, тільки по `unit_id`.
+
+---
+
+## 6. Рекомендований фінальний варіант
+
+### LOV item `P_REPORT_DEPARTMENTS`
+
+```sql
+SELECT DISTINCT
+       d.name AS display_value,
+       d.id   AS return_value
+FROM external_personal ep
+JOIN department d
+  ON d.id = ep.department_id
+WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+  AND ep.date_end IS NULL
+ORDER BY d.name
+```
+
+### Before Header Process
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(x.department_id, ':') WITHIN GROUP (ORDER BY x.department_name)
+          INTO l_departments
+          FROM (
+                SELECT DISTINCT
+                       d.id   AS department_id,
+                       d.name AS department_name
+                  FROM external_personal ep
+                  JOIN department d
+                    ON d.id = ep.department_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+               ) x;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+Якщо хочеш, я одразу напишу такий самий готовий блок для `P_CUR_UNIT` з урахуванням того, що unit теж треба брати тільки з `EXTERNAL_PERSONAL`.

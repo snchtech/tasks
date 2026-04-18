@@ -1,0 +1,246 @@
+Так, ось повністю аналогічний варіант для `P_CUR_UNIT`, але вже з логікою:
+
+* якщо `P0_COORDINATOR = 1` → відмічаємо **всі unit, які є в `EXTERNAL_PERSONAL`**
+* якщо `P_CUR_UNIT IS NULL` → теж **усі unit, які є в `EXTERNAL_PERSONAL`**
+* якщо передано список unit → відмічаємо тільки їх
+
+---
+
+# 1. LOV для `P_CUR_UNIT`
+
+Якщо список unit має залежати ще й від вибраних department, то краще одразу врахувати `P_REPORT_DEPARTMENTS`.
+
+```sql
+SELECT DISTINCT
+       u.name AS display_value,
+       u.id   AS return_value
+FROM external_personal ep
+JOIN units u
+  ON u.id = ep.unit_id
+WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+  AND ep.date_end IS NULL
+  AND (
+       :P0_COORDINATOR = 1
+       OR :P_REPORT_DEPARTMENTS IS NULL
+       OR ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+       )
+  )
+ORDER BY u.name
+```
+
+### Що це дає:
+
+* якщо координатор → бачить всі unit, які є в `EXTERNAL_PERSONAL`
+* якщо department не вибраний → теж усі unit з `EXTERNAL_PERSONAL`
+* якщо department вибраний → тільки unit, які належать записам цього department
+
+---
+
+# 2. Before Header Process для `P_CUR_UNIT`
+
+```plsql
+DECLARE
+    l_units VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_CUR_UNIT IS NULL THEN
+        SELECT LISTAGG(x.unit_id, ':') WITHIN GROUP (ORDER BY x.unit_name)
+          INTO l_units
+          FROM (
+                SELECT DISTINCT
+                       u.id   AS unit_id,
+                       u.name AS unit_name
+                  FROM external_personal ep
+                  JOIN units u
+                    ON u.id = ep.unit_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+                   AND (
+                        :P0_COORDINATOR = 1
+                        OR :P_REPORT_DEPARTMENTS IS NULL
+                        OR ep.department_id IN (
+                             SELECT TO_NUMBER(column_value)
+                             FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+                        )
+                   )
+               ) x;
+
+        :P_CUR_UNIT := l_units;
+    END IF;
+END;
+```
+
+---
+
+# 3. Як це працює
+
+## Якщо `P0_COORDINATOR = 1`
+
+* автоматично вибираються всі unit, що є в `EXTERNAL_PERSONAL`
+
+## Якщо `P0_COORDINATOR = 0` і `P_CUR_UNIT IS NULL`
+
+* вибираються всі unit, що є в `EXTERNAL_PERSONAL`
+* але можна обмежити їх вибраними `department`, якщо `P_REPORT_DEPARTMENTS` заданий
+
+## Якщо `P_CUR_UNIT` передано в URL
+
+* процес його не перезаписує
+
+---
+
+# 4. Рекомендована зв’язка для обох item
+
+## `P_REPORT_DEPARTMENTS` — LOV
+
+```sql
+SELECT DISTINCT
+       d.name AS display_value,
+       d.id   AS return_value
+FROM external_personal ep
+JOIN department d
+  ON d.id = ep.department_id
+WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+  AND ep.date_end IS NULL
+ORDER BY d.name
+```
+
+## `P_REPORT_DEPARTMENTS` — автозаповнення
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(x.department_id, ':') WITHIN GROUP (ORDER BY x.department_name)
+          INTO l_departments
+          FROM (
+                SELECT DISTINCT
+                       d.id   AS department_id,
+                       d.name AS department_name
+                  FROM external_personal ep
+                  JOIN department d
+                    ON d.id = ep.department_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+               ) x;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+## `P_CUR_UNIT` — LOV
+
+```sql
+SELECT DISTINCT
+       u.name AS display_value,
+       u.id   AS return_value
+FROM external_personal ep
+JOIN units u
+  ON u.id = ep.unit_id
+WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+  AND ep.date_end IS NULL
+  AND (
+       :P0_COORDINATOR = 1
+       OR :P_REPORT_DEPARTMENTS IS NULL
+       OR ep.department_id IN (
+            SELECT TO_NUMBER(column_value)
+            FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+       )
+  )
+ORDER BY u.name
+```
+
+## `P_CUR_UNIT` — автозаповнення
+
+```plsql
+DECLARE
+    l_units VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_CUR_UNIT IS NULL THEN
+        SELECT LISTAGG(x.unit_id, ':') WITHIN GROUP (ORDER BY x.unit_name)
+          INTO l_units
+          FROM (
+                SELECT DISTINCT
+                       u.id   AS unit_id,
+                       u.name AS unit_name
+                  FROM external_personal ep
+                  JOIN units u
+                    ON u.id = ep.unit_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+                   AND (
+                        :P0_COORDINATOR = 1
+                        OR :P_REPORT_DEPARTMENTS IS NULL
+                        OR ep.department_id IN (
+                             SELECT TO_NUMBER(column_value)
+                             FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+                        )
+                   )
+               ) x;
+
+        :P_CUR_UNIT := l_units;
+    END IF;
+END;
+```
+
+---
+
+# 5. Важливий нюанс
+
+Щоб `unit` правильно оновлювався після зміни `department`, бажано зробити ще:
+
+* у `P_CUR_UNIT` поставити **Cascading LOV Parent Item** = `P_REPORT_DEPARTMENTS`
+* або Dynamic Action:
+
+  * Event: Change
+  * Item: `P_REPORT_DEPARTMENTS`
+  * True Action: Refresh `P_CUR_UNIT`
+
+Інакше список unit може не перебудуватись одразу після зміни department.
+
+---
+
+# 6. Що я тобі раджу на практиці
+
+Щоб усе працювало стабільно:
+
+1. `P0_COORDINATOR` заповнювати в **Before Header**
+2. `P_REPORT_DEPARTMENTS` і `P_CUR_UNIT` зробити **checkbox group**
+3. LOV обох item будувати тільки по `EXTERNAL_PERSONAL`
+4. `P_CUR_UNIT` зробити залежним від `P_REPORT_DEPARTMENTS`
+5. у звітах лишити умови:
+
+```sql
+AND (
+    :P0_COORDINATOR = 1
+    OR :P_REPORT_DEPARTMENTS IS NULL
+    OR ep.department_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_REPORT_DEPARTMENTS, ':'))
+    )
+)
+
+AND (
+    :P0_COORDINATOR = 1
+    OR :P_CUR_UNIT IS NULL
+    OR ep.unit_id IN (
+        SELECT TO_NUMBER(column_value)
+        FROM TABLE(apex_string.split(:P_CUR_UNIT, ':'))
+    )
+)
+```
+
+---
+
+Є ще один важливий момент: якщо ти **автоматично заповнюєш `P_CUR_UNIT` усіма значеннями**, то в SQL-звіті умова `:P_CUR_UNIT IS NULL` вже майже ніколи не буде `TRUE`, бо item стане заповненим. Це не помилка, але логіка переходить у режим “фільтр явно містить всі доступні значення”.
+
+Якщо хочеш, я можу наступним повідомленням зібрати тобі **повну фінальну схему для сторінки**:
+
+* які item,
+* які LOV,
+* які Before Header processes,
+* які DA на refresh,
+* і в якому порядку це все краще створити в APEX.

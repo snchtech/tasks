@@ -1,0 +1,265 @@
+Так, тут логіку краще закласти не в сам SQL для **List of Values**, а в **значення item** для checkbox group.
+
+Тобто:
+
+* **LOV** показує всі department з таблиці `department`
+* а **selected values** формуються окремо за правилом:
+
+  * якщо `P0_COORDINATOR = 1` → вибрати всі department
+  * якщо `P_REPORT_DEPARTMENTS IS NULL` → теж вибрати всі department
+  * якщо `P_REPORT_DEPARTMENTS` містить список ID → вибрати тільки їх
+
+---
+
+# 1. LOV для checkbox group
+
+Для item, наприклад `P_REPORT_DEPARTMENTS`, залишаєш звичайний список:
+
+```sql
+SELECT d.name AS display_value,
+       d.id   AS return_value
+FROM department d
+ORDER BY d.name
+```
+
+Цей SQL лише формує список чекбоксів.
+
+---
+
+# 2. Як задати відмічені значення
+
+У checkbox group значення має бути у вигляді рядка:
+
+```text
+1:2:5:8
+```
+
+Саме такий рядок треба покласти в item.
+
+Отже, треба зробити процес/DA, який встановлює `P_REPORT_DEPARTMENTS`.
+
+---
+
+# 3. Логіка для значення item
+
+Ось потрібний PL/SQL:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(id, ':') WITHIN GROUP (ORDER BY name)
+          INTO l_departments
+          FROM department;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    ELSE
+        :P_REPORT_DEPARTMENTS := :P_REPORT_DEPARTMENTS;
+    END IF;
+END;
+```
+
+Але тут є нюанс: якщо ти цим кодом працюєш уже **після передачі значення в URL**, то треба відрізнити:
+
+* чи реально значення було передане,
+* чи item просто поки `NULL`.
+
+Тому краще використовувати окремий item, наприклад:
+
+* `P_REPORT_DEPARTMENTS_RAW` — що прийшло з URL
+* `P_REPORT_DEPARTMENTS` — що реально ставиться в checkbox group
+
+---
+
+# 4. Найкращий варіант
+
+## Створи таку логіку:
+
+### Item:
+
+* `P_REPORT_DEPARTMENTS` — checkbox group
+
+### Before Header process:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 THEN
+        SELECT LISTAGG(id, ':') WITHIN GROUP (ORDER BY name)
+          INTO l_departments
+          FROM department;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+
+    ELSIF :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(id, ':') WITHIN GROUP (ORDER BY name)
+          INTO l_departments
+          FROM department;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+
+    ELSE
+        :P_REPORT_DEPARTMENTS := :P_REPORT_DEPARTMENTS;
+    END IF;
+END;
+```
+
+---
+
+# 5. Коротше і чистіше
+
+Можна записати компактніше:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(id, ':') WITHIN GROUP (ORDER BY name)
+          INTO l_departments
+          FROM department;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+Цього вже достатньо.
+
+Логіка така:
+
+* якщо координатор → ставимо всі
+* якщо item порожній → ставимо всі
+* якщо item вже має значення з URL → нічого не чіпаємо
+
+---
+
+# 6. Якщо треба брати не всі department, а тільки ті, що мають дані
+
+Раніше ти писав, що коли `NULL`, то треба не просто всі department, а ті, що мають дані на поточну дату в `EXTERNAL_PERSONAL`.
+
+Тоді заміни `SELECT LISTAGG... FROM department` на такий варіант:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 THEN
+        SELECT LISTAGG(d.id, ':') WITHIN GROUP (ORDER BY d.name)
+          INTO l_departments
+          FROM department d;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+
+    ELSIF :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(x.department_id, ':') WITHIN GROUP (ORDER BY x.department_name)
+          INTO l_departments
+          FROM (
+                SELECT DISTINCT d.id AS department_id,
+                                d.name AS department_name
+                  FROM external_personal ep
+                  JOIN department d ON d.id = ep.department_id
+                 WHERE TRUNC(ep.date_create) = TRUNC(NVL(:P_REPORT_DATE, SYSDATE))
+                   AND ep.date_end IS NULL
+               ) x;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+Тут:
+
+* для координатора — реально **всі** department
+* для `NULL` — лише ті, де є дані на дату
+
+---
+
+# 7. Якщо у тебе по новій логіці `NULL = всі`
+
+Якщо ти тепер хочеш, щоб `NULL` означав буквально **всі department з таблиці**, тоді ось остаточний варіант:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(d.id, ':') WITHIN GROUP (ORDER BY d.name)
+          INTO l_departments
+          FROM department d;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+---
+
+# 8. Де саме це ставити
+
+Найкраще:
+
+* **Process Point**: `Before Header`
+
+Бо тоді:
+
+* item заповниться до рендеру сторінки,
+* checkbox group одразу покаже правильні відмічені значення.
+
+---
+
+# 9. Якщо треба через Dynamic Action
+
+Можна і через DA, але для checkbox group при першому рендері сторінки **краще process**, а не DA.
+
+Бо DA спрацює вже після завантаження сторінки, і можливі миготіння або невчасне оновлення.
+
+---
+
+# 10. Що вийде в результаті
+
+Checkbox group `P_REPORT_DEPARTMENTS` буде працювати так:
+
+* `P0_COORDINATOR = 1` → відмічені всі department
+* `P0_COORDINATOR = 0` і `P_REPORT_DEPARTMENTS IS NULL` → відмічені всі
+* `P0_COORDINATOR = 0` і `P_REPORT_DEPARTMENTS = '2:5:8'` → відмічені тільки `2, 5, 8`
+
+---
+
+# 11. Важливий нюанс
+
+Якщо item `P_REPORT_DEPARTMENTS` одночасно:
+
+* приймає значення з URL,
+* і є checkbox group,
+  то все ок, **якщо формат значення саме `1:2:3`**.
+
+---
+
+# 12. Що я б радив тобі
+
+Для стабільності зроби так:
+
+* `P0_COORDINATOR` — hidden on Page 0
+* `P_REPORT_DEPARTMENTS` — checkbox group
+* Before Header process:
+
+```plsql
+DECLARE
+    l_departments VARCHAR2(4000);
+BEGIN
+    IF :P0_COORDINATOR = 1 OR :P_REPORT_DEPARTMENTS IS NULL THEN
+        SELECT LISTAGG(id, ':') WITHIN GROUP (ORDER BY name)
+          INTO l_departments
+          FROM department;
+
+        :P_REPORT_DEPARTMENTS := l_departments;
+    END IF;
+END;
+```
+
+---
+
+Якщо хочеш, я можу одразу написати тобі ще й такий самий готовий блок для `P_CUR_UNIT`, щоб для другого checkbox group логіка була повністю аналогічна.
