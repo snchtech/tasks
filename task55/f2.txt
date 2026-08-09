@@ -1,0 +1,518 @@
+Тоді картина трохи інша: я б уже не вважав `htp.p(l_html)` єдиною причиною. У вашому пакеті є щонайменше **три різні місця**, де можна отримати `buffer too small`, і ваш тест із `DBMS_OUTPUT` якраз натякає, що проблема може виникати **всередині `render()` при обробці конкретних даних картки**.
+
+І ще виправлю важливий момент із моєї попередньої відповіді: `30000` для `DBMS_LOB.SUBSTR` не є гарантовано безпечним при `AL32UTF8`. `VARCHAR2(32767)` обмежений байтами, а кирилиця багатобайтна. Для виведення краще брати, наприклад, **8000 символів за раз**.
+
+### 1. Найпідозріліше місце — `subtask_content`
+
+У вас зараз:
+
+```plsql
+function fetch_subtask_content(...) return varchar2
+is
+    l_txt varchar2(4000);
+```
+
+а далі:
+
+```plsql
+select subtask_content
+into l_txt
+...
+```
+
+
+
+Якщо `subtask_content` у таблиці має тип `VARCHAR2` більшого розміру або, тим більше, `CLOB`, то тут є жорсткий ліміт:
+
+```plsql
+l_txt varchar2(4000);
+```
+
+І далі в `render_substage_rows` у вас ще раз:
+
+```plsql
+l_subtask_content varchar2(4000);
+```
+
+
+
+Кілька речень зазвичай у 4000 символів помістяться. Але якщо користувачі можуть вставляти довгі описи, це вже потенційна проблема.
+
+Те саме з `note`.
+
+У вас:
+
+```plsql
+l_note varchar2(4000);
+```
+
+і в нього робиться `FETCH`:
+
+```plsql
+fetch rc into
+    l_sdate,
+    l_stime,
+    l_by,
+    l_dep,
+    l_note,
+    l_status;
+```
+
+
+
+Якщо `signaturehistory.note` більший за 4000 або є `CLOB`, ви отримаєте помилку ще **до `htp.p`**.
+
+---
+
+### 2. Ваш тест із `DBMS_OUTPUT` дуже показовий
+
+Ви пишете, що без доступу до collection:
+
+```plsql
+dbms_output.put_line(l_html);
+```
+
+відпрацював і HTML вивівся.
+
+Це означає, що:
+
+```plsql
+confirm_cart_pkg.render(...)
+```
+
+сам по собі здатний сформувати HTML для маленької картки.
+
+Але без `APEX_COLLECTIONS` у вас не виконується основна важка частина:
+
+```plsql
+for r in c_list loop
+```
+
+
+
+і відповідно не відбуваються:
+
+```plsql
+fetch_subtask_content(...)
+```
+
+
+
+та читання `note`, історії підписів і т. д.
+
+Тому цей тест фактично говорить:
+
+> проблема може бути не в загальному розмірі HTML, а в одному конкретному полі одного запису картки.
+
+---
+
+### 3. Спочатку треба зловити ТОЧНЕ місце ORA-06502
+
+У вас зараз є одна дуже незручна річ для діагностики.
+
+У `render_substage_rows`:
+
+```plsql
+exception
+    when others then
+        append(
+            p_buf,
+            '<div class="confirm-cart-error">Помилка підетапу '
+            || h(sqlerrm) ||
+            '</div>'
+        );
+end;
+```
+
+
+
+А в `render` ще один:
+
+```plsql
+exception
+    when others then
+        return '<div class="confirm-cart-error">Помилка побудови картки: '
+               || h(sqlerrm) ||
+               '</div>';
+```
+
+
+
+Тобто ви **знищуєте stack trace**.
+
+На час діагностики я б змінив exception головного `render` на:
+
+```plsql
+exception
+    when others then
+        return
+            '<pre>' ||
+            apex_escape.html(
+                sqlerrm || chr(10) ||
+                dbms_utility.format_error_stack || chr(10) ||
+                dbms_utility.format_error_backtrace || chr(10) ||
+                dbms_utility.format_call_stack
+            ) ||
+            '</pre>';
+end render;
+```
+
+А ще краще тимчасово взагалі:
+
+```plsql
+exception
+    when others then
+        raise;
+end render;
+```
+
+І аналогічно в `render_substage_rows`:
+
+```plsql
+exception
+    when others then
+        raise;
+end;
+```
+
+Тоді APEX покаже щось на кшталт:
+
+```text
+ORA-06502: PL/SQL: numeric or value error:
+character string buffer too small
+
+ORA-06512: at "TASKTRACKER.CONFIRM_CART_PKG", line 483
+```
+
+Ось **номер рядка пакета** нам зараз потрібен найбільше.
+
+---
+
+### 4. Я б одразу перевірив розміри полів у БД
+
+Виконайте для таблиці підзавдань:
+
+```sql
+select
+    data_type,
+    data_length,
+    char_length,
+    char_used
+from all_tab_columns
+where owner = 'TASKTRACKER'
+  and table_name = 'TASK_SUBTASKS'
+  and column_name = 'SUBTASK_CONTENT';
+```
+
+Для шаблонів:
+
+```sql
+select
+    data_type,
+    data_length,
+    char_length,
+    char_used
+from all_tab_columns
+where owner = 'TASKTRACKER'
+  and table_name = 'TASK_TEMPLATE_SUBTASKS'
+  and column_name = 'SUBTASK_CONTENT';
+```
+
+І для note:
+
+```sql
+select
+    data_type,
+    data_length,
+    char_length,
+    char_used
+from all_tab_columns
+where owner = 'TASKTRACKER'
+  and table_name = 'SIGNATUREHISTORY'
+  and column_name = 'NOTE';
+```
+
+Особливо цікаво, якщо отримаємо:
+
+```text
+SUBTASK_CONTENT    CLOB
+```
+
+або:
+
+```text
+VARCHAR2    8000
+```
+
+при тому, що в PL/SQL у вас:
+
+```plsql
+varchar2(4000)
+```
+
+Тоді причина очевидна.
+
+---
+
+### 5. Я б перевірив конкретну «велику» картку
+
+Наприклад:
+
+```sql
+select
+    id,
+    length(subtask_content)  as len_chars,
+    lengthb(subtask_content) as len_bytes
+from tasktracker.task_subtasks
+where ...
+order by lengthb(subtask_content) desc;
+```
+
+Для `note`:
+
+```sql
+select
+    signright_id,
+    length(note)  as len_chars,
+    lengthb(note) as len_bytes
+from tasktracker.signaturehistory
+where ...
+order by lengthb(note) desc;
+```
+
+Якщо поле `CLOB`, можна:
+
+```sql
+select
+    id,
+    dbms_lob.getlength(subtask_content) as len_chars
+from tasktracker.task_subtasks
+where ...
+order by dbms_lob.getlength(subtask_content) desc;
+```
+
+Тут важливі і `LENGTH`, і `LENGTHB`.
+
+Наприклад:
+
+```text
+LENGTH  = 3500
+LENGTHB = 6700
+```
+
+для кирилиці — абсолютно нормальна ситуація.
+
+---
+
+### 6. `VARCHAR2(4000)` я б у вашому пакеті взагалі прибрав для текстових полів
+
+Як мінімум:
+
+```plsql
+l_subtask_content varchar2(32767);
+```
+
+і:
+
+```plsql
+l_note varchar2(32767);
+```
+
+А `fetch_subtask_content`:
+
+```plsql
+function fetch_subtask_content(
+    p_stage_no      in number,
+    p_stage_for_txt in number,
+    p_task_mode     in number,
+    p_subtask_id    in number
+) return varchar2
+is
+    l_txt varchar2(32767);
+begin
+    ...
+end;
+```
+
+Але це правильне рішення тільки якщо поля в БД теж `VARCHAR2`.
+
+Якщо вони `CLOB`, я б **не конвертував їх назад у VARCHAR2**. Тоді треба робити:
+
+```plsql
+function fetch_subtask_content(...) return clob
+```
+
+і:
+
+```plsql
+l_subtask_content clob;
+```
+
+Те саме потенційно для `note`.
+
+---
+
+### 7. Є ще одна прихована проблема — ваш `h()`
+
+Зараз:
+
+```plsql
+function h(p_txt in varchar2) return varchar2 is
+begin
+    return apex_escape.html(p_txt);
+end;
+```
+
+
+
+Це означає, що вся ваша система HTML фактично все одно орієнтована на:
+
+```text
+CLOB
+ ↑
+VARCHAR2 chunks
+```
+
+Для коротких рядків це нормально.
+
+Але уявімо, що користувач вводить текст довжиною 15 000 символів і там багато:
+
+```text
+&
+<
+>
+"
+```
+
+`apex_escape.html()` перетворює їх на HTML entities, тобто рядок **збільшується**.
+
+Умовно:
+
+```text
+<
+```
+
+перетворюється на:
+
+```html
+&lt;
+```
+
+Тобто один символ став чотирма.
+
+І тоді навіть значення, яке до escaping вкладалося у `VARCHAR2`, після:
+
+```plsql
+apex_escape.html(...)
+```
+
+може вже не влізти.
+
+Саме тому для довгого текстового контенту я б не будував усе навколо `VARCHAR2(32767)`.
+
+---
+
+### 8. І `htp.p(l_html)` все одно треба прибрати
+
+Навіть якщо зараз знайдемо помилку в `subtask_content`, після її виправлення ви дуже ймовірно натрапите вже на реальний ліміт `HTP.P`.
+
+Для вашого Legacy Dynamic Content я б залишив:
+
+```plsql
+declare
+    l_html   clob;
+    l_pos    pls_integer := 1;
+    l_chunk  varchar2(32767);
+begin
+
+    l_html := tasktracker.confirm_cart_pkg.render(
+        ...
+    );
+
+    while l_pos <= dbms_lob.getlength(l_html) loop
+
+        l_chunk := dbms_lob.substr(
+            l_html,
+            8000,
+            l_pos
+        );
+
+        exit when l_chunk is null;
+
+        htp.prn(l_chunk);
+
+        l_pos := l_pos + length(l_chunk);
+
+    end loop;
+
+end;
+```
+
+Саме:
+
+```plsql
+8000
+```
+
+а не `30000`.
+
+При `AL32UTF8` один символ потенційно може займати до 4 байтів:
+
+```text
+8000 × 4 = 32000 bytes
+```
+
+що вкладається в:
+
+```text
+VARCHAR2 = 32767 bytes
+```
+
+---
+
+### 9. Чому новий Dynamic Content з `return` теж міг не допомогти
+
+Це теж узгоджується з цією версією.
+
+Якщо помилка стається тут:
+
+```plsql
+select subtask_content
+into l_txt;                  -- l_txt VARCHAR2(4000)
+```
+
+або тут:
+
+```plsql
+fetch rc into ..., l_note, ...; -- l_note VARCHAR2(4000)
+```
+
+то не має значення, що знаходиться після `render()`:
+
+```plsql
+return l_html;
+```
+
+чи:
+
+```plsql
+htp.p(l_html);
+```
+
+Пакет падає **раніше**, під час формування `l_html`.
+
+Тобто перехід:
+
+```text
+Legacy + HTP.P
+        ↓
+Dynamic Content + RETURN CLOB
+```
+
+не лікує переповнення локального `VARCHAR2` всередині `confirm_cart_pkg`.
+
+---
+
+У вашій ситуації я б зараз **не міняв архітектуру регіону**. Спочатку треба на 100% локалізувати ORA-06502. Найкорисніший наступний крок: тимчасово замінити обидва `WHEN OTHERS` на `RAISE`, відкрити саме ту велику картку і подивитися `ORA-06512 ... confirm_cart_pkg, line N`.
+
+Якщо дасте мені **повний текст помилки з ORA-06512 і номером рядка**, я зможу вже точно сказати: це `HTP`, `subtask_content`, `note`, `apex_escape`, `append` чи ще одне місце, і дам конкретне виправлення саме цього фрагмента пакета.

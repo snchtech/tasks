@@ -1,0 +1,187 @@
+Так, у вашому випадку причина майже напевно не в `iframe` і не в тому, що сам `CLOB` у пакеті став «занадто великим». Проблемне місце — ось цей рядок на скріншоті:
+
+```plsql
+htp.p(l_html);
+```
+
+У `confirm_cart_pkg.render` ви правильно формуєте результат як `CLOB`: створюєте temporary CLOB через `dbms_lob.createtemporary` , поступово дописуєте до нього HTML і наприкінці повертаєте весь `CLOB` . Тобто сама картка може бути значно більшою за 32 КБ.
+
+Проблема виникає вже після повернення цього `CLOB`, коли ви намагаєтеся одним викликом передати його в `htp.p()`. `HTP.P` фактично працює з `VARCHAR2`, а для PL/SQL `VARCHAR2` має межу 32767 байт/символів залежно від конкретної операції. Поки картка була маленькою — усе працювало. Коли користувач створив велику картку, весь `CLOB` перестав уміщатися в один внутрішній буфер.
+
+### Найпростіше виправлення
+
+Ваш поточний код регіону:
+
+```plsql
+declare
+    l_html clob;
+begin
+    l_html := tasktracker.confirm_cart_pkg.render(
+        p_app_id              => :APP_ID,
+        p_task_id             => :P5_TASK_ID,
+        p_page_list_id        => :P0_PAGE_LIST_ID,
+        p_substitution_mode   => :P0_SUBSTITUTION_MODE,
+        p_cur_position_id     => :P0_CUR_USER_POSITION,
+        p_new_position_id     => :P0_NEW_POSITION_ID,
+        p_cur_tabno           => :P0_CUR_USER_TABNO,
+        p_new_tabno           => :P0_NEW_USER_ID,
+        p_cur_department_id   => :P0_CUR_USER_DEPARTMENT,
+        p_new_department_id   => :P0_NEW_DEPARTMENT_ID,
+        p_new_roles           => :P0_NEW_ROLES,
+        p_app_user            => :APP_USER,
+        p_p5_status_id        => :P5_STATUS_ID,
+        p_stage_for_subtask   => 2,
+        p_current_task_mode   => :P5_TASK_MODE,
+        p_stage_mode          => 0
+    );
+
+    htp.p(l_html);
+end;
+```
+
+треба змінити так, щоб CLOB віддавався частинами:
+
+```plsql
+declare
+    l_html    clob;
+    l_offset  pls_integer := 1;
+    l_amount  pls_integer := 30000;
+    l_chunk   varchar2(32767);
+begin
+    l_html := tasktracker.confirm_cart_pkg.render(
+        p_app_id              => :APP_ID,
+        p_task_id             => :P5_TASK_ID,
+        p_page_list_id        => :P0_PAGE_LIST_ID,
+        p_substitution_mode   => :P0_SUBSTITUTION_MODE,
+        p_cur_position_id     => :P0_CUR_USER_POSITION,
+        p_new_position_id     => :P0_NEW_POSITION_ID,
+        p_cur_tabno           => :P0_CUR_USER_TABNO,
+        p_new_tabno           => :P0_NEW_USER_ID,
+        p_cur_department_id   => :P0_CUR_USER_DEPARTMENT,
+        p_new_department_id   => :P0_NEW_DEPARTMENT_ID,
+        p_new_roles           => :P0_NEW_ROLES,
+        p_app_user            => :APP_USER,
+        p_p5_status_id        => :P5_STATUS_ID,
+        p_stage_for_subtask   => 2,
+        p_current_task_mode   => :P5_TASK_MODE,
+        p_stage_mode          => 0
+    );
+
+    if l_html is not null then
+        while l_offset <= dbms_lob.getlength(l_html) loop
+
+            l_chunk := dbms_lob.substr(
+                l_html,
+                l_amount,
+                l_offset
+            );
+
+            htp.prn(l_chunk);
+
+            l_offset := l_offset + length(l_chunk);
+        end loop;
+    end if;
+end;
+```
+
+Я навмисно використав `30000`, а не `32767`. Це безпечніше, особливо коли HTML містить кирилицю.
+
+### Чому саме це має вирішити вашу проблему
+
+У самому пакеті у вас вже використовується правильна архітектура. Є процедура:
+
+```plsql
+procedure append(
+    p_buf in out nocopy clob,
+    p_txt in varchar2
+)
+```
+
+і кожен невеликий фрагмент HTML додається до великого `CLOB` через `dbms_lob.writeappend` .
+
+Наприклад, кожен рядок картки додається окремими невеликими шматками . Тому картка хоч на 100 КБ, хоч на 500 КБ, хоч на декілька мегабайт для `l_buf` сама по собі проблемою не є.
+
+У кінці ви маєте:
+
+```plsql
+append(l_buf, '</div>');
+return l_buf;
+```
+
+
+
+Тобто до цього моменту все нормально.
+
+Проблема концептуально виглядає так:
+
+```text
+render()
+   |
+   |  CLOB, наприклад 150 000 символів
+   v
+l_html
+   |
+   |  htp.p(l_html)
+   v
+спроба пропхати великий CLOB через VARCHAR2-буфер
+   |
+   X
+buffer too small / ORA-06502
+```
+
+Після зміни буде:
+
+```text
+render()
+   |
+   | CLOB 150 000
+   v
+l_html
+   |
+   +--> 30 000 --> htp.prn()
+   +--> 30 000 --> htp.prn()
+   +--> 30 000 --> htp.prn()
+   +--> 30 000 --> htp.prn()
+   +--> 30 000 --> htp.prn()
+```
+
+І обмеження одного `VARCHAR2` вже не має значення для загального розміру HTML.
+
+### Є ще краще рішення для APEX 24
+
+Оскільки у вас зараз саме **PL/SQL Dynamic Content [Legacy]**, я б поки що зробив наведений вище chunked-output — це мінімальна зміна і не потребує перероблення пакета.
+
+Але якщо будете переходити з Legacy на новий **Dynamic Content**, варто взагалі прибрати конструкцію:
+
+```plsql
+declare
+    l_html clob;
+begin
+    ...
+    htp.p(l_html);
+end;
+```
+
+і використовувати варіант джерела регіону, який безпосередньо повертає `CLOB`, тобто концептуально:
+
+```plsql
+return tasktracker.confirm_cart_pkg.render(
+    ...
+);
+```
+
+Тоді APEX сам працюватиме з результатом як із CLOB, і вам не потрібно буде вручну ганяти його через `HTP.P`.
+
+Але **для вашого поточного Legacy-регіону я б не робив міграцію зараз лише заради цієї помилки**. Заміна одного `htp.p(l_html)` на цикл із `dbms_lob.substr + htp.prn` має бути першим тестом.
+
+Є ще одне потенційне місце у вашому пакеті, яке я б перевірив після цього. У вас `append()` приймає:
+
+```plsql
+p_txt in varchar2
+```
+
+
+
+Це нормально, поки **кожен окремий виклик `append()` не формує рядок > 32767**. Судячи з наданого пакета, зараз ви переважно додаєте невеликі фрагменти, тому загальний розмір картки тут не є проблемою. Але якщо `subtask_content`, `note`, назви або інший контент у майбутньому стануть `CLOB`, цей `append()` теж доведеться модернізувати.
+
+Тобто я б зараз змінив **тільки код PL/SQL Dynamic Content**, не чіпаючи `confirm_cart_pkg`. Якщо після заміни `htp.p(l_html)` на порційний `htp.prn()` помилка залишиться, тоді вже треба дивитися **повний ORA-код і stack/backtrace**, тому що в пакеті є ще кілька місць із `VARCHAR2(4000)`, зокрема текст підзавдання  і коментар підпису , які можуть бути другим незалежним обмеженням.

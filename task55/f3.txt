@@ -1,0 +1,425 @@
+Так. Я ще раз пройшовся саме по вашому `confirm_cart_pkg`, і там є **кілька місць, які потенційно можуть дати `ORA-06502: character string buffer too small` навіть при невеликому загальному HTML**. Причому одне місце я б поставив дуже високо в списку підозрюваних — `l_dep_unit varchar2(512)`.
+
+Я б перевіряв у такому порядку:
+
+1. **`l_dep_unit varchar2(512)` — дуже реальний кандидат.** У вас оголошено:
+
+```plsql
+l_list_position       varchar2(255);
+l_list_department     varchar2(255);
+l_list_unit           varchar2(255);
+
+l_dep_unit            varchar2(512);
+```
+
+
+
+А потім формується:
+
+```plsql
+l_dep_unit :=
+    '<span class="l-dep-unit">('
+    || h(l_list_department)
+    || ' / '
+    || h(l_list_unit)
+    || ')</span>';
+```
+
+
+
+Тобто якщо `department` ≈ 255 символів і `unit` ≈ 255:
+
+```text
+255 + 255 = 510
+```
+
+а до цього ще додаються:
+
+```html
+<span class="l-dep-unit">( / )</span>
+```
+
+Тобто 512 вже недостатньо **навіть без урахування HTML escaping**.
+
+Я б одразу змінив:
+
+```plsql
+l_dep_unit varchar2(512);
+```
+
+на:
+
+```plsql
+l_dep_unit varchar2(32767);
+```
+
+Або хоча б:
+
+```plsql
+l_dep_unit varchar2(2000);
+```
+
+Але практичного сенсу економити тут немає — краще `32767`.
+
+2. **`apex_escape.html()` може істотно збільшити рядок.** Ваша функція:
+
+```plsql
+function h(p_txt in varchar2) return varchar2 is
+begin
+    return apex_escape.html(p_txt);
+end;
+```
+
+
+
+Наприклад текст:
+
+```text
+A & B < C
+```
+
+після escaping стає приблизно:
+
+```html
+A &amp; B &lt; C
+```
+
+Тому змінна на 255 символів не означає, що після `h()` результат теж матиме ≤255.
+
+Особливо це стосується конструкцій типу:
+
+```plsql
+l_dep_unit := '...' || h(l_list_department) || ...;
+```
+
+Якщо дані містять `&`, `<`, `>`, `"`, `'`, результат збільшується.
+
+3. **`subtask_content varchar2(4000)` — обов'язково перевірити.** У функції:
+
+```plsql
+function fetch_subtask_content(...) return varchar2
+is
+    l_txt varchar2(4000);
+```
+
+
+
+і потім ще:
+
+```plsql
+l_subtask_content varchar2(4000);
+```
+
+
+
+Тут є два ризики.
+
+Якщо значення з БД >4000 — помилка виникне вже при:
+
+```plsql
+select subtask_content
+into l_txt
+```
+
+Якщо зараз воно не більше 4000, проблема все одно може виникнути пізніше через:
+
+```plsql
+h(l_subtask_content)
+```
+
+Я б як мінімум зробив:
+
+```plsql
+l_txt varchar2(32767);
+```
+
+та:
+
+```plsql
+l_subtask_content varchar2(32767);
+```
+
+Якщо колонка БД `CLOB` — тоді краще вже переводити цей ланцюжок на `CLOB`.
+
+4. **`note varchar2(4000)` має аналогічну проблему.** У вас:
+
+```plsql
+l_note varchar2(4000);
+```
+
+
+
+і потім:
+
+```plsql
+fetch rc into
+    l_sdate,
+    l_stime,
+    l_by,
+    l_dep,
+    l_note,
+    l_status;
+```
+
+
+
+Якщо `SIGNATUREHISTORY.NOTE` довший за 4000 — отримуєте `buffer too small` на `FETCH`.
+
+Я б змінив хоча б на:
+
+```plsql
+l_note varchar2(32767);
+```
+
+А якщо `NOTE` у таблиці `CLOB` — тут теж краще використовувати `CLOB`.
+
+5. **`l_stage_title`, `l_sub_title`, `l_btn_text`, `l_after_text`.** У головному `render`:
+
+```plsql
+l_stage_title varchar2(255);
+
+l_sub_title   varchar2(255);
+l_btn_text    varchar2(100);
+l_after_text  varchar2(100);
+```
+
+
+
+А значення приходять безпосередньо з БД:
+
+```plsql
+fetch rc_stg
+into l_stage_id, l_stage_no, l_stage_title;
+```
+
+і:
+
+```plsql
+fetch rc_sub
+into l_sub_id,
+     l_sub_no,
+     l_sub_title,
+     l_btn_text,
+     l_after_text;
+```
+
+
+
+Якщо в таблиці, наприклад:
+
+```sql
+TITLE VARCHAR2(500)
+```
+
+а тут:
+
+```plsql
+l_sub_title varchar2(255)
+```
+
+то один довший запис зламає всю картку.
+
+Це дуже добре узгоджується з ситуацією:
+
+> все працювало роками, поки один користувач не створив «велику» картку.
+
+Можливо, річ взагалі не в кількості рядків, а **в одному конкретному значенні**, яке вперше перевищило розмір локальної змінної.
+
+6. **`fetch_executor_by_tabno` також має змінні лише по 255.** Ви повертаєте:
+
+```plsql
+o_posada     out varchar2,
+o_department out varchar2,
+o_pib        out varchar2
+```
+
+а приймаєте їх у:
+
+```plsql
+l_user_pos     varchar2(255);
+l_user_dep     varchar2(255);
+l_executor_pib varchar2(255);
+```
+
+
+
+При цьому SQL формує, зокрема:
+
+```plsql
+u.familia || ' ' ||
+substr(u.ima,1,1) || '. ' ||
+substr(u.otchestvo,1,1) || '.'
+```
+
+
+
+Для ПІБ 255 майже напевно вистачить, але `spr_dolznost` або `short_name` я б перевірив за фактичними типами колонок.
+
+7. **`l_by` та `l_dep` у історії підпису мають 255.**
+
+```plsql
+l_by  varchar2(255);
+l_dep varchar2(255);
+```
+
+
+
+А курсор повертає:
+
+```plsql
+(p.familia || ... ) as signer_by,
+p.tseh_short        as depart,
+sh.note             as note_txt
+```
+
+
+
+Тут теж треба порівняти максимальний розмір SQL-виразу з PL/SQL-змінною.
+
+8. **Конкатенація виконується ДО `append()`.** Це важливий нюанс. Наприклад:
+
+```plsql
+append(
+    p_buf,
+    '<span class="tsk-to-do"><span class="sbtsk-ttl">До виконання:</span> '||
+    '<span class="sbtsk-txt">'||h(l_subtask_content)||'</span></span>'
+);
+```
+
+
+
+Може здатися, що оскільки `p_buf` — `CLOB`, проблеми немає.
+
+Але спочатку Oracle повинен обчислити другий аргумент:
+
+```plsql
+'...' || h(l_subtask_content) || '...'
+```
+
+А `append` оголошений:
+
+```plsql
+procedure append(
+    p_buf in out nocopy clob,
+    p_txt in varchar2
+)
+```
+
+
+
+Тобто **кожен окремий сформований фрагмент все одно повинен поміститися у PL/SQL `VARCHAR2`**.
+
+Зараз для `subtask_content <= 4000` це не проблема. Але якщо ми просто замінимо:
+
+```plsql
+l_subtask_content varchar2(4000);
+```
+
+на:
+
+```plsql
+varchar2(32767);
+```
+
+і користувач реально введе 30 000 символів, тоді конструкція:
+
+```plsql
+'<html>' || h(l_subtask_content) || '</html>'
+```
+
+може переповнитися.
+
+Тому для справді довгого тексту треба вже робити CLOB-safe escaping/output, а не тільки збільшувати `VARCHAR2`.
+
+9. **`p_new_roles` теж варто глянути, хоча це менш імовірно.** Він передається як:
+
+```plsql
+p_new_roles in varchar2
+```
+
+
+
+і використовується через:
+
+```plsql
+instr(nvl(p_new_roles,'~'), 'U_'||p_unit_id)
+```
+
+
+
+Якщо `P0_NEW_ROLES` звичайний APEX item з невеликим переліком ролей, тут проблеми немає. Але якщо туди формується дуже великий список — теж є межа `VARCHAR2`.
+
+10. **APEX Collections самі по собі теж заслуговують перевірки.** Ви читаєте:
+
+```plsql
+c001
+c002
+c003
+...
+c015
+```
+
+
+
+і перекладаєте їх у:
+
+```plsql
+l_list_position   varchar2(255);
+l_list_department varchar2(255);
+l_list_unit       varchar2(255);
+```
+
+
+
+Якщо в collection реально лежить більше 255 символів, помилка виникне вже тут:
+
+```plsql
+l_list_department := r.list_department;
+```
+
+або:
+
+```plsql
+l_list_unit := r.list_unit;
+```
+
+Тобто **це одна з перших речей, яку я перевірив би саме для проблемної картки**, бо ви вже встановили важливий факт: без collection `render()` відпрацьовує.
+
+---
+
+Я б зараз зробив дуже практичну зміну: **усі локальні текстові буфери, де немає бізнес-причини обмежувати розмір, перевів би на `VARCHAR2(32767)`**:
+
+```plsql
+l_list_position       varchar2(32767);
+l_list_department     varchar2(32767);
+l_list_unit           varchar2(32767);
+
+l_dep_unit            varchar2(32767);
+
+l_user_pos            varchar2(32767);
+l_user_dep            varchar2(32767);
+l_executor_pib        varchar2(32767);
+
+l_subtask_content     varchar2(32767);
+
+l_stage_title         varchar2(32767);
+l_sub_title           varchar2(32767);
+l_btn_text            varchar2(32767);
+l_after_text          varchar2(32767);
+
+l_by                  varchar2(32767);
+l_dep                 varchar2(32767);
+l_note                varchar2(32767);
+```
+
+І окремо:
+
+```plsql
+function fetch_subtask_content(...) return varchar2
+is
+    l_txt varchar2(32767);
+```
+
+Це не вирішує проблему **справжніх CLOB-полів**, але прибирає величезну кількість штучних локальних обмежень `100/255/512/4000`.
+
+Найбільш підозрілими конкретно у вашому коді я зараз вважаю **`l_dep_unit varchar2(512)`**, значення з `APEX_COLLECTIONS`, які кладуться у `varchar2(255)`, і `subtask_content/note varchar2(4000)`. Загальний розмір картки — це вже окрема проблема на рівні `HTP.P`, але вона не пояснює всі ваші спостереження.
