@@ -1,0 +1,278 @@
+Так, для періоду краще трактувати `BETWEEN` як дві межі: `START_DATE >= дата_від` і `END_DATE <= дата_до` або, якщо фільтрація йде по одній даті, `DATE_COLUMN >= дата_від` і `DATE_COLUMN < дата_до + 1`.
+
+Для вашого механізму перенесення IR-фільтрів я б додав окрему обробку двох колонок, наприклад `START_DATE` і `END_DATE`.
+
+```plsql
+create or replace procedure copy_ir_filters (
+    p_source_page_id   in number,
+    p_source_region_id in number,
+    p_target_page_id   in number,
+    p_target_region_id in number
+)
+is
+    l_report          apex_ir.t_report;
+    l_sql             varchar2(32767);
+
+    l_bind_name       varchar2(255);
+    l_bind_value      varchar2(4000);
+
+    l_bind_pos        pls_integer;
+    l_fragment        varchar2(2000);
+
+    l_source_column   varchar2(255);
+    l_target_column   varchar2(255);
+
+    l_sql_op          varchar2(30);
+    l_apex_op         varchar2(30);
+
+begin
+
+    l_report := apex_ir.get_report(
+        p_page_id   => p_source_page_id,
+        p_region_id => p_source_region_id
+    );
+
+    l_sql := l_report.sql_query;
+
+
+    for i in 1 .. l_report.binds.count
+    loop
+
+        l_bind_name  := l_report.binds(i).name;
+        l_bind_value := l_report.binds(i).value;
+
+
+        if upper(l_bind_name) like 'APXWS_EXPR_%'
+        then
+
+            l_bind_pos :=
+                instr(
+                    upper(l_sql),
+                    ':' || upper(l_bind_name)
+                );
+
+
+            if l_bind_pos > 0
+            then
+
+                l_fragment :=
+                    substr(
+                        l_sql,
+                        greatest(1, l_bind_pos - 1000),
+                        least(1000, l_bind_pos)
+                    );
+
+
+                ----------------------------------------------------
+                -- Отримуємо alias колонки
+                ----------------------------------------------------
+                l_source_column :=
+                    regexp_substr(
+                        l_fragment,
+                        '"([^"]+)"[[:space:]]*(=|<>|!=|>=|<=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                ----------------------------------------------------
+                -- Отримуємо operator
+                ----------------------------------------------------
+                l_sql_op :=
+                    regexp_substr(
+                        l_fragment,
+                        '(<>|!=|>=|<=|=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                ----------------------------------------------------
+                -- SQL operator -> APEX operator
+                ----------------------------------------------------
+                l_apex_op :=
+                    case upper(l_sql_op)
+
+                        when '='  then 'EQ'
+                        when '<>' then 'NEQ'
+                        when '!=' then 'NEQ'
+
+                        when '>'  then 'GT'
+                        when '>=' then 'GTE'
+
+                        when '<'  then 'LT'
+                        when '<=' then 'LTE'
+
+                        when 'LIKE' then 'LIKE'
+
+                        else null
+
+                    end;
+
+
+                ----------------------------------------------------
+                -- Mapping колонок
+                ----------------------------------------------------
+                l_target_column :=
+                    case upper(l_source_column)
+
+                        when 'DEPARTMENT_NAME' then
+                            'DEPARTMENT'
+
+                        when 'STATUS' then
+                            'STATUS'
+
+                        ------------------------------------------------
+                        -- ДАТИ
+                        ------------------------------------------------
+                        when 'START_DATE' then
+                            'START_DATE'
+
+                        when 'END_DATE' then
+                            'END_DATE'
+
+                        when 'EMPLOYEE' then
+                            'EMPLOYEE_NAME'
+
+                        else
+                            null
+
+                    end;
+
+
+                ----------------------------------------------------
+                -- Переносимо filter
+                ----------------------------------------------------
+                if l_target_column is not null
+                   and l_apex_op is not null
+                then
+
+                    apex_ir.add_filter(
+                        p_page_id       => p_target_page_id,
+                        p_region_id     => p_target_region_id,
+                        p_report_column => l_target_column,
+                        p_filter_value  => l_bind_value,
+                        p_operator_abbr => l_apex_op
+                    );
+
+                end if;
+
+            end if;
+
+        end if;
+
+    end loop;
+
+end copy_ir_filters;
+/
+```
+
+Тоді якщо користувач на Page 1 задає період:
+
+```text
+START_DATE >= 01.08.2026
+END_DATE   <= 10.08.2026
+```
+
+процедура створить на Page 15 два стандартні IR-фільтри:
+
+```plsql
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'START_DATE',
+    p_filter_value  => '01.08.2026',
+    p_operator_abbr => 'GTE'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'END_DATE',
+    p_filter_value  => '10.08.2026',
+    p_operator_abbr => 'LTE'
+);
+```
+
+Але тут є важлива різниця в бізнес-логіці.
+
+Якщо запис має:
+
+```text
+START_DATE = 01.08.2026
+END_DATE   = 20.08.2026
+```
+
+а користувач шукає:
+
+```text
+05.08.2026 - 10.08.2026
+```
+
+умови:
+
+```sql
+START_DATE >= 05.08.2026
+AND END_DATE <= 10.08.2026
+```
+
+цей запис **не повернуть**.
+
+Якщо вам потрібні всі записи, які хоча б частково перетинаються з вибраним періодом, правильна умова інша:
+
+```sql
+START_DATE <= :DATE_TO
+AND END_DATE >= :DATE_FROM
+```
+
+Тобто для:
+
+```text
+користувач:
+05.08.2026 - 10.08.2026
+
+запис:
+01.08.2026 - 20.08.2026
+```
+
+запис потрапить у результат.
+
+У стандартному IR це відповідало б двом фільтрам:
+
+```text
+START_DATE <= 10.08.2026
+END_DATE   >= 05.08.2026
+```
+
+Тобто:
+
+```plsql
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'START_DATE',
+    p_filter_value  => '10.08.2026',
+    p_operator_abbr => 'LTE'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'END_DATE',
+    p_filter_value  => '05.08.2026',
+    p_operator_abbr => 'GTE'
+);
+```
+
+Для вашої ситуації з `START_DATE` + `END_DATE` я б використовував саме **перетин періодів**:
+
+```sql
+START_DATE <= DATE_TO
+AND END_DATE >= DATE_FROM
+```
+
+Бо це зазвичай природна семантика «покажи записи за вибраний період», а не «покажи тільки ті записи, які повністю помістилися всередину періоду».

@@ -1,0 +1,96 @@
+На скріншоті ви робите це через **HTML Expression**:
+
+```html
+#CREATOR_INFO# <br>
+#EXECUTOR_INFO#
+```
+
+Це правильний підхід для **відображення на сторінці**, але є важливий нюанс: HTML Expression не створює нову SQL-колонку. Для PDF/export це може поводитися не так, як очікуєте.
+
+Якщо ваша задача — саме в IR показати дві колонки як одну, я б зробив так.
+
+У SQL залишаєте:
+
+```sql
+SELECT
+    ...,
+    creator_info,
+    executor_info,
+    ...
+FROM ...
+```
+
+Для `CREATOR_INFO` задаєте HTML Expression:
+
+```html
+#CREATOR_INFO#<br>
+#EXECUTOR_INFO#
+```
+
+А колонку `EXECUTOR_INFO`:
+
+```text
+Identification → Type / Display
+```
+
+приховуєте від відображення користувачу.
+
+У результаті в одній колонці буде:
+
+```text
+Інформація про автора
+Інформація про виконавця
+```
+
+### Але для вашого PDF є кращий варіант
+
+Враховуючи попередню проблему з HTML, я б **не використовував `<br>` для такого об'єднання**, якщо ця колонка повинна потім експортуватися.
+
+Якщо можете змінити SELECT самого IR, об'єднайте дві колонки прямо в SQL:
+
+```sql
+SELECT
+    ...,
+
+    creator_info
+        || CHR(10)
+        || executor_info AS creator_executor_info,
+
+    ...
+
+FROM ...
+```
+
+І вже `CREATOR_EXECUTOR_INFO` буде однією реальною колонкою.
+
+Якщо `CREATOR_INFO` та `EXECUTOR_INFO` самі містять HTML, можна:
+
+```sql
+creator_info
+    || '<br>'
+    || executor_info AS creator_executor_info
+```
+
+але тоді знову матимете HTML у PDF.
+
+Тому для export краще:
+
+```sql
+APEX_ESCAPE.STRIPHTML(creator_info)
+    || CHR(10)
+    || APEX_ESCAPE.STRIPHTML(executor_info)
+        AS creator_executor_info
+```
+
+Але ви казали, що не хочете вручну чистити HTML, тому якщо вам важливо зберегти штатне автоматичне очищення APEX при PDF export, ваш поточний варіант:
+
+```html
+#CREATOR_INFO#<br>
+#EXECUTOR_INFO#
+```
+
+має сенс саме для UI.
+
+**Ще один важливий момент на вашому скріншоті:** ви редагуєте `CREATOR_INFO`, і в його HTML Expression посилаєтесь на `#CREATOR_INFO#`. Це нормально. Але `EXECUTOR_INFO` має бути присутня в SQL-запиті цього Interactive Report, навіть якщо ви її приховаєте як окрему колонку.
+
+Якщо ваша мета конкретно така: **в IR бачити одну об'єднану колонку, і при стандартному PDF Download отримати теж одну колонку з двома значеннями без HTML**, тоді я можу показати, як саме налаштувати `CREATOR_INFO` і `EXECUTOR_INFO` в Page Designer, бо тут є нюанс із тим, як APEX експортує HTML Expression.

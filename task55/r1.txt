@@ -1,0 +1,229 @@
+Для вашого прикладу, коли потрібно перенести **активний стандартний фільтр `DEPARTMENT = ...`** з IR сторінки 1 у звіт сторінки 15, можна зробити так.
+
+Припустимо:
+
+```text
+Page 1
+IR Region ID = 100100100100100
+
+Page 15
+IR Region ID = 150150150150150
+
+Колонка = DEPARTMENT
+
+Hidden item на Page 15:
+P15_DEPARTMENT
+```
+
+На **Page 15 → Before Header → Process → PL/SQL Code**:
+
+```plsql
+declare
+    l_report       apex_ir.t_report;
+    l_sql          varchar2(32767);
+    l_bind_name    varchar2(255);
+    l_department   varchar2(4000);
+begin
+
+    /*
+     * Отримуємо поточний стан Interactive Report
+     * зі сторінки 1.
+     *
+     * Тут будуть враховані стандартні Actions -> Filter,
+     * які користувач встановив у IR.
+     */
+    l_report := apex_ir.get_report(
+        p_page_id   => 1,
+        p_region_id => 100100100100100
+    );
+
+    l_sql := l_report.sql_query;
+
+
+    /*
+     * Шукаємо bind, який APEX створив для умови DEPARTMENT.
+     *
+     * Наприклад APEX може сформувати щось подібне:
+     *
+     * "DEPARTMENT" = :APXWS_EXPR_1
+     */
+    l_bind_name :=
+        regexp_substr(
+            l_sql,
+            '"?DEPARTMENT"?[^:]*:(APXWS_EXPR_[0-9]+)',
+            1,
+            1,
+            'i',
+            1
+        );
+
+
+    /*
+     * Якщо фільтр DEPARTMENT знайдений,
+     * знаходимо його фактичне значення у bind-параметрах.
+     */
+    if l_bind_name is not null then
+
+        for i in 1 .. l_report.binds.count loop
+
+            if upper(l_report.binds(i).name) = upper(l_bind_name) then
+
+                l_department := l_report.binds(i).value;
+
+                exit;
+
+            end if;
+
+        end loop;
+
+    end if;
+
+
+    /*
+     * Записуємо значення у Session State Page 15.
+     *
+     * Якщо на Page 1 DEPARTMENT не фільтрувався,
+     * P15_DEPARTMENT буде NULL.
+     */
+    apex_util.set_session_state(
+        p_name  => 'P15_DEPARTMENT',
+        p_value => l_department
+    );
+
+end;
+```
+
+Після цього SQL Interactive Report на **Page 15** може бути звичайним:
+
+```sql
+select
+    t.id,
+    t.name,
+    t.department,
+    t.status,
+    t.planning_date_start
+from your_table t
+where
+    (
+        :P15_DEPARTMENT is null
+        or t.department = :P15_DEPARTMENT
+    )
+order by t.id
+```
+
+Тобто поведінка буде така:
+
+```text
+Page 1:
+
+Actions
+  -> Filter
+     -> DEPARTMENT = 'Відділ 1'
+
+          ↓
+
+користувач натискає кнопку
+
+          ↓
+
+Page 15 відкривається
+
+          ↓
+
+APEX_IR.GET_REPORT(Page 1)
+
+          ↓
+
+знаходимо:
+DEPARTMENT = :APXWS_EXPR_1
+
+          ↓
+
+з bind:
+APXWS_EXPR_1 = 'Відділ 1'
+
+          ↓
+
+P15_DEPARTMENT = 'Відділ 1'
+
+          ↓
+
+Page 15 SQL:
+
+WHERE
+    (:P15_DEPARTMENT IS NULL
+     OR DEPARTMENT = :P15_DEPARTMENT)
+
+          ↓
+
+показується тільки Відділ 1
+```
+
+Якщо на Page 1 користувач **не встановив фільтр `DEPARTMENT`**, тоді:
+
+```text
+P15_DEPARTMENT = NULL
+```
+
+і умова:
+
+```sql
+:P15_DEPARTMENT is null
+```
+
+буде істинною, тому Page 15 покаже всі записи.
+
+### Якщо хочете, щоб на Page 15 це був саме видимий стандартний IR Filter
+
+Тоді після отримання `l_department` можна не лише записати його в `P15_DEPARTMENT`, а створити справжній фільтр Interactive Report:
+
+```plsql
+if l_department is not null then
+
+    apex_ir.add_filter(
+        p_page_id       => 15,
+        p_region_id     => 150150150150150,
+        p_report_column => 'DEPARTMENT',
+        p_filter_value  => l_department,
+        p_operator_abbr => 'EQ'
+    );
+
+end if;
+```
+
+Тобто повний блок наприкінці буде:
+
+```plsql
+if l_department is not null then
+
+    apex_util.set_session_state(
+        p_name  => 'P15_DEPARTMENT',
+        p_value => l_department
+    );
+
+    apex_ir.add_filter(
+        p_page_id       => 15,
+        p_region_id     => 150150150150150,
+        p_report_column => 'DEPARTMENT',
+        p_filter_value  => l_department,
+        p_operator_abbr => 'EQ'
+    );
+
+end if;
+```
+
+Тоді користувач на сторінці 15 побачить у стандартному IR:
+
+```text
+DEPARTMENT = Відділ 1
+```
+
+як звичайний активний фільтр.
+
+**Але є один суттєвий нюанс:** цей приклад розрахований на простий стандартний фільтр типу:
+
+```text
+DEPARTMENT = Відділ 1
+```
+
+Якщо вам потрібно переносити також `!=`, `IN`, `LIKE`, `Contains`, діапазони дат і **декілька одночасних стандартних фільтрів**, я б реалізовував це вже як універсальний механізм перенесення `column + operator + value`, а не через один `P15_DEPARTMENT`. Для двох майже однакових IR це буде правильніше.

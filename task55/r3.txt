@@ -1,0 +1,358 @@
+Так. Я б виніс це в окрему процедуру, щоб на Page 15 залишився один виклик.
+
+Нижче приклад для однакових alias колонок в обох IR. Він переносить прості порівняння, `LIKE/Contains`, а `BETWEEN` фактично переноситься як дві умови `>=` і `<=`, якщо APEX сформував їх окремими bind.
+
+```plsql
+create or replace procedure copy_ir_filters (
+    p_source_page_id   in number,
+    p_source_region_id in number,
+    p_target_page_id   in number,
+    p_target_region_id in number
+)
+is
+    l_report      apex_ir.t_report;
+    l_sql         varchar2(32767);
+
+    l_bind_name   varchar2(255);
+    l_bind_value  varchar2(4000);
+
+    l_bind_pos    pls_integer;
+    l_fragment    varchar2(2000);
+
+    l_column      varchar2(255);
+    l_sql_op      varchar2(30);
+    l_apex_op     varchar2(30);
+
+begin
+
+    ------------------------------------------------------------------
+    -- 1. Отримуємо поточний стан Interactive Report джерела
+    ------------------------------------------------------------------
+    l_report := apex_ir.get_report(
+        p_page_id   => p_source_page_id,
+        p_region_id => p_source_region_id
+    );
+
+    l_sql := l_report.sql_query;
+
+
+    ------------------------------------------------------------------
+    -- 2. Проходимо по bind variables поточного IR
+    ------------------------------------------------------------------
+    for i in 1 .. l_report.binds.count
+    loop
+
+        l_bind_name  := l_report.binds(i).name;
+        l_bind_value := l_report.binds(i).value;
+
+        ----------------------------------------------------------------
+        -- Нас цікавлять bind-и, які APEX створив для IR filters
+        ----------------------------------------------------------------
+        if upper(l_bind_name) like 'APXWS_EXPR_%'
+        then
+
+            ------------------------------------------------------------
+            -- Знаходимо цей bind у SQL
+            ------------------------------------------------------------
+            l_bind_pos :=
+                instr(
+                    upper(l_sql),
+                    ':' || upper(l_bind_name)
+                );
+
+
+            if l_bind_pos > 0
+            then
+
+                --------------------------------------------------------
+                -- Беремо SQL перед bind.
+                --
+                -- Наприклад:
+                --
+                -- "DEPARTMENT" = :APXWS_EXPR_1
+                --
+                -- "STATUS" <> :APXWS_EXPR_2
+                --
+                -- "NAME" like :APXWS_EXPR_3
+                --
+                -- "PLANNING_DATE" >= :APXWS_EXPR_4
+                --------------------------------------------------------
+                l_fragment :=
+                    substr(
+                        l_sql,
+                        greatest(1, l_bind_pos - 1000),
+                        least(1000, l_bind_pos)
+                    );
+
+
+                --------------------------------------------------------
+                -- 3. Визначаємо колонку
+                --------------------------------------------------------
+                l_column :=
+                    regexp_substr(
+                        l_fragment,
+                        '"([^"]+)"[[:space:]]*(=|<>|!=|>=|<=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                --------------------------------------------------------
+                -- 4. Визначаємо SQL operator
+                --------------------------------------------------------
+                l_sql_op :=
+                    regexp_substr(
+                        l_fragment,
+                        '(<>|!=|>=|<=|=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                --------------------------------------------------------
+                -- 5. Перетворюємо SQL operator
+                --    у operator APEX_IR.ADD_FILTER
+                --------------------------------------------------------
+                l_apex_op :=
+                    case upper(l_sql_op)
+
+                        when '=' then
+                            'EQ'
+
+                        when '<>' then
+                            'NEQ'
+
+                        when '!=' then
+                            'NEQ'
+
+                        when '>' then
+                            'GT'
+
+                        when '>=' then
+                            'GTE'
+
+                        when '<' then
+                            'LT'
+
+                        when '<=' then
+                            'LTE'
+
+                        when 'LIKE' then
+                            'LIKE'
+
+                        else
+                            null
+
+                    end;
+
+
+                --------------------------------------------------------
+                -- 6. Додаємо той самий filter у target IR
+                --------------------------------------------------------
+                if l_column is not null
+                   and l_apex_op is not null
+                then
+
+                    apex_ir.add_filter(
+                        p_page_id       => p_target_page_id,
+                        p_region_id     => p_target_region_id,
+                        p_report_column => l_column,
+                        p_filter_value  => l_bind_value,
+                        p_operator_abbr => l_apex_op
+                    );
+
+                end if;
+
+            end if;
+
+        end if;
+
+    end loop;
+
+end copy_ir_filters;
+/
+```
+
+Тоді для вашого прикладу:
+
+```text
+Page 1 IR Region ID:
+100100100100100
+
+Page 15 IR Region ID:
+150150150150150
+```
+
+на сторінці 15 у `Before Header` достатньо:
+
+```plsql
+begin
+
+    copy_ir_filters(
+        p_source_page_id   => 1,
+        p_source_region_id => 100100100100100,
+
+        p_target_page_id   => 15,
+        p_target_region_id => 150150150150150
+    );
+
+end;
+```
+
+Наприклад, якщо користувач на Page 1 встановив:
+
+```text
+DEPARTMENT = Відділ 1
+
+STATUS != CLOSED
+
+PLANNING_DATE >= 01.08.2026
+
+PLANNING_DATE <= 10.08.2026
+```
+
+процедура спробує створити на Page 15 еквівалент:
+
+```plsql
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'DEPARTMENT',
+    p_filter_value  => 'Відділ 1',
+    p_operator_abbr => 'EQ'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'STATUS',
+    p_filter_value  => 'CLOSED',
+    p_operator_abbr => 'NEQ'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'PLANNING_DATE',
+    p_filter_value  => '01.08.2026',
+    p_operator_abbr => 'GTE'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'PLANNING_DATE',
+    p_filter_value  => '10.08.2026',
+    p_operator_abbr => 'LTE'
+);
+```
+
+Для `Contains` стандартний IR часто зрештою формує `LIKE` зі значенням на кшталт:
+
+```text
+%Іван%
+```
+
+тому воно переноситься як:
+
+```plsql
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'NAME',
+    p_filter_value  => '%Іван%',
+    p_operator_abbr => 'LIKE'
+);
+```
+
+На кнопці Page 1 я б при відкритті Page 15 обов'язково робив reset цільового IR:
+
+```text
+Target Page: 15
+Request: RIR
+```
+
+і як раніше:
+
+```text
+Set Items:
+P15_TAB_MODE
+
+With Values:
+&P1_TAB_MODE.
+```
+
+Це потрібно, щоб не сталося:
+
+```text
+перше відкриття:
+DEPARTMENT = Відділ 1
+
+закрили modal
+
+Page 1:
+DEPARTMENT = Відділ 2
+
+знову відкрили modal
+```
+
+а на Page 15 залишився старий стан.
+
+Є одна принципова проблема з цим рішенням: ми парсимо `l_report.sql_query`, тобто SQL, який генерує сам APEX. Для звичайних column filters це нормально як практичне рішення, але я б не робив на цьому критичну бізнес-логіку без тестування всіх ваших типів фільтрів.
+
+Для вашого сценарію я б ще додав **whitelist колонок**, щоб переносити тільки ті фільтри, які справді існують у Page 15. Наприклад:
+
+```plsql
+if upper(l_column) in (
+    'DEPARTMENT',
+    'STATUS',
+    'PLANNING_DATE',
+    'EMPLOYEE_NAME'
+)
+then
+
+    apex_ir.add_filter(
+        p_page_id       => p_target_page_id,
+        p_region_id     => p_target_region_id,
+        p_report_column => l_column,
+        p_filter_value  => l_bind_value,
+        p_operator_abbr => l_apex_op
+    );
+
+end if;
+```
+
+Це особливо актуально у вас, бо ви казали, що **структура колонок Page 15 трохи відрізняється від Page 1**. Інакше користувач може поставити на Page 1 фільтр по колонці, якої взагалі немає у другому IR.
+
+Також я б додав mapping, якщо alias відрізняються, наприклад:
+
+```plsql
+l_target_column :=
+    case upper(l_column)
+
+        when 'DEPARTMENT_NAME' then
+            'DEPARTMENT'
+
+        when 'EMPLOYEE' then
+            'EMPLOYEE_NAME'
+
+        when 'PLAN_DATE' then
+            'PLANNING_DATE'
+
+        else
+            l_column
+
+    end;
+```
+
+і вже передав:
+
+```plsql
+p_report_column => l_target_column
+```
+
+Саме **mapping колонок + whitelist + перенесення операторів** я вважаю найкращим варіантом для ваших двох трохи різних Interactive Report.

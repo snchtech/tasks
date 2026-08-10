@@ -1,0 +1,327 @@
+Можна зробити так. Але важливий момент: `APEX_IR.GET_REPORT` дає нам **готовий SQL + bind values**, а не готовий масив `column/operator/value`. Тому для перенесення стандартних IR-фільтрів треба розібрати умови, які APEX додав до SQL.
+
+Нижче приклад для типових операторів `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`. Припустимо:
+
+```text
+Page 1 IR Region ID  = 100100100100100
+Page 15 IR Region ID = 150150150150150
+```
+
+На **Page 15 → Processing → Before Header → PL/SQL Process**:
+
+```plsql
+DECLARE
+    l_report       apex_ir.t_report;
+    l_sql          VARCHAR2(32767);
+
+    l_bind_name    VARCHAR2(255);
+    l_bind_value   VARCHAR2(4000);
+
+    l_column       VARCHAR2(255);
+    l_operator     VARCHAR2(20);
+
+    l_pos          PLS_INTEGER;
+    l_fragment     VARCHAR2(1000);
+
+BEGIN
+
+    /*
+     * Отримуємо поточний Interactive Report Page 1.
+     *
+     * У ньому вже враховані фільтри, які користувач
+     * поставив через Actions -> Filter.
+     */
+    l_report := apex_ir.get_report(
+        p_page_id   => 1,
+        p_region_id => 100100100100100
+    );
+
+    l_sql := l_report.sql_query;
+
+
+    /*
+     * Проходимо по bind variables,
+     * які APEX сформував для Interactive Report.
+     */
+    FOR i IN 1 .. l_report.binds.count LOOP
+
+        l_bind_name  := l_report.binds(i).name;
+        l_bind_value := l_report.binds(i).value;
+
+
+        /*
+         * Нас цікавлять bind variables стандартних
+         * фільтрів Interactive Report.
+         *
+         * Зазвичай вони мають вигляд:
+         *
+         * APXWS_EXPR_1
+         * APXWS_EXPR_2
+         * ...
+         */
+        IF UPPER(l_bind_name) LIKE 'APXWS_EXPR_%' THEN
+
+            /*
+             * Знаходимо bind у сформованому SQL.
+             */
+            l_pos := INSTR(
+                UPPER(l_sql),
+                ':' || UPPER(l_bind_name)
+            );
+
+
+            IF l_pos > 0 THEN
+
+                /*
+                 * Беремо фрагмент SQL перед bind.
+                 *
+                 * Наприклад:
+                 *
+                 * "DEPARTMENT" = :APXWS_EXPR_1
+                 *
+                 * або:
+                 *
+                 * "STATUS" <> :APXWS_EXPR_2
+                 */
+                l_fragment := SUBSTR(
+                    l_sql,
+                    GREATEST(1, l_pos - 500),
+                    LEAST(500, l_pos)
+                );
+
+
+                /*
+                 * Визначаємо колонку.
+                 *
+                 * Беремо останній quoted identifier
+                 * перед оператором.
+                 */
+                l_column := REGEXP_SUBSTR(
+                    l_fragment,
+                    '"([^"]+)"\s*(=|<>|!=|>=|<=|>|<|LIKE)\s*$',
+                    1,
+                    1,
+                    'in',
+                    1
+                );
+
+
+                /*
+                 * Визначаємо SQL operator.
+                 */
+                l_operator := REGEXP_SUBSTR(
+                    l_fragment,
+                    '(=|<>|!=|>=|<=|>|<|LIKE)\s*$',
+                    1,
+                    1,
+                    'in',
+                    1
+                );
+
+
+                /*
+                 * Якщо вдалося визначити колонку
+                 * та оператор — переносимо filter
+                 * на Interactive Report Page 15.
+                 */
+                IF l_column IS NOT NULL
+                   AND l_operator IS NOT NULL
+                THEN
+
+                    apex_ir.add_filter(
+                        p_page_id       => 15,
+                        p_region_id     => 150150150150150,
+                        p_report_column => l_column,
+
+                        p_filter_value  => l_bind_value,
+
+                        p_operator_abbr =>
+                            CASE UPPER(l_operator)
+
+                                WHEN '=' THEN
+                                    'EQ'
+
+                                WHEN '<>' THEN
+                                    'NEQ'
+
+                                WHEN '!=' THEN
+                                    'NEQ'
+
+                                WHEN '>' THEN
+                                    'GT'
+
+                                WHEN '>=' THEN
+                                    'GTE'
+
+                                WHEN '<' THEN
+                                    'LT'
+
+                                WHEN '<=' THEN
+                                    'LTE'
+
+                                WHEN 'LIKE' THEN
+                                    'LIKE'
+
+                            END
+                    );
+
+                END IF;
+
+            END IF;
+
+        END IF;
+
+    END LOOP;
+
+END;
+```
+
+Тобто якщо на Page 1 користувач встановив:
+
+```text
+Actions → Filter
+
+DEPARTMENT = Відділ 1
+STATUS = ACTIVE
+```
+
+`GET_REPORT` умовно дасть щось на кшталт:
+
+```sql
+...
+WHERE
+    "DEPARTMENT" = :APXWS_EXPR_1
+AND
+    "STATUS" = :APXWS_EXPR_2
+```
+
+і:
+
+```text
+APXWS_EXPR_1 = Відділ 1
+APXWS_EXPR_2 = ACTIVE
+```
+
+Код вище виконає на Page 15 еквівалент:
+
+```plsql
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'DEPARTMENT',
+    p_filter_value  => 'Відділ 1',
+    p_operator_abbr => 'EQ'
+);
+
+apex_ir.add_filter(
+    p_page_id       => 15,
+    p_region_id     => 150150150150150,
+    p_report_column => 'STATUS',
+    p_filter_value  => 'ACTIVE',
+    p_operator_abbr => 'EQ'
+);
+```
+
+У результаті на Page 15 користувач побачить саме стандартні IR-фільтри:
+
+```text
+DEPARTMENT = Відділ 1
+STATUS = ACTIVE
+```
+
+і SQL самого звіту Page 15 міняти не потрібно.
+
+### Ще одна важлива річ — очищення старих фільтрів Page 15
+
+Інакше можливий сценарій:
+
+```text
+1-й запуск:
+DEPARTMENT = Відділ 1
+
+закрили modal
+
+2-й запуск:
+DEPARTMENT = Відділ 2
+```
+
+і Page 15 може зберегти попередній стан IR.
+
+Тому при відкритті modal бажано скидати Page 15 IR. Для кнопки Page 1 можна передавати Request:
+
+```text
+RIR
+```
+
+тобто в Target:
+
+```text
+Page: 15
+Request: RIR
+```
+
+`RIR` означає **Reset Interactive Report** перед побудовою сторінки.
+
+Ваш `P1_TAB_MODE` при цьому передавайте як і зараз:
+
+```text
+Set Items:
+
+P15_TAB_MODE
+
+With Values:
+
+&P1_TAB_MODE.
+```
+
+Тоді весь потік буде:
+
+```text
+Page 1
+
+Interactive Report
+    |
+    | Actions -> Filter
+    |
+    | DEPARTMENT = Відділ 1
+    | STATUS = ACTIVE
+    |
+    v
+
+кнопка
+Page 15
+Request = RIR
+P15_TAB_MODE = &P1_TAB_MODE.
+
+    |
+    v
+
+Before Header
+
+APEX_IR.GET_REPORT(
+    Page 1,
+    Region 100100100100100
+)
+
+    |
+    +--> DEPARTMENT / EQ / Відділ 1
+    |
+    +--> STATUS / EQ / ACTIVE
+    |
+    v
+
+APEX_IR.ADD_FILTER
+для IR Page 15
+
+    |
+    v
+
+Page 15 IR:
+
+DEPARTMENT = Відділ 1
+STATUS = ACTIVE
+```
+
+Є лише одна принципова межа цього підходу: **універсально на 100% перенести абсолютно всі можливі IR-фільтри (`Between`, `In`, `Not In`, складні date expressions, Row filters тощо) через `GET_REPORT` без розбору згенерованого APEX SQL не вийде**, бо публічний API не повертає їх як готову колекцію `column/operator/value`.
+
+Для вашого випадку я б наступним кроком зробив версію, яка підтримує саме потрібний набір: **`=`, `!=`, Contains, In, Between та фільтри дат**. Це вже можна оформити як окрему процедуру, наприклад `COPY_IR_FILTERS(1, region1, 15, region15)`, щоб на Page 15 залишився один виклик.

@@ -1,0 +1,236 @@
+Так, і тут я б уже не намагався робити один універсальний export IR на всі випадки. Краще розділити експортні сценарії, але спільні фільтри — `DEPARTMENT`, `TASK_MODE` — передавати однаково.
+
+Для архівного експорту я б зробив окрему modal Page, наприклад `Page 16`.
+
+```text
+Page 1
+Основний Interactive Report
+
+Активні стандартні фільтри:
+DEPARTMENT = Відділ 1
+STATUS = ...
+...
+
+P1_TASK_MODE
+        |
+        | кнопка "Архів"
+        v
+Page 16 modal
+
+Дата від: P16_DATE_FROM
+Дата до:  P16_DATE_TO
+
+P16_TASK_MODE     hidden
+P16_DEPARTMENT    hidden
+
+[Завантажити]
+```
+
+Тут є важливий момент: **період я б не переносив зі стандартного IR Page 1**, а задавав окремо на Page 16. Тобто:
+
+* `DEPARTMENT` — беремо з активного стандартного фільтра Page 1;
+* `TASK_MODE` — передаємо окремим item;
+* `DATE_FROM / DATE_TO` — користувач задає вже в архівній модалці.
+
+Це виходить дуже зрозуміло.
+
+На Page 16 створюєте:
+
+```text
+P16_TASK_MODE
+P16_DEPARTMENT
+
+P16_DATE_FROM
+P16_DATE_TO
+```
+
+При відкритті Page 16:
+
+```text
+P16_TASK_MODE = &P1_TASK_MODE.
+```
+
+А `P16_DEPARTMENT` отримуєте з активного стандартного IR filter Page 1 тим самим механізмом, який ми вже обговорювали.
+
+Наприклад, якщо на Page 1:
+
+```text
+DEPARTMENT = Відділ 2
+```
+
+то перед показом Page 16:
+
+```text
+P16_DEPARTMENT = Відділ 2
+```
+
+А далі архівний SQL може бути взагалі незалежним від основного IR:
+
+```sql
+select
+    t.task_id,
+    t.task_name,
+    t.department,
+    t.employee_name,
+    t.status,
+    t.start_date,
+    t.end_date,
+
+    t.archive_number,
+    t.archive_category,
+    t.archive_comment,
+
+    t.description,
+    t.note
+
+from tasks t
+
+where
+    --------------------------------------------------
+    -- TASK MODE
+    --------------------------------------------------
+    (
+        :P16_TASK_MODE is null
+        or t.task_mode = :P16_TASK_MODE
+    )
+
+    --------------------------------------------------
+    -- ВІДДІЛ
+    --------------------------------------------------
+    and (
+        :P16_DEPARTMENT is null
+        or t.department = :P16_DEPARTMENT
+    )
+
+    --------------------------------------------------
+    -- ПЕРІОД
+    --------------------------------------------------
+    and (
+        :P16_DATE_FROM is null
+        or t.end_date >=
+           to_date(:P16_DATE_FROM, 'DD.MM.YYYY')
+    )
+
+    and (
+        :P16_DATE_TO is null
+        or t.start_date <
+           to_date(:P16_DATE_TO, 'DD.MM.YYYY') + 1
+    )
+
+order by
+    t.start_date;
+```
+
+Я тут спеціально використав логіку **перетину періодів**:
+
+```sql
+t.end_date >= DATE_FROM
+and
+t.start_date < DATE_TO + 1
+```
+
+Тобто якщо користувач обрав:
+
+```text
+01.08.2026 — 31.08.2026
+```
+
+а запис:
+
+```text
+START_DATE = 25.07.2026
+END_DATE   = 05.08.2026
+```
+
+він потрапить в архівний звіт, бо частина запису припадає на серпень.
+
+Якщо вам потрібно інше правило — тільки записи, які **повністю лежать усередині** періоду — тоді:
+
+```sql
+and (
+    :P16_DATE_FROM is null
+    or t.start_date >=
+       to_date(:P16_DATE_FROM, 'DD.MM.YYYY')
+)
+
+and (
+    :P16_DATE_TO is null
+    or t.end_date <
+       to_date(:P16_DATE_TO, 'DD.MM.YYYY') + 1
+)
+```
+
+Для архіву часто саме другий варіант може бути логічнішим, залежно від того, що означає «за період».
+
+Архітектурно я б у вас зробив приблизно так:
+
+```text
+                         PAGE 1
+                Основний Interactive Report
+                         |
+               стандартні IR Filters
+                         |
+               +---------+---------+
+               |                   |
+               v                   v
+
+          "Завантажити"         "Архів"
+
+               |                   |
+               v                   v
+
+            PAGE 15             PAGE 16
+         Export format       Archive export
+
+         4 колонки           більше колонок
+
+         TASK_MODE           TASK_MODE
+         DEPARTMENT          DEPARTMENT
+                             DATE_FROM
+                             DATE_TO
+```
+
+І це, на мою думку, краще, ніж намагатися зробити Page 15 універсальною для всього.
+
+Ще я б спростив процедуру копіювання фільтрів: для архіву вам, схоже, **не треба копіювати всі стандартні IR-фільтри**. Якщо бізнес-вимога говорить, що з основного звіту треба врахувати лише `DEPARTMENT`, то переносіть тільки його.
+
+Тобто замість універсального:
+
+```plsql
+copy_ir_filters(...)
+```
+
+можна мати щось набагато простіше:
+
+```plsql
+get_ir_department(...)
+```
+
+яке повертає тільки активний `DEPARTMENT`.
+
+Умовно:
+
+```plsql
+:P16_DEPARTMENT :=
+    report_filter_pkg.get_filter_value(
+        p_page_id     => 1,
+        p_region_id   => 100100100100100,
+        p_column_name => 'DEPARTMENT'
+    );
+```
+
+Тоді у вас формується дуже чисте правило:
+
+```text
+Основний export:
+копіюємо потрібні IR filters
+
+Архівний export:
+DEPARTMENT із Page 1
++
+TASK_MODE
++
+власний DATE_FROM / DATE_TO
+```
+
+Саме так я б це й реалізовував: **кожен тип експорту має власний SQL і власні параметри, а з основного IR забираємо тільки ті фільтри, які справді мають сенс для конкретного експорту.**

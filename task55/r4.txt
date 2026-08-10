@@ -1,0 +1,325 @@
+Так, додамо одразу і whitelist, і mapping колонок. Тоді процедура буде переносити тільки дозволені фільтри, а якщо alias колонок на Page 1 і Page 15 різні — автоматично підміняти їх.
+
+```plsql id="t4h7sq"
+create or replace procedure copy_ir_filters (
+    p_source_page_id   in number,
+    p_source_region_id in number,
+    p_target_page_id   in number,
+    p_target_region_id in number
+)
+is
+    l_report          apex_ir.t_report;
+    l_sql             varchar2(32767);
+
+    l_bind_name       varchar2(255);
+    l_bind_value      varchar2(4000);
+
+    l_bind_pos        pls_integer;
+    l_fragment        varchar2(2000);
+
+    l_source_column   varchar2(255);
+    l_target_column   varchar2(255);
+
+    l_sql_op          varchar2(30);
+    l_apex_op         varchar2(30);
+
+begin
+
+    ------------------------------------------------------------------
+    -- 1. Отримуємо поточний стан Interactive Report джерела
+    ------------------------------------------------------------------
+    l_report := apex_ir.get_report(
+        p_page_id   => p_source_page_id,
+        p_region_id => p_source_region_id
+    );
+
+    l_sql := l_report.sql_query;
+
+
+    ------------------------------------------------------------------
+    -- 2. Проходимо по bind variables активного IR
+    ------------------------------------------------------------------
+    for i in 1 .. l_report.binds.count
+    loop
+
+        l_bind_name  := l_report.binds(i).name;
+        l_bind_value := l_report.binds(i).value;
+
+
+        ----------------------------------------------------------------
+        -- Стандартні IR filters APEX
+        ----------------------------------------------------------------
+        if upper(l_bind_name) like 'APXWS_EXPR_%'
+        then
+
+            l_bind_pos :=
+                instr(
+                    upper(l_sql),
+                    ':' || upper(l_bind_name)
+                );
+
+
+            if l_bind_pos > 0
+            then
+
+                --------------------------------------------------------
+                -- Фрагмент SQL перед поточним bind
+                --------------------------------------------------------
+                l_fragment :=
+                    substr(
+                        l_sql,
+                        greatest(1, l_bind_pos - 1000),
+                        least(1000, l_bind_pos)
+                    );
+
+
+                --------------------------------------------------------
+                -- 3. Визначаємо колонку source IR
+                --------------------------------------------------------
+                l_source_column :=
+                    regexp_substr(
+                        l_fragment,
+                        '"([^"]+)"[[:space:]]*(=|<>|!=|>=|<=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                --------------------------------------------------------
+                -- 4. Визначаємо SQL operator
+                --------------------------------------------------------
+                l_sql_op :=
+                    regexp_substr(
+                        l_fragment,
+                        '(<>|!=|>=|<=|=|>|<|LIKE)[[:space:]]*$',
+                        1,
+                        1,
+                        'in',
+                        1
+                    );
+
+
+                --------------------------------------------------------
+                -- 5. Перетворення SQL operator -> APEX IR operator
+                --------------------------------------------------------
+                l_apex_op :=
+                    case upper(l_sql_op)
+
+                        when '=' then
+                            'EQ'
+
+                        when '<>' then
+                            'NEQ'
+
+                        when '!=' then
+                            'NEQ'
+
+                        when '>' then
+                            'GT'
+
+                        when '>=' then
+                            'GTE'
+
+                        when '<' then
+                            'LT'
+
+                        when '<=' then
+                            'LTE'
+
+                        when 'LIKE' then
+                            'LIKE'
+
+                        else
+                            null
+
+                    end;
+
+
+                --------------------------------------------------------
+                -- 6. Mapping колонок
+                --
+                -- Тут описуємо:
+                --
+                -- колонка Page 1 -> колонка Page 15
+                --------------------------------------------------------
+                l_target_column :=
+                    case upper(l_source_column)
+
+                        ------------------------------------------------
+                        -- однакові alias
+                        ------------------------------------------------
+                        when 'DEPARTMENT' then
+                            'DEPARTMENT'
+
+                        when 'STATUS' then
+                            'STATUS'
+
+                        when 'PLANNING_DATE' then
+                            'PLANNING_DATE'
+
+                        ------------------------------------------------
+                        -- різні alias
+                        ------------------------------------------------
+                        when 'DEPARTMENT_NAME' then
+                            'DEPARTMENT'
+
+                        when 'EMPLOYEE' then
+                            'EMPLOYEE_NAME'
+
+                        when 'PLAN_DATE' then
+                            'PLANNING_DATE'
+
+                        ------------------------------------------------
+                        -- NULL означає:
+                        -- не переносити цю колонку
+                        ------------------------------------------------
+                        else
+                            null
+
+                    end;
+
+
+                --------------------------------------------------------
+                -- 7. Whitelist
+                --
+                -- Фільтр переносимо тільки якщо:
+                -- - колонка розпізнана
+                -- - для неї є mapping
+                -- - оператор підтримується
+                --------------------------------------------------------
+                if l_source_column is not null
+                   and l_target_column is not null
+                   and l_apex_op is not null
+                then
+
+                    apex_ir.add_filter(
+                        p_page_id       => p_target_page_id,
+                        p_region_id     => p_target_region_id,
+                        p_report_column => l_target_column,
+                        p_filter_value  => l_bind_value,
+                        p_operator_abbr => l_apex_op
+                    );
+
+                end if;
+
+            end if;
+
+        end if;
+
+    end loop;
+
+end copy_ir_filters;
+/
+```
+
+Тепер, наприклад, якщо на Page 1 є такі колонки:
+
+```text id="fir2w9"
+DEPARTMENT_NAME
+STATUS
+EMPLOYEE
+PLAN_DATE
+COMMENTS
+```
+
+а на Page 15:
+
+```text id="3z85zb"
+DEPARTMENT
+STATUS
+EMPLOYEE_NAME
+PLANNING_DATE
+```
+
+mapping виглядає так:
+
+```plsql id="ne2i7o"
+l_target_column :=
+    case upper(l_source_column)
+
+        when 'DEPARTMENT_NAME' then
+            'DEPARTMENT'
+
+        when 'STATUS' then
+            'STATUS'
+
+        when 'EMPLOYEE' then
+            'EMPLOYEE_NAME'
+
+        when 'PLAN_DATE' then
+            'PLANNING_DATE'
+
+        else
+            null
+
+    end;
+```
+
+Тобто `COMMENTS` не переноситься взагалі, бо для нього немає mapping.
+
+На Page 15 у `Before Header`:
+
+```plsql id="dquydc"
+begin
+
+    copy_ir_filters(
+        p_source_page_id   => 1,
+        p_source_region_id => 100100100100100,
+
+        p_target_page_id   => 15,
+        p_target_region_id => 150150150150150
+    );
+
+end;
+```
+
+А кнопку Page 1 залишаєте з відкриттям Page 15, але бажано:
+
+```text id="0hrnfc"
+Page:
+15
+
+Request:
+RIR
+```
+
+і передаванням вашого режиму:
+
+```text id="mcdx3m"
+Set Items:
+P15_TAB_MODE
+
+With Values:
+&P1_TAB_MODE.
+```
+
+Тоді приклад:
+
+```text id="9sqei5"
+Page 1 filter:
+
+DEPARTMENT_NAME = 'Відділ 1'
+STATUS <> 'CLOSED'
+PLAN_DATE >= 01.08.2026
+COMMENTS contains 'test'
+```
+
+дасть на Page 15:
+
+```text id="5f07he"
+DEPARTMENT = 'Відділ 1'
+STATUS <> 'CLOSED'
+PLANNING_DATE >= 01.08.2026
+```
+
+а:
+
+```text id="4d1usp"
+COMMENTS contains 'test'
+```
+
+буде проігнорований, оскільки `COMMENTS` немає у whitelist/mapping.
+
+Я б ще додав сюди `apex_debug.message`, щоб у Debug APEX було видно, який фільтр знайшовся, який mapping застосувався і який фільтр реально додався на Page 15. Це дуже допоможе при першому тестуванні такого механізму.

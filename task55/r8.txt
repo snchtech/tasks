@@ -1,0 +1,346 @@
+Так, тут у вас дві окремі проблеми, і обидві краще вирішити **на рівні `APEX_DATA_EXPORT`**, не через URL-export:
+
+1. `APEX_DATA_EXPORT` бере технічний `NAME`, а вам потрібен свій заголовок;
+2. `apex_region.open_query_context` віддає значення колонки так, як вона є в джерелі IR, тому якщо там HTML — він може потрапити в PDF.
+
+Я б для PDF зробив **окремі export-only колонки в SQL Interactive Report**, а в PL/SQL явно задав, які колонки і з якими заголовками експортувати.
+
+Наприклад, у SQL вашого IR зараз умовно є:
+
+```sql
+select
+    t.task_name,
+
+    '<b>' || t.department || '</b><br>' ||
+    t.employee_name as responsible,
+
+    '<span class="status">' || t.status || '</span>'
+        as task_status,
+
+    t.start_date,
+    t.end_date
+
+from tasks t
+```
+
+Додайте в цей самий запит технічні колонки саме для PDF:
+
+```sql
+select
+    t.task_name,
+
+    --------------------------------------------------
+    -- Колонки для відображення в APEX
+    --------------------------------------------------
+    '<b>' || t.department || '</b><br>' ||
+    t.employee_name as responsible,
+
+    '<span class="status">' || t.status || '</span>'
+        as task_status,
+
+
+    --------------------------------------------------
+    -- ЧИСТІ колонки для PDF
+    --------------------------------------------------
+    t.department
+        || chr(10)
+        || t.employee_name
+        as pdf_responsible,
+
+    t.status
+        as pdf_status,
+
+    t.start_date,
+    t.end_date
+
+from tasks t
+```
+
+У самому IR `PDF_RESPONSIBLE`, `PDF_STATUS` можна зробити невидимими для користувача.
+
+А ваш PL/SQL export я б переписав приблизно так:
+
+```plsql
+declare
+    l_export       apex_data_export.t_export;
+    l_context      apex_exec.t_context;
+    l_print_config apex_data_export.t_print_config;
+
+    l_columns      apex_data_export.t_columns;
+
+begin
+
+    ------------------------------------------------------------
+    -- 1. Налаштування PDF
+    ------------------------------------------------------------
+    l_print_config :=
+        apex_data_export.get_print_config(
+            p_paper_size  => apex_data_export.c_size_a4,
+            p_orientation => apex_data_export.c_orientation_portrait
+        );
+
+
+    ------------------------------------------------------------
+    -- 2. Вказуємо, ЯКІ колонки експортувати
+    --    і ЯКІ заголовки показувати
+    ------------------------------------------------------------
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_NAME',
+        p_heading => 'Завдання'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'PDF_RESPONSIBLE',
+        p_heading => 'Відповідальний'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'PDF_STATUS',
+        p_heading => 'Статус'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'START_DATE',
+        p_heading => 'Дата початку'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'END_DATE',
+        p_heading => 'Дата завершення'
+    );
+
+
+    ------------------------------------------------------------
+    -- 3. Відкриваємо context саме вашого Interactive Report
+    ------------------------------------------------------------
+    l_context :=
+        apex_region.open_query_context(
+            p_page_id   => 15,
+            p_region_id => 397351893134453127
+        );
+
+
+    ------------------------------------------------------------
+    -- 4. Формуємо PDF
+    ------------------------------------------------------------
+    l_export :=
+        apex_data_export.export(
+            p_context      => l_context,
+            p_format       => apex_data_export.c_format_pdf,
+            p_columns      => l_columns,
+            p_print_config => l_print_config,
+            p_file_name    => 'task_report'
+        );
+
+
+    ------------------------------------------------------------
+    -- 5. Закриваємо context
+    ------------------------------------------------------------
+    apex_exec.close(l_context);
+
+
+    ------------------------------------------------------------
+    -- 6. Віддаємо PDF
+    ------------------------------------------------------------
+    apex_data_export.download(
+        p_export => l_export
+    );
+
+
+exception
+    when others then
+
+        if apex_exec.is_open(l_context) then
+            apex_exec.close(l_context);
+        end if;
+
+        raise;
+end;
+```
+
+Ключове тут:
+
+```plsql
+apex_data_export.add_column(
+    p_columns => l_columns,
+    p_name    => 'PDF_RESPONSIBLE',
+    p_heading => 'Відповідальний'
+);
+```
+
+`p_name` — **alias SQL-колонки**, а `p_heading` — те, що реально буде написано в PDF.
+
+Тобто замість:
+
+```text
+PDF_RESPONSIBLE
+```
+
+отримаєте:
+
+```text
+Відповідальний
+```
+
+---
+
+Щодо HTML — я б **не чистив його регуляркою вже під час генерації PDF**, якщо ви контролюєте SQL звіту.
+
+Тобто не так:
+
+```sql
+regexp_replace(
+    responsible,
+    '<[^>]*>',
+    ''
+)
+```
+
+а краще одразу мати дві версії:
+
+```sql
+'<b>' || department || '</b><br>' || employee
+    as responsible,
+
+department || chr(10) || employee
+    as pdf_responsible
+```
+
+Це важливо, бо HTML може бути складніший:
+
+```html
+<a href="...">
+<span>
+<div>
+<br>
+<i>
+```
+
+і простий `REGEXP_REPLACE` може прибрати теги, але втратити логічні переноси рядків.
+
+Наприклад:
+
+```html
+Відділ 1<br>Іваненко Іван
+```
+
+після:
+
+```sql
+regexp_replace(value, '<[^>]+>', '')
+```
+
+може стати:
+
+```text
+Відділ 1Іваненко Іван
+```
+
+А спеціальна PDF-колонка:
+
+```sql
+department
+|| chr(10) ||
+employee
+```
+
+дає нормальний результат:
+
+```text
+Відділ 1
+Іваненко Іван
+```
+
+### Якщо HTML уже знаходиться безпосередньо в даних
+
+Наприклад, у БД реально записане:
+
+```html
+<p>Завдання виконано</p>
+<br>
+<b>Примітка</b>
+```
+
+тоді можна зробити export-column:
+
+```sql
+trim(
+    regexp_replace(
+        regexp_replace(
+            note,
+            '<br\s*/?>|</p>|</div>',
+            chr(10),
+            1,
+            0,
+            'i'
+        ),
+        '<[^>]+>',
+        ''
+    )
+) as pdf_note
+```
+
+Тобто спочатку:
+
+```sql
+<br>
+</p>
+</div>
+```
+
+перетворюємо на переноси рядків, а вже потім видаляємо решту HTML.
+
+Ще краще врахувати HTML entities, якщо вони у вас є, наприклад `&nbsp;`, `&amp;` тощо.
+
+---
+
+І для вашої архітектури це дуже добре стикується з тим, що ми обговорювали раніше:
+
+```text
+IR Page 15
+───────────────────────────────────────
+
+Колонки UI:
+
+RESPONSIBLE
+STATUS
+...
+
+Колонки PDF:
+
+PDF_RESPONSIBLE
+PDF_STATUS
+PDF_DESCRIPTION
+...
+
+        ↓
+
+APEX_REGION.OPEN_QUERY_CONTEXT
+
+        ↓
+
+APEX_DATA_EXPORT
+
+p_columns:
+    PDF_RESPONSIBLE → "Відповідальний"
+    PDF_STATUS      → "Статус"
+    ...
+```
+
+При цьому **фільтри Interactive Report продовжують працювати**, бо `open_query_context` відкриває саме контекст вашого IR.
+
+Тобто ваш `DEPARTMENT`, який ми перенесемо через:
+
+```plsql
+apex_ir.add_filter(...)
+```
+
+також буде врахований при створенні PDF.
+
+Це, на мою думку, найчистіший варіант для вашого випадку: **IR відповідає за фільтрацію, окремі `PDF_*` колонки — за чистий вміст файлу, а `APEX_DATA_EXPORT.ADD_COLUMN` — за назви й склад колонок у PDF.**

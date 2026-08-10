@@ -1,0 +1,310 @@
+Так, згоден: на Page 15/16 `P16_DEPARTMENT` тут зайвий. Якщо `DEPARTMENT` потрібен саме як фільтр export-IR, логічніше прочитати його з IR сторінки 1 і одразу зробити `APEX_IR.ADD_FILTER` для IR на сторінці 16.
+
+Я б для спеціалізованого випадку зробив функцію, яка повертає лише значення активного фільтра `DEPARTMENT`.
+
+Наприклад, пакет:
+
+```plsql
+create or replace package report_filter_pkg as
+
+    function get_ir_department (
+        p_page_id   in number,
+        p_region_id in number
+    ) return varchar2;
+
+end report_filter_pkg;
+/
+```
+
+Body:
+
+```plsql
+create or replace package body report_filter_pkg as
+
+
+    function get_ir_department (
+        p_page_id   in number,
+        p_region_id in number
+    ) return varchar2
+    is
+        l_report      apex_ir.t_report;
+        l_sql         varchar2(32767);
+
+        l_bind_name   varchar2(255);
+        l_bind_value  varchar2(4000);
+
+        l_bind_pos    pls_integer;
+        l_fragment    varchar2(2000);
+
+        l_column      varchar2(255);
+        l_operator    varchar2(30);
+
+    begin
+
+        ------------------------------------------------------------
+        -- Отримуємо поточний стан IR
+        ------------------------------------------------------------
+        l_report := apex_ir.get_report(
+            p_page_id   => p_page_id,
+            p_region_id => p_region_id
+        );
+
+        l_sql := l_report.sql_query;
+
+
+        ------------------------------------------------------------
+        -- Перебираємо bind-и, створені IR
+        ------------------------------------------------------------
+        for i in 1 .. l_report.binds.count
+        loop
+
+            l_bind_name  := l_report.binds(i).name;
+            l_bind_value := l_report.binds(i).value;
+
+
+            --------------------------------------------------------
+            -- Нас цікавлять стандартні IR filter bind-и
+            --------------------------------------------------------
+            if upper(l_bind_name) like 'APXWS_EXPR_%'
+            then
+
+                l_bind_pos :=
+                    instr(
+                        upper(l_sql),
+                        ':' || upper(l_bind_name)
+                    );
+
+
+                if l_bind_pos > 0
+                then
+
+                    ------------------------------------------------
+                    -- SQL перед bind
+                    ------------------------------------------------
+                    l_fragment :=
+                        substr(
+                            l_sql,
+                            greatest(1, l_bind_pos - 1000),
+                            least(1000, l_bind_pos)
+                        );
+
+
+                    ------------------------------------------------
+                    -- Визначаємо колонку
+                    ------------------------------------------------
+                    l_column :=
+                        regexp_substr(
+                            l_fragment,
+                            '"([^"]+)"[[:space:]]*' ||
+                            '(=|<>|!=|>=|<=|>|<|LIKE)[[:space:]]*$',
+                            1,
+                            1,
+                            'in',
+                            1
+                        );
+
+
+                    ------------------------------------------------
+                    -- Визначаємо operator
+                    ------------------------------------------------
+                    l_operator :=
+                        regexp_substr(
+                            l_fragment,
+                            '(<>|!=|>=|<=|=|>|<|LIKE)[[:space:]]*$',
+                            1,
+                            1,
+                            'in',
+                            1
+                        );
+
+
+                    ------------------------------------------------
+                    -- Нам потрібен тільки простий:
+                    --
+                    -- DEPARTMENT = ...
+                    ------------------------------------------------
+                    if upper(l_column) = 'DEPARTMENT'
+                       and l_operator = '='
+                    then
+
+                        return l_bind_value;
+
+                    end if;
+
+                end if;
+
+            end if;
+
+        end loop;
+
+
+        ------------------------------------------------------------
+        -- Фільтра DEPARTMENT немає
+        ------------------------------------------------------------
+        return null;
+
+    end get_ir_department;
+
+
+end report_filter_pkg;
+/
+```
+
+Тоді на **Page 16 → Before Header**:
+
+```plsql
+declare
+    l_department varchar2(4000);
+begin
+
+    ------------------------------------------------------------
+    -- Читаємо DEPARTMENT із основного IR Page 1
+    ------------------------------------------------------------
+    l_department :=
+        report_filter_pkg.get_ir_department(
+            p_page_id   => 1,
+            p_region_id => 100100100100100
+        );
+
+
+    ------------------------------------------------------------
+    -- Якщо користувач відфільтрував DEPARTMENT,
+    -- додаємо такий самий filter до archive IR
+    ------------------------------------------------------------
+    if l_department is not null
+    then
+
+        apex_ir.add_filter(
+            p_page_id       => 16,
+            p_region_id     => 160160160160160,
+            p_report_column => 'DEPARTMENT',
+            p_filter_value  => l_department,
+            p_operator_abbr => 'EQ'
+        );
+
+    end if;
+
+end;
+```
+
+Таким чином `DEPARTMENT` взагалі не бере участі в SQL Page 16 як `P16_DEPARTMENT`.
+
+SQL архівного IR може залишатися:
+
+```sql
+select
+    t.task_id,
+    t.task_name,
+    t.department,
+    t.employee_name,
+    t.start_date,
+    t.end_date,
+    t.status,
+    t.archive_number,
+    t.archive_type,
+    t.archive_comment
+from tasks t
+where t.task_mode = :P16_TASK_MODE
+```
+
+APEX сам накладе:
+
+```text
+DEPARTMENT = Відділ 1
+```
+
+як стандартний IR filter.
+
+А дати з модалки — це вже інше. Їх я якраз **не робив би через `APEX_IR.ADD_FILTER`**, бо вони є параметрами конкретного архівного експорту, а не успадкованими фільтрами.
+
+На Page 16:
+
+```text
+P16_DATE_FROM
+P16_DATE_TO
+```
+
+і SQL:
+
+```sql
+select
+    t.task_id,
+    t.task_name,
+    t.department,
+    t.employee_name,
+    t.start_date,
+    t.end_date,
+    t.status,
+    t.archive_number,
+    t.archive_type,
+    t.archive_comment
+from tasks t
+where
+        t.task_mode = :P16_TASK_MODE
+
+and (
+        :P16_DATE_FROM is null
+        or t.end_date >=
+           to_date(:P16_DATE_FROM, 'DD.MM.YYYY')
+    )
+
+and (
+        :P16_DATE_TO is null
+        or t.start_date <
+           to_date(:P16_DATE_TO, 'DD.MM.YYYY') + 1
+    )
+```
+
+А поверх цього APEX додасть успадкований стандартний IR-фільтр:
+
+```text
+DEPARTMENT = Відділ 1
+```
+
+У результаті логіка дуже проста:
+
+```text
+Page 1
+────────────────────────────
+
+IR:
+DEPARTMENT = Відділ 1
+
+P1_TASK_MODE = ACTIVE
+
+        ↓ Archive
+
+Page 16
+────────────────────────────
+
+P16_TASK_MODE = ACTIVE
+
+Дата від: 01.08.2026
+Дата до:  31.08.2026
+
+Before Header:
+get_ir_department(Page 1)
+
+        ↓
+
+APEX_IR.ADD_FILTER
+
+DEPARTMENT = Відділ 1
+
+        ↓
+
+Archive IR
+────────────────────────────
+
+task_mode = ACTIVE
+
+AND перетин з
+01.08.2026 - 31.08.2026
+
+AND стандартний IR filter:
+DEPARTMENT = Відділ 1
+```
+
+Є ще один момент, який я б обов'язково врахував: **перед `ADD_FILTER` треба скидати попередній стан archive IR**, інакше при другому відкритті модалки старий `DEPARTMENT` може залишитися. Тобто кнопку відкриття Page 16 доцільно відкривати з `Request = RIR` або іншим штатним reset поточного IR.
+
+І для `get_ir_department()` я б навмисно залишив підтримку тільки `DEPARTMENT = value`. Не варто ускладнювати спеціалізовану функцію підтримкою `IN`, `LIKE`, `!=`, `BETWEEN`, якщо бізнес-правило тут просте: **якщо на основному звіті вибраний конкретний відділ — успадкувати його в архівний export**. Це значно легше підтримувати, ніж універсальний парсер.

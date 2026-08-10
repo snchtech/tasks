@@ -1,0 +1,142 @@
+Так. Якщо ваша мета — **не будувати `IR[...]_PDF` URL вручну**, а запустити ту саму штатну дію, що користувач викликає через `Actions → Download`, я б робив це через JavaScript API самого Interactive Report.
+
+Для регіону Interactive Report задайте **Static ID**, наприклад:
+
+```text
+list-task-report-print
+```
+
+На вашій кнопці створіть:
+
+```text
+Dynamic Action
+Event: Click
+True Action: Execute JavaScript Code
+```
+
+і викличте штатну дію Download:
+
+```javascript
+const region = apex.region("list-task-report-print");
+const ir = region.widget();
+const actions = ir.interactiveReport("getActions");
+
+actions.invoke("show-download-dialog");
+```
+
+У результаті APEX відкриє **свій стандартний Download dialog** для цього Interactive Report.
+
+Тобто фактично користувач отримає те саме:
+
+```text
+Actions
+  → Download
+      → PDF
+      → A4
+      → Portrait
+      → Download
+```
+
+і вам уже не потрібні:
+
+```plsql
+apex_page.get_url(...)
+```
+
+та:
+
+```plsql
+p_request => 'IR[list-task-report-print]_PDF'
+```
+
+Саме цей варіант я б перевірив першим, оскільки ви вже встановили, що штатний діалог APEX генерує PDF нормально.
+
+Якщо у вашій версії APEX виклик через `.widget().interactiveReport(...)` не спрацює, спробуйте варіант через `region.call`:
+
+```javascript
+const actions =
+    apex.region("list-task-report-print")
+        .call("getActions");
+
+actions.invoke("show-download-dialog");
+```
+
+Для APEX 24 я б почав саме з першого варіанта:
+
+```javascript
+const actions = apex
+    .region("list-task-report-print")
+    .widget()
+    .interactiveReport("getActions");
+
+actions.invoke("show-download-dialog");
+```
+
+### Як перевірити назву action
+
+Це корисно, бо назви action можуть відрізнятися залежно від версії/типу регіону. Тимчасово виконайте в Console:
+
+```javascript
+const actions = apex
+    .region("list-task-report-print")
+    .widget()
+    .interactiveReport("getActions");
+
+console.log(actions.list());
+```
+
+Ви побачите зареєстровані actions Interactive Report.
+
+Можна також знайти ті, що стосуються download:
+
+```javascript
+const actions = apex
+    .region("list-task-report-print")
+    .widget()
+    .interactiveReport("getActions");
+
+console.table(
+    actions.list().filter(action =>
+        action.name &&
+        action.name.toLowerCase().includes("download")
+    )
+);
+```
+
+Це дозволить точно побачити, чи у вашому APEX action називається:
+
+```text
+show-download-dialog
+```
+
+чи інакше.
+
+### Для вашої кнопки я б зробив саме так
+
+Замість поточного PL/SQL:
+
+```plsql
+begin
+    :P15_EXPORT_URL := apex_page.get_url(
+        p_application => v('APP_ID'),
+        p_page        => v('APP_PAGE_ID'),
+        p_request     => 'IR[list-task-report-print]_PDF',
+        p_session     => v('APP_SESSION')
+    );
+end;
+```
+
+взагалі прибрати `P15_EXPORT_URL` і зробити на кнопці лише:
+
+```javascript
+const actions = apex
+    .region("list-task-report-print")
+    .widget()
+    .interactiveReport("getActions");
+
+actions.invoke("show-download-dialog");
+```
+
+Це дає вам важливу перевагу: **APEX сам формує той внутрішній request і print configuration, які він використовує при ручному `Actions → Download`**. Тобто саме той шлях, який у вас зараз працює без `division by zero`.
+
+Якщо ж ви хочете наступний крок — натиснути вашу кнопку **«Завантажити PDF» і взагалі не показувати Download dialog**, але при цьому все одно використати штатний механізм APEX з `A4 + Portrait`, тут уже треба окремо подивитися, які actions і параметри доступні у вашому IR. Найкраще для цього спочатку виконати `actions.list()` — тоді можна побудувати рішення без ручного `IR[...]_PDF` request.

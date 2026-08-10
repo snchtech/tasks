@@ -1,0 +1,238 @@
+Тут уже видно важливу річ: якщо **той самий Interactive Report** через `Actions → Download → PDF → A4 → Portrait` нормально генерується, а через
+
+```plsql
+p_request => 'IR[list-task-report-print]_PDF'
+```
+
+падає на `division by zero`, то проблема майже напевно **не у вашому SQL і не в даних**.
+
+Різниця в тому, що ви фактично запускаєте **не зовсім той самий механізм**, що запускає стандартний діалог Download.
+
+У вашому коді:
+
+```plsql
+begin
+    :P15_EXPORT_URL := apex_page.get_url(
+        p_application => v('APP_ID'),
+        p_page        => v('APP_PAGE_ID'),
+        p_request     => 'IR[list-task-report-print]_PDF',
+        p_session     => v('APP_SESSION')
+    );
+end;
+```
+
+ви передаєте тільки request. Але стандартний:
+
+```text
+Actions
+→ Download
+→ PDF
+→ A4
+→ Portrait
+```
+
+передає APEX ще й **параметри print configuration**. І саме тут може бути причина `division by zero`: PDF renderer отримує request на PDF, але частина параметрів layout/width/config не ініціалізована так, як при штатному Download.
+
+Особливо підозріло, що ви вже пробували варіанти:
+
+```text
+IR[list-task-report-print]_PDF_N_N
+IR[list-task-report-print]_PDF_Y_N
+```
+
+і результат відрізняється від штатного виклику.
+
+### Я б зараз зробив один конкретний тест
+
+Не треба вгадувати правильний `REQUEST`.
+
+Відкрийте ваш звіт нормально:
+
+```text
+Actions
+→ Download
+→ PDF
+```
+
+виберіть:
+
+```text
+A4
+Portrait
+```
+
+і перед самим завантаженням відкрийте DevTools браузера:
+
+```text
+F12
+→ Network
+```
+
+Після натискання Download знайдіть request до APEX.
+
+Нас цікавить **не просто URL браузера**, а всі параметри request, які реально відправляє APEX.
+
+Ви майже напевно побачите, що штатний Download передає більше інформації, ніж:
+
+```text
+REQUEST = IR[list-task-report-print]_PDF
+```
+
+Тобто порівняйте:
+
+```text
+ваш виклик:
+
+f?p=195:15:SESSION:IR[list-task-report-print]_PDF
+```
+
+з тим, що реально відправив APEX.
+
+---
+
+Але є ще кращий варіант для вашої задачі: **не формувати власний PDF request взагалі**, а програмно запускати штатну дію Interactive Report.
+
+Тоді APEX сам збере:
+
+* поточний report state;
+* filters;
+* labels;
+* HTML → plain text;
+* ширини колонок;
+* print attributes;
+* A4;
+* portrait;
+* потрібні параметри PDF renderer.
+
+Саме тому стандартний Download у вас працює.
+
+### Ще один тест, який дуже багато скаже
+
+У вашому коді спробуйте тимчасово замість:
+
+```plsql
+p_request => 'IR[list-task-report-print]_PDF'
+```
+
+поставити **точно той request**, який генерує сам APEX.
+
+У вас на скріншоті вже були спроби:
+
+```plsql
+-- p_request => 'IR[list-task-report-print]_PDF_N_N',
+-- p_request => 'IR[list-task-report-print]_PDF_Y_N',
+p_request    => 'IR[list-task-report-print]_PDF',
+```
+
+Я б не підбирав `N_N` / `Y_N` вручну. Візьміть значення безпосередньо зі штатного запиту.
+
+---
+
+Ще одна підозріла деталь у вашому коді:
+
+```plsql
+p_page => v('APP_PAGE_ID')
+```
+
+Я для такого export URL не використовував би поточну сторінку неявно. Ви точно знаєте, що export IR знаходиться на Page 15, тому:
+
+```plsql
+begin
+    :P15_EXPORT_URL :=
+        apex_page.get_url(
+            p_application => v('APP_ID'),
+            p_page        => 15,
+            p_request     => 'IR[list-task-report-print]_PDF',
+            p_session     => v('APP_SESSION')
+        );
+end;
+```
+
+Але це саме по собі навряд чи пояснить division by zero, якщо код виконується на Page 15.
+
+### Чому `division by zero` може виникати всередині APEX
+
+PDF renderer приблизно повинен розрахувати ширини:
+
+```text
+доступна ширина сторінки
+        ↓
+ширини колонок
+        ↓
+коефіцієнт масштабування
+        ↓
+PDF
+```
+
+Якщо при ручному `REQUEST` він отримує некоректну/неініціалізовану print configuration, десь усередині може вийти умовно:
+
+```text
+available_width / calculated_width
+```
+
+де `calculated_width = 0`.
+
+Тому Oracle і показує:
+
+```text
+division by zero
+```
+
+хоча **у вашому SQL взагалі немає `/`**.
+
+Це дуже добре узгоджується з вашою поведінкою:
+
+```text
+Actions → Download → A4 → Portrait
+                         ↓
+                       працює
+
+ручний IR[...]_PDF request
+                         ↓
+                  division by zero
+```
+
+Тобто я б більше не шукав ділення у SELECT.
+
+### Що я пропоную зробити далі
+
+Зараз найкорисніше — один раз подивитися фактичний штатний Download request.
+
+У Chrome/Edge:
+
+```text
+F12
+→ Network
+→ Clear
+
+Actions
+→ Download
+→ PDF
+→ A4
+→ Portrait
+→ Download
+```
+
+Відкрийте request і зробіть скрін:
+
+```text
+Headers
++
+Payload / Form Data
+```
+
+Особливо мене цікавлять параметри на кшталт:
+
+```text
+p_request
+p_widget_name
+p_widget_action
+p_widget_action_mod
+x01
+x02
+...
+```
+
+або будь-які параметри з `PDF`, `PRINT`, `DOWNLOAD`.
+
+**Якщо ви дасте мені цей Network request, я зможу зіставити його з вашим `APEX_PAGE.GET_URL` і показати конкретно, чого бракує.** Це значно перспективніше, ніж далі перебирати `_PDF`, `_PDF_N_N`, `_PDF_Y_N` навмання.
