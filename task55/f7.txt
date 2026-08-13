@@ -1,0 +1,254 @@
+Так, можна зробити **той самий механізм**, тільки в PL/SQL міняєш формат експорту на XLSX, а в JavaScript — ім’я файлу.
+
+Найкраще навіть не робити окремий JS: передавати тип файлу як параметр і одним callback генерувати PDF або XLSX.
+
+Наприклад, Ajax Callback `DOWNLOAD_REPORT`.
+
+```plsql
+declare
+    l_export       apex_data_export.t_export;
+    l_context      apex_exec.t_context;
+    l_print_config apex_data_export.t_print_config;
+    l_columns      apex_data_export.t_columns;
+    l_report_id    number;
+    l_format       varchar2(10) := upper(apex_application.g_x01);
+begin
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_INFO',
+        p_heading => 'Інформація'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_DESCRIPTION_HTML',
+        p_heading => 'Опис'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'CREATOR_EXECUTOR_INFO',
+        p_heading => 'Виконавець'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'NOTE',
+        p_heading => 'Примітка'
+    );
+
+    l_report_id :=
+        apex_ir.get_last_viewed_report_id(
+            p_page_id   => 15,
+            p_region_id => 397351893134453127
+        );
+
+    l_context :=
+        apex_region.open_query_context(
+            p_page_id      => 15,
+            p_region_id    => 397351893134453127,
+            p_component_id => l_report_id,
+            p_view_mode    => 'REPORT'
+        );
+
+    if l_format = 'PDF' then
+
+        l_print_config :=
+            apex_data_export.get_print_config(
+                p_paper_size  => apex_data_export.c_size_a4,
+                p_orientation => apex_data_export.c_orientation_portrait
+            );
+
+        l_export :=
+            apex_data_export.export(
+                p_context      => l_context,
+                p_format       => apex_data_export.c_format_pdf,
+                p_print_config => l_print_config,
+                p_columns      => l_columns,
+                p_page_header  => 'Звіт по задачах',
+                p_file_name    => 'task_report'
+            );
+
+    elsif l_format = 'XLSX' then
+
+        l_export :=
+            apex_data_export.export(
+                p_context   => l_context,
+                p_format    => apex_data_export.c_format_xlsx,
+                p_columns   => l_columns,
+                p_file_name => 'task_report'
+            );
+
+    else
+        raise_application_error(
+            -20001,
+            'Невідомий формат експорту'
+        );
+    end if;
+
+    apex_exec.close(l_context);
+
+    apex_data_export.download(
+        p_export => l_export
+    );
+
+    apex_application.stop_apex_engine;
+
+exception
+    when apex_application.e_stop_apex_engine then
+        null;
+
+    when others then
+        if apex_exec.is_open(l_context) then
+            apex_exec.close(l_context);
+        end if;
+
+        raise;
+end;
+```
+
+Тут формат приходить через:
+
+```plsql
+apex_application.g_x01
+```
+
+Тобто з JavaScript передаємо:
+
+```javascript
+x01: "PDF"
+```
+
+або:
+
+```javascript
+x01: "XLSX"
+```
+
+І зробимо одну JS-функцію:
+
+```javascript
+function downloadReport(format) {
+
+    const spinner = apex.util.showSpinner(document.body);
+
+    const xhr = new XMLHttpRequest();
+
+    const url = apex.server.url(
+        {
+            x01: format,
+            pageItems: "#P15_TASK_MODE"
+        },
+        {
+            process: "DOWNLOAD_REPORT"
+        }
+    );
+
+    xhr.open("GET", url, true);
+    xhr.responseType = "blob";
+
+    xhr.onload = function () {
+        try {
+
+            if (xhr.status !== 200) {
+                throw new Error("HTTP " + xhr.status);
+            }
+
+            const blob = xhr.response;
+
+            if (!blob || blob.size === 0) {
+                throw new Error("Порожній файл");
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+
+            const link = document.createElement("a");
+
+            link.href = blobUrl;
+
+            if (format === "PDF") {
+                link.download = "task_report.pdf";
+            } else if (format === "XLSX") {
+                link.download = "task_report.xlsx";
+            }
+
+            link.style.display = "none";
+
+            document.body.appendChild(link);
+
+            link.click();
+
+            link.remove();
+
+            setTimeout(function () {
+                URL.revokeObjectURL(blobUrl);
+            }, 1000);
+
+        } catch (e) {
+
+            console.error(e);
+
+            apex.message.alert(
+                "Не вдалося завантажити звіт."
+            );
+
+        } finally {
+
+            spinner.remove();
+
+        }
+    };
+
+    xhr.onerror = function () {
+
+        spinner.remove();
+
+        apex.message.alert(
+            "Не вдалося завантажити звіт."
+        );
+
+    };
+
+    xhr.send();
+}
+```
+
+Тоді для кнопки PDF:
+
+```javascript
+downloadReport("PDF");
+```
+
+А для Excel:
+
+```javascript
+downloadReport("XLSX");
+```
+
+І все.
+
+Тобто архітектура виходить дуже проста:
+
+```text
+кнопка PDF
+   ↓
+downloadReport("PDF")
+
+кнопка Excel
+   ↓
+downloadReport("XLSX")
+
+        ↓
+
+один Ajax Callback
+        ↓
+APEX_DATA_EXPORT
+        ↓
+Blob
+        ↓
+download
+```
+
+Ще одна важлива різниця: для XLSX тобі **не потрібен `p_print_config`**. `A4`, `Portrait` мають сенс тільки для PDF.
+
+Якщо хочеш, можна ще сильніше спростити і зробити одну кнопку **«Завантажити» + Select List PDF/XLSX**, але два окремі buttons теж цілком нормально.

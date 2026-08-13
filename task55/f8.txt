@@ -1,0 +1,194 @@
+Для кастомних кнопок це якраз просто: ти один раз оголошуєш функцію `downloadReport(format)`, а кожна кнопка викликає її зі своїм форматом.
+
+На Page 15 у `JavaScript → Function and Global Variable Declaration` додай:
+
+```javascript
+function downloadReport(format) {
+
+    const spinner = apex.util.showSpinner(document.body);
+
+    const xhr = new XMLHttpRequest();
+
+    const url = apex.server.url(
+        {
+            x01: format,
+            pageItems: "#P15_TASK_MODE"
+        },
+        {
+            process: "DOWNLOAD_REPORT"
+        }
+    );
+
+    xhr.open("GET", url, true);
+    xhr.responseType = "blob";
+
+    xhr.onload = function () {
+
+        try {
+
+            if (xhr.status !== 200) {
+                throw new Error("HTTP " + xhr.status);
+            }
+
+            const blob = xhr.response;
+
+            if (!blob || blob.size === 0) {
+                throw new Error("Порожній файл");
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+
+            const link = document.createElement("a");
+
+            link.href = blobUrl;
+
+            if (format === "PDF") {
+                link.download = "task_report.pdf";
+            }
+
+            if (format === "XLSX") {
+                link.download = "task_report.xlsx";
+            }
+
+            link.style.display = "none";
+
+            document.body.appendChild(link);
+
+            link.click();
+
+            link.remove();
+
+            setTimeout(function () {
+                URL.revokeObjectURL(blobUrl);
+            }, 1000);
+
+        } catch (e) {
+
+            console.error(e);
+
+            apex.message.alert(
+                "Не вдалося завантажити звіт."
+            );
+
+        } finally {
+
+            spinner.remove();
+
+        }
+    };
+
+
+    xhr.onerror = function () {
+
+        spinner.remove();
+
+        apex.message.alert(
+            "Не вдалося завантажити звіт."
+        );
+
+    };
+
+
+    xhr.send();
+}
+```
+
+Потім створюєш дві звичайні кастомні кнопки.
+
+Для кнопки `DOWNLOAD_PDF`:
+
+`Action = Defined by Dynamic Action`
+
+Створюєш Dynamic Action:
+
+`Event = Click`
+
+`Selection Type = Button`
+
+`Button = DOWNLOAD_PDF`
+
+True Action:
+
+`Execute JavaScript Code`
+
+Код:
+
+```javascript
+downloadReport("PDF");
+```
+
+Для кнопки `DOWNLOAD_XLSX` аналогічно:
+
+```javascript
+downloadReport("XLSX");
+```
+
+Тобто в результаті в тебе:
+
+```text
+Кнопка "Скачати PDF"
+        ↓
+downloadReport("PDF")
+        ↓
+DOWNLOAD_REPORT Ajax Callback
+        ↓
+APEX_DATA_EXPORT PDF
+```
+
+і:
+
+```text
+Кнопка "Скачати Excel"
+        ↓
+downloadReport("XLSX")
+        ↓
+той самий DOWNLOAD_REPORT
+        ↓
+APEX_DATA_EXPORT XLSX
+```
+
+У самому Ajax Callback формат читається через:
+
+```plsql
+l_format varchar2(10) :=
+    upper(apex_application.g_x01);
+```
+
+і далі:
+
+```plsql
+if l_format = 'PDF' then
+
+    l_export :=
+        apex_data_export.export(
+            p_context      => l_context,
+            p_format       => apex_data_export.c_format_pdf,
+            p_print_config => l_print_config,
+            p_columns      => l_columns,
+            p_page_header  => 'Звіт по задачах',
+            p_file_name    => 'task_report'
+        );
+
+elsif l_format = 'XLSX' then
+
+    l_export :=
+        apex_data_export.export(
+            p_context   => l_context,
+            p_format    => apex_data_export.c_format_xlsx,
+            p_columns   => l_columns,
+            p_file_name => 'task_report'
+        );
+
+end if;
+```
+
+Тобто тобі не треба два Ajax Callback. Один callback обслуговує обидві кнопки.
+
+Якщо на сторінці є додаткові items, наприклад дата від/до, просто додаєш їх сюди:
+
+```javascript
+pageItems:
+    "#P15_TASK_MODE,#P15_DATE_FROM,#P15_DATE_TO"
+```
+
+І вони автоматично будуть доступні в PL/SQL як `:P15_DATE_FROM`, `:P15_DATE_TO`.

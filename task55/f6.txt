@@ -1,0 +1,246 @@
+Так. Ось один цілісний варіант без перезавантаження сторінки: **Ajax Callback формує PDF, JavaScript отримує його як Blob, запускає download і показує spinner на час формування**.
+
+### 1. Ajax Callback `DOWNLOAD_PDF_REPORT`
+
+На Page 15 створи:
+
+`Processing → Ajax Callback`
+
+Name:
+
+`DOWNLOAD_PDF_REPORT`
+
+PL/SQL:
+
+```plsql
+declare
+    l_export       apex_data_export.t_export;
+    l_context      apex_exec.t_context;
+    l_print_config apex_data_export.t_print_config;
+    l_columns      apex_data_export.t_columns;
+    l_report_id    number;
+begin
+    -- 1. PDF config
+    l_print_config :=
+        apex_data_export.get_print_config(
+            p_paper_size  => apex_data_export.c_size_a4,
+            p_orientation => apex_data_export.c_orientation_portrait
+        );
+
+    -- 2. Export columns
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_INFO',
+        p_heading => 'Інформація'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_DESCRIPTION_HTML',
+        p_heading => 'Опис'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'CREATOR_EXECUTOR_INFO',
+        p_heading => 'Виконавець'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'NOTE',
+        p_heading => 'Примітка'
+    );
+
+    -- 3. Current IR report id
+    l_report_id :=
+        apex_ir.get_last_viewed_report_id(
+            p_page_id   => 15,
+            p_region_id => 397351893134453127
+        );
+
+    -- 4. Open IR context
+    l_context :=
+        apex_region.open_query_context(
+            p_page_id      => 15,
+            p_region_id    => 397351893134453127,
+            p_component_id => l_report_id,
+            p_view_mode    => 'REPORT'
+        );
+
+    -- 5. Generate PDF
+    l_export :=
+        apex_data_export.export(
+            p_context      => l_context,
+            p_format       => apex_data_export.c_format_pdf,
+            p_print_config => l_print_config,
+            p_columns      => l_columns,
+            p_page_header  => 'Звіт по задачах',
+            p_file_name    => 'task_report'
+        );
+
+    apex_exec.close(l_context);
+
+    -- 6. Return binary file
+    apex_data_export.download(
+        p_export => l_export
+    );
+
+    apex_application.stop_apex_engine;
+
+exception
+    when apex_application.e_stop_apex_engine then
+        null;
+
+    when others then
+        if apex_exec.is_open(l_context) then
+            apex_exec.close(l_context);
+        end if;
+
+        raise;
+end;
+```
+
+Тут **не додавай вручну**:
+
+```plsql
+htp.init;
+owa_util.mime_header(...);
+Content-Length
+http_header_close
+```
+
+бо `apex_data_export.download()` це робить сам.
+
+---
+
+### 2. JavaScript на кастомній кнопці
+
+На кнопці:
+
+`Dynamic Action → Execute JavaScript Code`
+
+встав:
+
+```javascript
+const spinner = apex.util.showSpinner(document.body);
+
+const xhr = new XMLHttpRequest();
+
+const url = apex.server.url(
+    {
+        pageItems: "#P15_TASK_MODE"
+    },
+    {
+        process: "DOWNLOAD_PDF_REPORT"
+    }
+);
+
+xhr.open("GET", url, true);
+xhr.responseType = "blob";
+
+xhr.onload = function () {
+    try {
+        if (xhr.status !== 200) {
+            throw new Error("HTTP " + xhr.status);
+        }
+
+        const blob = xhr.response;
+
+        if (!blob || blob.size === 0) {
+            throw new Error("Отримано порожній файл");
+        }
+
+        const blobUrl = URL.createObjectURL(blob);
+
+        const link = document.createElement("a");
+
+        link.href = blobUrl;
+        link.download = "task_report.pdf";
+        link.style.display = "none";
+
+        document.body.appendChild(link);
+
+        link.click();
+
+        link.remove();
+
+        setTimeout(function () {
+            URL.revokeObjectURL(blobUrl);
+        }, 1000);
+
+    } catch (e) {
+        console.error(e);
+
+        apex.message.alert(
+            "Не вдалося завантажити PDF."
+        );
+    } finally {
+        spinner.remove();
+    }
+};
+
+xhr.onerror = function () {
+    spinner.remove();
+
+    console.error("Помилка HTTP-запиту");
+
+    apex.message.alert(
+        "Не вдалося завантажити PDF."
+    );
+};
+
+xhr.send();
+```
+
+Тоді поведінка:
+
+```text
+натискання кнопки
+        ↓
+APEX spinner
+        ↓
+Ajax Callback
+        ↓
+формування PDF
+        ↓
+отримання Blob
+        ↓
+браузер починає download
+        ↓
+spinner зникає
+```
+
+Сторінка при цьому **не reload-иться**.
+
+---
+
+Є один нюанс: якщо Ajax Callback використовує ще якісь page items, крім `P15_TASK_MODE`, додай їх сюди:
+
+```javascript
+pageItems: "#P15_TASK_MODE,#P15_DATE_FROM,#P15_DATE_TO"
+```
+
+Наприклад:
+
+```javascript
+const url = apex.server.url(
+    {
+        pageItems:
+            "#P15_TASK_MODE,#P15_DATE_FROM,#P15_DATE_TO"
+    },
+    {
+        process: "DOWNLOAD_PDF_REPORT"
+    }
+);
+```
+
+І тоді ці значення будуть доступні у PL/SQL як:
+
+```plsql
+:P15_TASK_MODE
+:P15_DATE_FROM
+:P15_DATE_TO
+```
+
+Це я б і залишив як базовий робочий варіант: один Ajax Callback + один JS у кнопці.

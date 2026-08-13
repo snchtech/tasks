@@ -1,0 +1,157 @@
+Так, саме тому для твого випадку AJAX підхід має сенс: **сторінка не перезавантажується**.
+
+Проблема не в самій ідеї AJAX, а в тому, що `apex.server.process()` не віддає binary response як `Blob` так просто, як звичайний `fetch`/`XMLHttpRequest`.
+
+Тому найпростіше лишити твій Ajax Callback `DOWNLOAD_PDF_REPORT`, але викликати його не через `apex.server.process()`, а через `fetch()` на AJAX URL цього process.
+
+У APEX можна отримати URL процесу так:
+
+```javascript
+const url = apex.util.makeApplicationUrl({
+    pageId: 15,
+    request: "APPLICATION_PROCESS=DOWNLOAD_PDF_REPORT"
+});
+```
+
+Але для page-level Ajax Callback краще використовувати `apex.server.url(...)`:
+
+```javascript
+const url = apex.server.url({
+    pageItems: "#P15_TASK_MODE"
+}, {
+    process: "DOWNLOAD_PDF_REPORT"
+});
+```
+
+І далі:
+
+```javascript
+fetch(url, {
+    method: "GET",
+    credentials: "same-origin"
+})
+.then(response => {
+    if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+    }
+
+    return response.blob();
+})
+.then(blob => {
+    const blobUrl = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = "task_report.pdf";
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(blobUrl);
+})
+.catch(error => {
+    console.error(error);
+    apex.message.alert("Не вдалося завантажити PDF.");
+});
+```
+
+Але я б навіть зробив ще надійніше через `XMLHttpRequest`, бо тут точно контролюєш `responseType = "blob"`:
+
+```javascript
+const xhr = new XMLHttpRequest();
+
+const url = apex.server.url(
+    {
+        pageItems: "#P15_TASK_MODE"
+    },
+    {
+        process: "DOWNLOAD_PDF_REPORT"
+    }
+);
+
+xhr.open("GET", url, true);
+
+xhr.responseType = "blob";
+
+xhr.onload = function () {
+
+    if (xhr.status === 200) {
+
+        const blobUrl = URL.createObjectURL(xhr.response);
+
+        const link = document.createElement("a");
+
+        link.href = blobUrl;
+        link.download = "task_report.pdf";
+
+        document.body.appendChild(link);
+
+        link.click();
+
+        link.remove();
+
+        URL.revokeObjectURL(blobUrl);
+
+    } else {
+
+        apex.message.alert(
+            "Помилка завантаження PDF."
+        );
+
+    }
+
+};
+
+xhr.onerror = function () {
+
+    apex.message.alert(
+        "Помилка завантаження PDF."
+    );
+
+};
+
+xhr.send();
+```
+
+Тобто схема буде:
+
+```text
+кнопка
+↓
+XHR / fetch
+↓
+Ajax Callback
+↓
+APEX_DATA_EXPORT
+↓
+PDF response
+↓
+Blob
+↓
+download
+```
+
+і **жодного reload сторінки немає**.
+
+У PL/SQL при цьому я б не робив вручну `htp.init`, `mime_header`, `Content-Length`, якщо вже викликаєш:
+
+```plsql
+apex_data_export.download(
+    p_export => l_export
+);
+```
+
+Залиш тільки:
+
+```plsql
+apex_data_export.download(
+    p_export => l_export
+);
+
+apex_application.stop_apex_engine;
+```
+
+і exception для `e_stop_apex_engine`.
+
+Якщо хочеш, я можу наступним повідомленням дати тобі **один цілісний готовий комплект**: `Ajax Callback PL/SQL + JavaScript для кнопки + spinner`, без зайвих варіантів.
