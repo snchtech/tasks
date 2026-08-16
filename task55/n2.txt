@@ -1,0 +1,392 @@
+Так, варіант із `REQUEST + Page Process` може нормально працювати в APEX 24, але якщо ти вже отримував HTML замість файла, я б перед впровадженням зробив його максимально діагностованим. HTML зазвичай означає одне з трьох: процес не спрацював по потрібному `REQUEST`, процес впав до `apex_data_export.download`, або після процесу APEX продовжив рендерити сторінку.
+
+Я б зробив **два окремі Page Process** на початку — PDF та XLSX. Так дебажити набагато простіше, а об'єднати їх потім завжди можна.
+
+Для PDF створи Page Process на Page 15:
+
+`Name: DOWNLOAD_PDF`
+
+`Point: Before Header`
+
+`Server-side Condition → Request = DOWNLOAD_PDF`
+
+Код:
+
+```plsql
+declare
+    l_export       apex_data_export.t_export;
+    l_context      apex_exec.t_context;
+    l_print_config apex_data_export.t_print_config;
+    l_columns      apex_data_export.t_columns;
+    l_report_id    number;
+begin
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: START, REQUEST=%s',
+        v('REQUEST')
+    );
+
+    --------------------------------------------------
+    -- 1. Колонки
+    --------------------------------------------------
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_INFO',
+        p_heading => 'Інформація'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_DESCRIPTION_HTML',
+        p_heading => 'Опис'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'CREATOR_EXECUTOR_INFO',
+        p_heading => 'Виконавець'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'NOTE',
+        p_heading => 'Примітка'
+    );
+
+    apex_debug.message('DOWNLOAD_PDF: columns prepared');
+
+
+    --------------------------------------------------
+    -- 2. Поточний REPORT_ID
+    --------------------------------------------------
+
+    l_report_id :=
+        apex_ir.get_last_viewed_report_id(
+            p_page_id   => 15,
+            p_region_id => 397351893134453127
+        );
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: report_id=%s',
+        l_report_id
+    );
+
+
+    --------------------------------------------------
+    -- 3. Query context
+    --------------------------------------------------
+
+    l_context :=
+        apex_region.open_query_context(
+            p_page_id      => 15,
+            p_region_id    => 397351893134453127,
+            p_component_id => l_report_id,
+            p_view_mode    => 'REPORT'
+        );
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: context opened'
+    );
+
+
+    --------------------------------------------------
+    -- 4. PDF configuration
+    --------------------------------------------------
+
+    l_print_config :=
+        apex_data_export.get_print_config(
+            p_paper_size  => apex_data_export.c_size_a4,
+            p_orientation => apex_data_export.c_orientation_portrait
+        );
+
+
+    --------------------------------------------------
+    -- 5. Export
+    --------------------------------------------------
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: before export'
+    );
+
+    l_export :=
+        apex_data_export.export(
+            p_context      => l_context,
+            p_format       => apex_data_export.c_format_pdf,
+            p_columns      => l_columns,
+            p_print_config => l_print_config,
+            p_page_header  => 'Звіт по задачах',
+            p_file_name    => 'task_report'
+        );
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: export created, blob length=%s',
+        dbms_lob.getlength(l_export.content_blob)
+    );
+
+
+    --------------------------------------------------
+    -- 6. Context більше не потрібний
+    --------------------------------------------------
+
+    apex_exec.close(l_context);
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: context closed'
+    );
+
+
+    --------------------------------------------------
+    -- 7. Download
+    --------------------------------------------------
+
+    apex_debug.message(
+        'DOWNLOAD_PDF: calling download'
+    );
+
+    apex_data_export.download(
+        p_export => l_export
+    );
+
+    /*
+     * Після download нормальний код сюди,
+     * швидше за все, вже не повинен дійти.
+     */
+    apex_debug.message(
+        'DOWNLOAD_PDF: AFTER DOWNLOAD'
+    );
+
+
+exception
+
+    when apex_application.e_stop_apex_engine then
+
+        /*
+         * Це НЕ помилка.
+         * APEX_DATA_EXPORT.DOWNLOAD може зупиняти
+         * APEX engine після віддачі файла.
+         */
+        apex_debug.message(
+            'DOWNLOAD_PDF: normal stop_apex_engine'
+        );
+
+        raise;
+
+
+    when others then
+
+        apex_debug.error(
+            'DOWNLOAD_PDF ERROR: SQLCODE=%s SQLERRM=%s',
+            sqlcode,
+            sqlerrm
+        );
+
+        apex_debug.error(
+            'BACKTRACE=%s',
+            dbms_utility.format_error_backtrace
+        );
+
+        apex_debug.error(
+            'CALL STACK=%s',
+            dbms_utility.format_call_stack
+        );
+
+        begin
+            if apex_exec.is_open(l_context) then
+                apex_exec.close(l_context);
+            end if;
+        exception
+            when others then
+                null;
+        end;
+
+        raise;
+
+end;
+```
+
+Тут я спеціально зробив одну важливу зміну проти попереднього прикладу:
+
+```plsql
+when apex_application.e_stop_apex_engine then
+    raise;
+```
+
+а не:
+
+```plsql
+when apex_application.e_stop_apex_engine then
+    null;
+```
+
+Я б **не ковтав `e_stop_apex_engine`**. Якщо його проковтнути, APEX потенційно може продовжити життєвий цикл сторінки, і в результаті ти можеш отримати HTML після/замість binary response. Для download APEX engine має припинити нормальний rendering.
+
+Тепер кнопку PDF для першого тесту я б зробив взагалі без JS і без `GET_URL`.
+
+У Button:
+
+`Action = Submit Page`
+
+`Request / Button Name = DOWNLOAD_PDF`
+
+або просто назви кнопку:
+
+`DOWNLOAD_PDF`
+
+і переконайся, що процес має умову:
+
+`Request = DOWNLOAD_PDF`.
+
+Це дуже важливий тест. Натискаєш кнопку → звичайний submit → Before Header process → PDF.
+
+Якщо **так файл завантажується**, значить сам PL/SQL і `APEX_DATA_EXPORT` у тебе правильні. Тоді вже можна замінювати submit на URL/JS.
+
+Якщо навіть так повертається HTML, то відкривай Debug — причина буде видна до JavaScript взагалі.
+
+### Як увімкнути Debug в APEX 24
+
+Запусти сторінку з Developer Toolbar унизу та натисни:
+
+`Debug → Level 6` або `Debug → Debug`
+
+Після цього натисни `DOWNLOAD_PDF`.
+
+Потім:
+
+`Developer Toolbar → Debug → View Debug`
+
+і шукай:
+
+`DOWNLOAD_PDF:`
+
+Ти повинен побачити послідовність приблизно:
+
+```text
+DOWNLOAD_PDF: START, REQUEST=DOWNLOAD_PDF
+DOWNLOAD_PDF: columns prepared
+DOWNLOAD_PDF: report_id=123456789
+DOWNLOAD_PDF: context opened
+DOWNLOAD_PDF: before export
+DOWNLOAD_PDF: export created, blob length=58439
+DOWNLOAD_PDF: context closed
+DOWNLOAD_PDF: calling download
+DOWNLOAD_PDF: normal stop_apex_engine
+```
+
+Якщо останній рядок:
+
+```text
+DOWNLOAD_PDF: before export
+```
+
+а далі exception — проблема в:
+
+```plsql
+apex_data_export.export(...)
+```
+
+Якщо:
+
+```text
+report_id=
+```
+
+порожній або неправильний — проблема з current IR.
+
+Якщо є:
+
+```text
+blob length=0
+```
+
+проблема вже в результаті export.
+
+Якщо бачиш:
+
+```text
+blob length=58439
+```
+
+але браузер отримує HTML — значить PDF уже сформований і треба дивитися саме response lifecycle після `download()`.
+
+Для exception особливо корисним буде:
+
+```plsql
+dbms_utility.format_error_backtrace
+```
+
+В Debug ти отримаєш не просто:
+
+```text
+ORA-...
+```
+
+а рядок PL/SQL, на якому це впало.
+
+### Ще простіший тест без Interactive Report
+
+Щоб перевірити, чи взагалі працює `APEX_DATA_EXPORT.DOWNLOAD` через Page Process у твоєму середовищі, можна тимчасово зробити процес із дуже простим context. Але я б цього поки не робив — твій поточний код уже формував PDF через AJAX, отже сам export engine у тебе, скоріш за все, працює.
+
+### Чому раніше GET_URL міг працювати «не завжди»
+
+Тут є типова проблема session state.
+
+Наприклад ти формував:
+
+```plsql
+apex_page.get_url(
+    p_page    => 15,
+    p_request => 'DOWNLOAD_PDF'
+)
+```
+
+але перед цим змінив:
+
+```text
+P15_TASK_MODE
+P15_DATE_FROM
+P15_DATE_TO
+```
+
+на клієнті.
+
+URL перехід сам по собі **не обов'язково submit-ить поточні browser values у session state**.
+
+Тому export process може побачити старі значення.
+
+Саме тому для діагностики я б почав із:
+
+```text
+Button → Submit Page → DOWNLOAD_PDF
+```
+
+Submit гарантовано запише items у session state перед Processing.
+
+### Чи перезавантажиться сторінка
+
+При правильному:
+
+```plsql
+apex_data_export.download(...)
+```
+
+response є attachment і normal page rendering має бути зупинений. Тобто браузер завантажує файл, а Page 15 залишається такою, як була.
+
+Це не AJAX, але користувацьки зазвичай виглядає саме як:
+
+```text
+натиснув
+→ PDF завантажився
+→ залишився на тій же сторінці
+```
+
+Це одна з причин, чому я зараз вважаю цей шлях кращим за Blob через Ajax Callback.
+
+Після того як **Submit Page + Page Process** у тебе стабільно запрацює, можна зробити і XLSX другим request:
+
+```text
+DOWNLOAD_PDF
+DOWNLOAD_XLSX
+```
+
+і вже потім об'єднати код у одну процедуру/пакет. На етапі дебагу я б їх не об'єднував — так одразу видно, який саме формат падає.

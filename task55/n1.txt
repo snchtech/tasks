@@ -1,0 +1,218 @@
+Так. **DA → Execute Server-side Code тут не допоможе**, бо ця дія теж виконується через AJAX. Для `APEX_DATA_EXPORT.DOWNLOAD` краще взагалі прибрати Ajax Callback і зробити звичайний **Page Process**, який викликається спеціальним `REQUEST`.
+
+Це буде значно простіше.
+
+На Page 15 створи процес, наприклад `DOWNLOAD_REPORT`, з Processing Point **Before Header**. Код:
+
+```plsql
+declare
+    l_export       apex_data_export.t_export;
+    l_context      apex_exec.t_context;
+    l_print_config apex_data_export.t_print_config;
+    l_columns      apex_data_export.t_columns;
+    l_report_id    number;
+    l_format       varchar2(10);
+begin
+
+    ----------------------------------------------------------------
+    -- Визначаємо формат по REQUEST
+    ----------------------------------------------------------------
+    if v('REQUEST') = 'DOWNLOAD_PDF' then
+        l_format := 'PDF';
+
+    elsif v('REQUEST') = 'DOWNLOAD_XLSX' then
+        l_format := 'XLSX';
+
+    else
+        return;
+    end if;
+
+
+    ----------------------------------------------------------------
+    -- Колонки експорту
+    ----------------------------------------------------------------
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_INFO',
+        p_heading => 'Інформація'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'TASK_DESCRIPTION_HTML',
+        p_heading => 'Опис'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'CREATOR_EXECUTOR_INFO',
+        p_heading => 'Виконавець'
+    );
+
+    apex_data_export.add_column(
+        p_columns => l_columns,
+        p_name    => 'NOTE',
+        p_heading => 'Примітка'
+    );
+
+
+    ----------------------------------------------------------------
+    -- Поточний IR
+    ----------------------------------------------------------------
+    l_report_id :=
+        apex_ir.get_last_viewed_report_id(
+            p_page_id   => 15,
+            p_region_id => 397351893134453127
+        );
+
+
+    l_context :=
+        apex_region.open_query_context(
+            p_page_id      => 15,
+            p_region_id    => 397351893134453127,
+            p_component_id => l_report_id,
+            p_view_mode    => 'REPORT'
+        );
+
+
+    ----------------------------------------------------------------
+    -- PDF
+    ----------------------------------------------------------------
+    if l_format = 'PDF' then
+
+        l_print_config :=
+            apex_data_export.get_print_config(
+                p_paper_size  => apex_data_export.c_size_a4,
+                p_orientation => apex_data_export.c_orientation_portrait
+            );
+
+        l_export :=
+            apex_data_export.export(
+                p_context      => l_context,
+                p_format       => apex_data_export.c_format_pdf,
+                p_columns      => l_columns,
+                p_print_config => l_print_config,
+                p_page_header  => 'Звіт по задачах',
+                p_file_name    => 'task_report'
+            );
+
+
+    ----------------------------------------------------------------
+    -- XLSX
+    ----------------------------------------------------------------
+    elsif l_format = 'XLSX' then
+
+        l_export :=
+            apex_data_export.export(
+                p_context   => l_context,
+                p_format    => apex_data_export.c_format_xlsx,
+                p_columns   => l_columns,
+                p_file_name => 'task_report'
+            );
+
+    end if;
+
+
+    apex_exec.close(l_context);
+
+
+    ----------------------------------------------------------------
+    -- Віддаємо файл браузеру
+    ----------------------------------------------------------------
+    apex_data_export.download(
+        p_export => l_export
+    );
+
+
+exception
+    when apex_application.e_stop_apex_engine then
+        null;
+
+    when others then
+
+        if apex_exec.is_open(l_context) then
+            apex_exec.close(l_context);
+        end if;
+
+        raise;
+end;
+```
+
+Для самого процесу постав Server-side Condition:
+
+```text
+Type: Request is contained in Value
+Value:
+DOWNLOAD_PDF,DOWNLOAD_XLSX
+```
+
+Або дві відповідні умови, залежно від того, що дозволяє твій Page Designer.
+
+Тепер **Ajax Callback взагалі видаляємо**.
+
+Для кастомної кнопки **PDF** ставиш `Action = Defined by Dynamic Action`, а в `Execute JavaScript Code`:
+
+```javascript
+apex.navigation.redirect(
+    "f?p=" +
+    $v("pFlowId") +
+    ":15:" +
+    $v("pInstance") +
+    ":DOWNLOAD_PDF"
+);
+```
+
+Для Excel:
+
+```javascript
+apex.navigation.redirect(
+    "f?p=" +
+    $v("pFlowId") +
+    ":15:" +
+    $v("pInstance") +
+    ":DOWNLOAD_XLSX"
+);
+```
+
+Ключове тут: відповідь процесу буде не HTML-сторінкою, а:
+
+```text
+Content-Disposition: attachment
+```
+
+який формує:
+
+```plsql
+apex_data_export.download(...)
+```
+
+Тому браузер має почати завантаження файла, а поточна сторінка в нормальному сценарії **залишиться відкритою**, а не відрендериться заново як Page 15.
+
+Тобто схема стає дуже проста:
+
+```text
+Кнопка PDF
+    ↓
+REQUEST = DOWNLOAD_PDF
+    ↓
+Page Process
+    ↓
+APEX_DATA_EXPORT
+    ↓
+PDF
+
+
+Кнопка Excel
+    ↓
+REQUEST = DOWNLOAD_XLSX
+    ↓
+той самий Page Process
+    ↓
+APEX_DATA_EXPORT
+    ↓
+XLSX
+```
+
+І важливе виправлення щодо твого питання: **не перенось це в DA Server-side Code**. `Execute Server-side Code` у Dynamic Action знову поверне тебе до AJAX-проблеми з binary response. Якщо раніше в тебе “через server side” файл завантажувався, найімовірніше це був саме submit/page process або окремий HTTP request, а не AJAX DA.
+
+Я б зараз пішов саме цим шляхом: **один Page Process + два REQUEST**. Він значно простіший за `XHR → Blob → createObjectURL → download`.
