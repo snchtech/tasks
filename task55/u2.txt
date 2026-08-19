@@ -1,0 +1,477 @@
+Так. Тепер, коли структура звіту узгоджена, я б уже **не намагався доробляти поточний `UNION ALL` шматками**, а перебудував SQL навколо одного набору даних. Це значно спростить і підрахунок, і два підсумкові рядки, і штатний Excel-export Interactive Report.
+
+Нижче даю варіант, який спирається на твою `ARM_OUTFIT_TREE_COUNTER_V` і на те, що `nr = 1` та `nr = 2` відповідають двом частинам звіту — **нарядам** і **розпорядженням**.
+
+Ключова логіка така: для кожного `performer_department_id` ми збираємо записи **з усіх `department`**, тому один підрозділ-виконавець виходить одним рядком. Три часові зрізи визначаються через `status_start_date/status_end_date`.
+
+```sql
+WITH params AS (
+    SELECT
+        /* 
+           Тут має бути дата, за яку будуємо звіт.
+           Замінити P6_REPORT_DATE на твій реальний item.
+           
+           Наприклад, якщо вибрано 16.08.2026:
+             slice_1 = 15.08.2026 13:00
+             slice_2 = 15.08.2026 21:00
+             slice_3 = 16.08.2026 06:00
+        */
+        TRUNC(TO_DATE(:P6_REPORT_DATE, 'DD.MM.YYYY')) - 1
+            + 13 / 24 AS slice_1,
+
+        TRUNC(TO_DATE(:P6_REPORT_DATE, 'DD.MM.YYYY')) - 1
+            + 21 / 24 AS slice_2,
+
+        TRUNC(TO_DATE(:P6_REPORT_DATE, 'DD.MM.YYYY'))
+            + 6 / 24 AS slice_3
+    FROM dual
+),
+
+/* ============================================================
+   1. Беремо вихідні записи.
+   ============================================================ */
+src AS (
+    SELECT
+        t.record_type,
+        t.group_name,
+        t.org,
+        t.department,
+        t.performer_department_id,
+        t.data_start,
+        t.status_start_date,
+        t.status_end_date,
+        t.nr,
+
+        /*
+         * Вибираємо PEOPLE залежно від UNIT.
+         *
+         * За твоєю VIEW:
+         *   UNIT 1 -> u1_people
+         *   UNIT 2 -> u2_people
+         *   UNIT 0 -> u3_people
+         */
+        CASE TO_NUMBER(NVL(:P6_MODAL_UNIT, '1'))
+            WHEN 1 THEN NVL(t.u1_people, 0)
+            WHEN 2 THEN NVL(t.u2_people, 0)
+            WHEN 0 THEN NVL(t.u3_people, 0)
+            ELSE 0
+        END AS people_count
+
+    FROM ASICS.ARM_OUTFIT_TREE_COUNTER_V t
+    WHERE 1 = 1
+
+      /* --------------------------------------------------------
+         Фільтр по вихідних department залишаємо.
+         ВАЖЛИВО:
+         performer_department_id тут НЕ фільтруємо,
+         бо саме по ньому потім агрегуємо виконавців.
+         -------------------------------------------------------- */
+      AND (
+            :P6_MODAL_DEPARTMENTS IS NULL
+            OR t.department IN (
+                SELECT column_value
+                FROM TABLE(
+                    ARM_PKG.SPLIT_STRING(
+                        :P6_MODAL_DEPARTMENTS,
+                        ':'
+                    )
+                )
+            )
+          )
+),
+
+/* ============================================================
+   2. Агрегуємо за ПІДРОЗДІЛОМ-ВИКОНАВЦЕМ.
+   
+   Саме тут:
+       department A -> performer_department_id 101 -> +
+       department B -> performer_department_id 101 -> +
+       department C -> performer_department_id 101 -> +
+       
+   => у звіті тільки ОДИН рядок для 101.
+   ============================================================ */
+performers AS (
+    SELECT
+        s.performer_department_id,
+
+        /* ---------------------- НАРЯД ---------------------- */
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_1
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_1
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_13,
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_2
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_2
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_21,
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_3
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_3
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_06,
+
+
+        /* ---------------- РОЗПОРЯДЖЕННЯ ---------------- */
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_1
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_1
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_13,
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_2
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_2
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_21,
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_3
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_3
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_06
+
+    FROM src s
+    CROSS JOIN params p
+
+    GROUP BY
+        s.performer_department_id
+),
+
+/* ============================================================
+   3. Додаємо назву performer department.
+   
+   Використовую SPR_DEPARTMENT, оскільки вона вже є
+   у твоєму поточному SQL.
+   ============================================================ */
+detail_rows AS (
+    SELECT
+        10 AS sort_group,
+
+        p.performer_department_id AS sort_id,
+
+        d.short_name AS department_name,
+
+        p.outfit_13,
+        p.outfit_21,
+        p.outfit_06,
+
+        CAST(NULL AS VARCHAR2(4000)) AS outfit_note,
+
+        p.order_13,
+        p.order_21,
+        p.order_06,
+
+        CAST(NULL AS VARCHAR2(4000)) AS order_note,
+
+        /*
+         * CSS-клас саме для звичайних рядків підрозділів.
+         */
+        'department-row' AS row_style
+
+    FROM performers p
+
+    LEFT JOIN kbs.spr_department d
+        ON d.id = p.performer_department_id
+
+    /*
+     * Якщо не хочеш показувати виконавця,
+     * у якого по ВСІХ шести зрізах 0,
+     * залишаємо цю умову.
+     */
+    WHERE NVL(p.outfit_13, 0)
+        + NVL(p.outfit_21, 0)
+        + NVL(p.outfit_06, 0)
+        + NVL(p.order_13, 0)
+        + NVL(p.order_21, 0)
+        + NVL(p.order_06, 0) > 0
+),
+
+/* ============================================================
+   4. Підраховуємо Всього.
+   ============================================================ */
+totals AS (
+    SELECT
+        SUM(outfit_13) AS outfit_13,
+        SUM(outfit_21) AS outfit_21,
+        SUM(outfit_06) AS outfit_06,
+
+        SUM(order_13)  AS order_13,
+        SUM(order_21)  AS order_21,
+        SUM(order_06)  AS order_06
+
+    FROM detail_rows
+),
+
+/* ============================================================
+   5. Формуємо фінальний набір Interactive Report.
+   ============================================================ */
+report_data AS (
+
+    /* ----- звичайні підрозділи / підрядники ----- */
+    SELECT
+        sort_group,
+        sort_id,
+
+        department_name,
+
+        outfit_13,
+        outfit_21,
+        outfit_06,
+
+        outfit_note,
+
+        order_13,
+        order_21,
+        order_06,
+
+        order_note,
+
+        row_style
+
+    FROM detail_rows
+
+
+    UNION ALL
+
+
+    /* -------------------- ВСЬОГО -------------------- */
+    SELECT
+        900 AS sort_group,
+        NULL AS sort_id,
+
+        'Всього' AS department_name,
+
+        t.outfit_13,
+        t.outfit_21,
+        t.outfit_06,
+
+        NULL AS outfit_note,
+
+        t.order_13,
+        t.order_21,
+        t.order_06,
+
+        NULL AS order_note,
+
+        'total-row' AS row_style
+
+    FROM totals t
+
+
+    UNION ALL
+
+
+    /* ------------ КІЛЬКІСТЬ ПРАЦЮЮЧИХ ------------ */
+    SELECT
+        1000 AS sort_group,
+        NULL AS sort_id,
+
+        'Кількість працюючих' AS department_name,
+
+        /*
+         * ТІЛЬКИ перші три колонки:
+         *
+         * НАРЯД + РОЗПОРЯДЖЕННЯ
+         * для відповідного моменту часу.
+         */
+        NVL(t.outfit_13, 0) + NVL(t.order_13, 0)
+            AS outfit_13,
+
+        NVL(t.outfit_21, 0) + NVL(t.order_21, 0)
+            AS outfit_21,
+
+        NVL(t.outfit_06, 0) + NVL(t.order_06, 0)
+            AS outfit_06,
+
+        NULL AS outfit_note,
+
+        /* 
+         * Тут навмисно NULL.
+         * У рядку "Кількість працюючих"
+         * друга трійка має бути порожньою.
+         */
+        NULL AS order_13,
+        NULL AS order_21,
+        NULL AS order_06,
+
+        NULL AS order_note,
+
+        'workers-total-row' AS row_style
+
+    FROM totals t
+)
+
+SELECT
+    department_name,
+    outfit_13,
+    outfit_21,
+    outfit_06,
+    outfit_note,
+    order_13,
+    order_21,
+    order_06,
+    order_note,
+    row_style
+FROM report_data
+ORDER BY
+    sort_group,
+    sort_id,
+    department_name
+```
+
+### Що вийде в Interactive Report
+
+Фізично IR матиме такі колонки:
+
+| SQL alias         | Заголовок в IR |
+| ----------------- | -------------- |
+| `DEPARTMENT_NAME` | Підрозділи     |
+| `OUTFIT_13`       | 13:00          |
+| `OUTFIT_21`       | 21:00          |
+| `OUTFIT_06`       | 06:00          |
+| `OUTFIT_NOTE`     | Примітка       |
+| `ORDER_13`        | 13:00          |
+| `ORDER_21`        | 21:00          |
+| `ORDER_06`        | 06:00          |
+| `ORDER_NOTE`      | Примітка       |
+| `ROW_STYLE`       | прихована      |
+
+У самому IR я б **не намагався робити складний дворівневий HTML header** типу `Наряд → 13:00 / 21:00 / 06:00`, якщо для тебе критичний штатний Excel-export. З погляду Excel надійніше залишити самі колонки звичайними, а `НАРЯД` і `РОЗПОРЯДЖЕННЯ` оформити над регіоном або через CSS/JS тільки в UI. SQL при цьому залишається абсолютно нормальним табличним джерелом для експорту.
+
+### CSS для першої колонки
+
+Тут є важливий нюанс: ти просив **не фарбувати весь рядок**, а підсвітити бежевим саме клітинку `Підрозділи`.
+
+Для колонки `DEPARTMENT_NAME` задай в APEX:
+
+**Static ID:**
+
+```text
+report_department
+```
+
+А `ROW_STYLE` залиш прихованою колонкою.
+
+Для самого Interactive Report встанови, наприклад, Static ID:
+
+```text
+outfit_report
+```
+
+Тоді CSS можна зробити так:
+
+```css
+/* звичайний рядок підрозділу — фарбуємо тільки першу колонку */
+#outfit_report .department-row td[headers="report_department"] {
+    background-color: #f4ecd8;
+}
+
+
+/* Всього */
+#outfit_report .total-row td {
+    font-weight: 700;
+    border-top: 2px solid #777;
+}
+
+
+/* Кількість працюючих */
+#outfit_report .workers-total-row td {
+    font-weight: 700;
+}
+
+
+/* для підсумкових рядків першу клітинку бежевою не робимо */
+#outfit_report .total-row td[headers="report_department"],
+#outfit_report .workers-total-row td[headers="report_department"] {
+    background-color: transparent;
+}
+```
+
+Але для цього треба, щоб значення `ROW_STYLE` реально потрапило як CSS-клас на `<tr>`. У стандартному Interactive Report це не відбувається автоматично просто від наявності колонки `ROW_STYLE`.
+
+Тому в APEX я б зробив трохи інакше і надійніше: **CSS-клас записати безпосередньо в `DEPARTMENT_NAME` через HTML Expression**.
+
+Для `DEPARTMENT_NAME` постав:
+
+```html
+<span class="#ROW_STYLE#">#DEPARTMENT_NAME#</span>
+```
+
+і `Escape Special Characters = No`.
+
+Тоді CSS значно простіший:
+
+```css
+/* тільки назви звичайних підрозділів */
+#outfit_report .department-row {
+    display: block;
+    background-color: #f4ecd8;
+    margin: -8px -12px;
+    padding: 8px 12px;
+}
+
+
+/* Всього */
+#outfit_report .total-row {
+    font-weight: 700;
+}
+
+
+/* Кількість працюючих */
+#outfit_report .workers-total-row {
+    font-weight: 700;
+}
+```
+
+Але **цей варіант має один недолік для Excel**: залежно від способу експорту HTML Expression може впливати на представлення першої колонки. Тому для твого випадку я більше рекомендую **не зашивати HTML у SQL**, а оформлення робити на рівні APEX/CSS.
+
+Є ще одна річ, яку я спеціально поки не «домислював»: у коді я використав `:P6_REPORT_DATE`, бо на твоїх фото я бачу логіку `P6_MODAL_TIMEMODE`, `P6_SHIFT_START`, `P6_SHIFT_END`, але не бачу достовірно item, який у новому звіті міститиме саме **дату поточної доби**. Треба просто замінити `P6_REPORT_DATE` на реальний item.
+
+І я б ще **не поспішав створювати цей SQL у APEX один-в-один** до перевірки одного моменту: чи `nr = 1` у твоїй `ARM_OUTFIT_TREE_COUNTER_V` точно означає **наряд**, а `nr = 2` — **розпорядження**. Якщо це так, структура вище вже відповідає погодженій нами моделі звіту.

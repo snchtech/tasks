@@ -1,0 +1,527 @@
+-- ============================================================
+-- Oracle APEX Interactive Report
+-- Звіт по нарядах / розпорядженнях
+--
+-- P11_UNIT:
+--   1 -> Тест 1
+--   2 -> Тест 2
+--   0 -> Тест 3
+--
+-- nr:
+--   1 -> Наряди
+--   2 -> Розпорядження
+--
+-- Структура IR:
+--   Підрозділи
+--   [Наряди]          13:00 | 21:00 | 06:00 | Примітка
+--   [Розпорядження]   13:00 | 21:00 | 06:00 | Примітка
+--
+-- Підсумки:
+--   Всього                 -> заповнюються всі 6 числових колонок
+--   Кількість працюючих    -> тільки перші 3 колонки:
+--                              Наряди + Розпорядження
+--
+-- ROW_TYPE використовується для штатного Highlight IR.
+-- ============================================================
+
+
+WITH params AS (
+    SELECT
+        /* Приклад:
+           якщо P11_REPORT_DATE = 16.08.2026:
+             15.08.2026 13:00
+             15.08.2026 21:00
+             16.08.2026 06:00
+
+           Якщо item дати у тебе має іншу назву,
+           заміни P11_REPORT_DATE нижче.
+        */
+        TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY')) - 1
+            + 13 / 24 AS slice_13,
+
+        TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY')) - 1
+            + 21 / 24 AS slice_21,
+
+        TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY'))
+            + 6 / 24 AS slice_06
+    FROM dual
+),
+
+
+/* ============================================================
+   Вихідні дані.
+   ВАЖЛИВО:
+   department використовується для фільтра,
+   а агрегування виконавців виконується по performer_department_id.
+   ============================================================ */
+src AS (
+    SELECT
+        t.record_type,
+        t.group_name,
+        t.org,
+        t.department,
+        t.performer_department_id,
+        t.data_start,
+        t.status_start_date,
+        t.status_end_date,
+        t.id_outfit,
+        t.nr,
+
+        CASE NVL(:P11_UNIT, '1')
+            WHEN '1' THEN NVL(t.u1_people, 0)
+            WHEN '2' THEN NVL(t.u2_people, 0)
+            WHEN '0' THEN NVL(t.u3_people, 0)
+            ELSE 0
+        END AS people_count
+
+    FROM ASICS.ARM_OUTFIT_TREE_COUNTER_V t
+    WHERE 1 = 1
+
+      /* Якщо item фільтра підрозділів на сторінці 11
+         має іншу назву — заміни P11_MODAL_DEPARTMENTS.
+      */
+      AND (
+            :P11_MODAL_DEPARTMENTS IS NULL
+            OR t.department IN (
+                SELECT column_value
+                FROM TABLE(
+                    ARM_PKG.SPLIT_STRING(
+                        :P11_MODAL_DEPARTMENTS,
+                        ':'
+                    )
+                )
+            )
+          )
+),
+
+
+/* ============================================================
+   Агрегування по підрозділу-виконавцю.
+
+   Наприклад:
+     department A -> performer_department_id = 101 -> 3
+     department B -> performer_department_id = 101 -> 5
+     department C -> performer_department_id = 101 -> 2
+
+   У звіті:
+     Підрозділ 101 -> 10
+   ============================================================ */
+performers AS (
+    SELECT
+        s.performer_department_id,
+
+        /* --------------------- НАРЯДИ, nr = 1 --------------------- */
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_13
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_13
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_13,
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_21
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_21
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_21,
+
+        SUM(
+            CASE
+                WHEN s.nr = 1
+                 AND s.status_start_date <= p.slice_06
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_06
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS outfit_06,
+
+
+        /* ---------------- РОЗПОРЯДЖЕННЯ, nr = 2 ---------------- */
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_13
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_13
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_13,
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_21
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_21
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_21,
+
+        SUM(
+            CASE
+                WHEN s.nr = 2
+                 AND s.status_start_date <= p.slice_06
+                 AND (
+                        s.status_end_date IS NULL
+                        OR s.status_end_date >= p.slice_06
+                     )
+                THEN s.people_count
+                ELSE 0
+            END
+        ) AS order_06
+
+    FROM src s
+    CROSS JOIN params p
+    GROUP BY s.performer_department_id
+),
+
+
+/* ============================================================
+   Детальні рядки.
+   Підрозділ-виконавець виводиться одним рядком незалежно
+   від кількості вихідних department.
+   ============================================================ */
+detail_rows AS (
+    SELECT
+        10 AS sort_group,
+        p.performer_department_id AS sort_id,
+
+        d.short_name AS department_name,
+
+        p.outfit_13,
+        p.outfit_21,
+        p.outfit_06,
+
+        CAST(NULL AS VARCHAR2(4000)) AS outfit_note,
+
+        p.order_13,
+        p.order_21,
+        p.order_06,
+
+        CAST(NULL AS VARCHAR2(4000)) AS order_note,
+
+        'DETAIL' AS row_type
+
+    FROM performers p
+
+    LEFT JOIN kbs.spr_department d
+        ON d.id = p.performer_department_id
+
+    /* Не показуємо повністю порожні рядки */
+    WHERE NVL(p.outfit_13, 0)
+        + NVL(p.outfit_21, 0)
+        + NVL(p.outfit_06, 0)
+        + NVL(p.order_13, 0)
+        + NVL(p.order_21, 0)
+        + NVL(p.order_06, 0) > 0
+),
+
+
+/* ============================================================
+   Підсумки по всіх виконавцях.
+   ============================================================ */
+totals AS (
+    SELECT
+        NVL(SUM(outfit_13), 0) AS outfit_13,
+        NVL(SUM(outfit_21), 0) AS outfit_21,
+        NVL(SUM(outfit_06), 0) AS outfit_06,
+
+        NVL(SUM(order_13), 0) AS order_13,
+        NVL(SUM(order_21), 0) AS order_21,
+        NVL(SUM(order_06), 0) AS order_06
+    FROM detail_rows
+),
+
+
+/* ============================================================
+   Фінальний dataset Interactive Report.
+   ============================================================ */
+report_data AS (
+
+    /* Детальні рядки */
+    SELECT
+        sort_group,
+        sort_id,
+        department_name,
+
+        outfit_13,
+        outfit_21,
+        outfit_06,
+        outfit_note,
+
+        order_13,
+        order_21,
+        order_06,
+        order_note,
+
+        row_type
+
+    FROM detail_rows
+
+
+    UNION ALL
+
+
+    /* Всього — підсумок у КОЖНІЙ із 6 числових колонок */
+    SELECT
+        900 AS sort_group,
+        NULL AS sort_id,
+        'Всього' AS department_name,
+
+        t.outfit_13,
+        t.outfit_21,
+        t.outfit_06,
+        NULL AS outfit_note,
+
+        t.order_13,
+        t.order_21,
+        t.order_06,
+        NULL AS order_note,
+
+        'TOTAL' AS row_type
+
+    FROM totals t
+
+
+    UNION ALL
+
+
+    /* Кількість працюючих:
+       заповнюються ТІЛЬКИ перші три часові колонки.
+
+       13:00 = Наряди 13:00 + Розпорядження 13:00
+       21:00 = Наряди 21:00 + Розпорядження 21:00
+       06:00 = Наряди 06:00 + Розпорядження 06:00
+    */
+    SELECT
+        1000 AS sort_group,
+        NULL AS sort_id,
+        'Кількість працюючих' AS department_name,
+
+        t.outfit_13 + t.order_13 AS outfit_13,
+        t.outfit_21 + t.order_21 AS outfit_21,
+        t.outfit_06 + t.order_06 AS outfit_06,
+
+        NULL AS outfit_note,
+
+        NULL AS order_13,
+        NULL AS order_21,
+        NULL AS order_06,
+
+        NULL AS order_note,
+
+        'WORKERS_TOTAL' AS row_type
+
+    FROM totals t
+)
+
+
+SELECT
+    department_name,
+    outfit_13,
+    outfit_21,
+    outfit_06,
+    outfit_note,
+    order_13,
+    order_21,
+    order_06,
+    order_note,
+    row_type
+FROM report_data
+ORDER BY
+    sort_group,
+    sort_id,
+    department_name;
+
+
+/* ============================================================
+   НАЛАШТУВАННЯ INTERACTIVE REPORT
+   ============================================================
+
+1. Колонки IR
+
+   DEPARTMENT_NAME
+       Heading: Підрозділи
+
+   OUTFIT_13
+       Heading: 13:00
+       Group: Наряди
+
+   OUTFIT_21
+       Heading: 21:00
+       Group: Наряди
+
+   OUTFIT_06
+       Heading: 06:00
+       Group: Наряди
+
+   OUTFIT_NOTE
+       Heading: Примітка
+       Group: Наряди
+
+   ORDER_13
+       Heading: 13:00
+       Group: Розпорядження
+
+   ORDER_21
+       Heading: 21:00
+       Group: Розпорядження
+
+   ORDER_06
+       Heading: 06:00
+       Group: Розпорядження
+
+   ORDER_NOTE
+       Heading: Примітка
+       Group: Розпорядження
+
+   ROW_TYPE
+       Службова колонка.
+       Можна приховати з основного відображення,
+       але залишити доступною для Highlight.
+
+
+2. Highlight
+
+   DETAIL
+   ------
+   Для DEPARTMENT_NAME:
+       ROW_TYPE = DETAIL
+       Cell Highlight
+       Background: світло-бежевий
+
+   TOTAL
+   -----
+       ROW_TYPE = TOTAL
+
+   WORKERS_TOTAL
+   -------------
+       ROW_TYPE = WORKERS_TOTAL
+
+
+3. P11_UNIT
+
+   Select List:
+       Default = 1
+
+   Значення:
+       1 -> Тест 1
+       2 -> Тест 2
+       0 -> Тест 3
+
+   При зміні P11_UNIT:
+       Dynamic Action -> Refresh Interactive Report.
+
+
+4. Заголовок залежно від P11_UNIT
+
+   Варіант без додаткового hidden item:
+   у Region Title можна використати substitution item лише для самого
+   значення, тому для текстового CASE зручніше мати P11_REPORT_TITLE.
+
+   Створити hidden item:
+       P11_REPORT_TITLE
+
+   Перед Refresh або під час завантаження сторінки:
+
+       BEGIN
+           :P11_REPORT_TITLE :=
+               CASE :P11_UNIT
+                   WHEN '1' THEN 'Тест 1'
+                   WHEN '2' THEN 'Тест 2'
+                   WHEN '0' THEN 'Тест 3'
+                   ELSE 'Тест 1'
+               END;
+       END;
+
+   Region Title:
+       &P11_REPORT_TITLE.
+
+
+5. Важливо для Dynamic Action P11_UNIT
+
+   Порядок дій:
+       1) Execute Server-side Code:
+              BEGIN
+                  :P11_REPORT_TITLE :=
+                      CASE :P11_UNIT
+                          WHEN '1' THEN 'Тест 1'
+                          WHEN '2' THEN 'Тест 2'
+                          WHEN '0' THEN 'Тест 3'
+                          ELSE 'Тест 1'
+                      END;
+              END;
+
+          Items to Submit:
+              P11_UNIT
+
+          Items to Return:
+              P11_REPORT_TITLE
+
+       2) Refresh Region із заголовком, якщо потрібно
+       3) Refresh Interactive Report
+
+   P11_UNIT також ОБОВ'ЯЗКОВО додати в Page Items to Submit
+   Interactive Report / Region, якщо SQL виконується AJAX-refresh.
+
+
+6. Групування колонок для Excel export
+
+   Група "Наряди":
+       OUTFIT_13
+       OUTFIT_21
+       OUTFIT_06
+       OUTFIT_NOTE
+
+   Група "Розпорядження":
+       ORDER_13
+       ORDER_21
+       ORDER_06
+       ORDER_NOTE
+
+   Це дозволяє при експорті чітко розділити дві групи колонок.
+
+
+7. Примітки
+
+   У поточному SQL OUTFIT_NOTE та ORDER_NOTE залишені NULL,
+   оскільки джерело/логіка тексту примітки ще не визначені.
+   Структура колонок уже готова, тому пізніше їх можна заповнити
+   без перебудови Interactive Report.
+
+
+8. Перевірити назви item
+
+   У коді використано:
+       P11_UNIT
+       P11_REPORT_DATE
+       P11_MODAL_DEPARTMENTS
+       P11_REPORT_TITLE
+
+   Якщо реальні item на сторінці мають інші назви —
+   необхідно просто замінити їх у SQL / Dynamic Action.
+
+============================================================ */
