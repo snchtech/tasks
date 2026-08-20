@@ -1,0 +1,648 @@
+ORACLE APEX 24 — ФІНАЛЬНИЙ ВАРІАНТ ЗВІТУ ЧЕРЕЗ APEX_COLLECTION
+
+Мета:
+- важку ASICS.ARM_OUTFIT_TREE_COUNTER_V опрацьовувати один раз;
+- агрегований результат зберігати в APEX collection REP_SRC;
+- Interactive Report будувати вже по маленькій колекції;
+- при зміні P11_REPORT_DATE або P11_UNIT перебудовувати колекцію
+  і лише після цього Refresh Interactive Report.
+
+Структура звіту:
+
+                       НАРЯДИ                         РОЗПОРЯДЖЕННЯ
+Підрозділи     13:00   21:00   06:00   Примітка   13:00   21:00   06:00   Примітка
+------------------------------------------------------------------------------------
+Підрозділ 1       ...     ...     ...                 ...     ...     ...
+Підрозділ 2       ...     ...     ...                 ...     ...     ...
+...
+Підрядник 1       ...     ...     ...                 ...     ...     ...
+------------------------------------------------------------------------------------
+Всього            SUM     SUM     SUM                 SUM     SUM     SUM
+Кількість
+працюючих       N+R13   N+R21   N+R06
+
+nr = 1 -> Наряди
+nr = 2 -> Розпорядження
+
+P11_UNIT:
+1 -> U1_PEOPLE -> "Тест 1"
+2 -> U2_PEOPLE -> "Тест 2"
+0 -> U3_PEOPLE -> "Тест 3"
+
+ВАЖЛИВО:
+жодного фільтра по department немає.
+Беруться записи з УСІХ department і сумуються по PERFORMER_DEPARTMENT_ID.
+
+
+====================================================================
+1. PAGE ITEMS
+====================================================================
+
+P11_REPORT_DATE
+    Date Picker
+    Format Mask: DD.MM.YYYY
+
+P11_UNIT
+    Select List
+    1 -> Тест 1
+    2 -> Тест 2
+    0 -> Тест 3
+    Default: 1
+
+P11_REPORT_TITLE
+    Hidden або Display Only.
+
+
+====================================================================
+2. BEFORE HEADER — ПОЧАТКОВЕ ФОРМУВАННЯ REP_SRC
+====================================================================
+
+Page Process:
+    BUILD REP_SRC - INITIAL
+
+Point:
+    Before Header
+
+PL/SQL Code:
+
+DECLARE
+    l_names  apex_application_global.vc_arr2;
+    l_values apex_application_global.vc_arr2;
+BEGIN
+    :P11_REPORT_TITLE :=
+        CASE NVL(:P11_UNIT, '1')
+            WHEN '1' THEN 'Тест 1'
+            WHEN '2' THEN 'Тест 2'
+            WHEN '0' THEN 'Тест 3'
+            ELSE 'Тест 1'
+        END;
+
+    IF apex_collection.collection_exists('REP_SRC') THEN
+        apex_collection.delete_collection('REP_SRC');
+    END IF;
+
+    l_names(1)  := 'P11_REPORT_DATE';
+    l_values(1) := :P11_REPORT_DATE;
+
+    l_names(2)  := 'P11_UNIT';
+    l_values(2) := NVL(:P11_UNIT, '1');
+
+    apex_collection.create_collection_from_query_b(
+        p_collection_name => 'REP_SRC',
+
+        p_query => q'~
+            WITH params AS (
+                SELECT
+                    TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY'))
+                        - 1 + 13 / 24 AS slice_13,
+
+                    TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY'))
+                        - 1 + 21 / 24 AS slice_21,
+
+                    TRUNC(TO_DATE(:P11_REPORT_DATE, 'DD.MM.YYYY'))
+                        + 6 / 24 AS slice_06
+                FROM dual
+            ),
+
+            src AS (
+                SELECT
+                    t.performer_department_id,
+                    t.status_start_date,
+                    t.status_end_date,
+                    t.nr,
+
+                    CASE NVL(:P11_UNIT, '1')
+                        WHEN '1' THEN NVL(t.u1_people, 0)
+                        WHEN '2' THEN NVL(t.u2_people, 0)
+                        WHEN '0' THEN NVL(t.u3_people, 0)
+                        ELSE 0
+                    END AS people_count
+
+                FROM ASICS.ARM_OUTFIT_TREE_COUNTER_V t
+                CROSS JOIN params p
+
+                WHERE t.nr IN (1, 2)
+                  AND t.status_start_date <= p.slice_06
+                  AND (
+                        t.status_end_date IS NULL
+                        OR t.status_end_date >= p.slice_13
+                      )
+                  AND t.performer_department_id IS NOT NULL
+            ),
+
+            performers AS (
+                SELECT
+                    s.performer_department_id,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 1
+                             AND s.status_start_date <= p.slice_13
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_13
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS outfit_13,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 1
+                             AND s.status_start_date <= p.slice_21
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_21
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS outfit_21,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 1
+                             AND s.status_start_date <= p.slice_06
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_06
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS outfit_06,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 2
+                             AND s.status_start_date <= p.slice_13
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_13
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS order_13,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 2
+                             AND s.status_start_date <= p.slice_21
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_21
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS order_21,
+
+                    SUM(
+                        CASE
+                            WHEN s.nr = 2
+                             AND s.status_start_date <= p.slice_06
+                             AND (
+                                    s.status_end_date IS NULL
+                                    OR s.status_end_date >= p.slice_06
+                                 )
+                            THEN s.people_count
+                            ELSE 0
+                        END
+                    ) AS order_06
+
+                FROM src s
+                CROSS JOIN params p
+                GROUP BY s.performer_department_id
+            )
+
+            SELECT
+                TO_CHAR(p.performer_department_id),
+                TO_CHAR(NVL(p.outfit_13, 0)),
+                TO_CHAR(NVL(p.outfit_21, 0)),
+                TO_CHAR(NVL(p.outfit_06, 0)),
+                TO_CHAR(NVL(p.order_13, 0)),
+                TO_CHAR(NVL(p.order_21, 0)),
+                TO_CHAR(NVL(p.order_06, 0))
+            FROM performers p
+            WHERE NVL(p.outfit_13, 0)
+                + NVL(p.outfit_21, 0)
+                + NVL(p.outfit_06, 0)
+                + NVL(p.order_13, 0)
+                + NVL(p.order_21, 0)
+                + NVL(p.order_06, 0) > 0
+        ~',
+
+        p_names  => l_names,
+        p_values => l_values
+    );
+END;
+
+
+====================================================================
+3. SQL SOURCE INTERACTIVE REPORT
+====================================================================
+
+WITH base_data AS (
+    SELECT
+        TO_NUMBER(c001) AS performer_department_id,
+        NVL(TO_NUMBER(c002), 0) AS outfit_13,
+        NVL(TO_NUMBER(c003), 0) AS outfit_21,
+        NVL(TO_NUMBER(c004), 0) AS outfit_06,
+        NVL(TO_NUMBER(c005), 0) AS order_13,
+        NVL(TO_NUMBER(c006), 0) AS order_21,
+        NVL(TO_NUMBER(c007), 0) AS order_06
+    FROM apex_collections
+    WHERE collection_name = 'REP_SRC'
+),
+
+detail_rows AS (
+    SELECT
+        b.performer_department_id,
+        NVL(
+            d.short_name,
+            'ID ' || TO_CHAR(b.performer_department_id)
+        ) AS department_name,
+        b.outfit_13,
+        b.outfit_21,
+        b.outfit_06,
+        b.order_13,
+        b.order_21,
+        b.order_06
+    FROM base_data b
+    LEFT JOIN kbs.spr_department d
+        ON d.id = b.performer_department_id
+),
+
+totals AS (
+    SELECT
+        NVL(SUM(outfit_13), 0) AS outfit_13,
+        NVL(SUM(outfit_21), 0) AS outfit_21,
+        NVL(SUM(outfit_06), 0) AS outfit_06,
+        NVL(SUM(order_13), 0) AS order_13,
+        NVL(SUM(order_21), 0) AS order_21,
+        NVL(SUM(order_06), 0) AS order_06
+    FROM detail_rows
+),
+
+report_data AS (
+    SELECT
+        10 AS sort_group,
+        d.performer_department_id AS sort_id,
+        d.department_name,
+        d.outfit_13,
+        d.outfit_21,
+        d.outfit_06,
+        CAST(NULL AS VARCHAR2(4000)) AS outfit_note,
+        d.order_13,
+        d.order_21,
+        d.order_06,
+        CAST(NULL AS VARCHAR2(4000)) AS order_note,
+        'DETAIL' AS row_type
+    FROM detail_rows d
+
+    UNION ALL
+
+    SELECT
+        900 AS sort_group,
+        NULL AS sort_id,
+        'Всього' AS department_name,
+        t.outfit_13,
+        t.outfit_21,
+        t.outfit_06,
+        NULL AS outfit_note,
+        t.order_13,
+        t.order_21,
+        t.order_06,
+        NULL AS order_note,
+        'TOTAL' AS row_type
+    FROM totals t
+
+    UNION ALL
+
+    SELECT
+        1000 AS sort_group,
+        NULL AS sort_id,
+        'Кількість працюючих' AS department_name,
+        t.outfit_13 + t.order_13 AS outfit_13,
+        t.outfit_21 + t.order_21 AS outfit_21,
+        t.outfit_06 + t.order_06 AS outfit_06,
+        NULL AS outfit_note,
+        NULL AS order_13,
+        NULL AS order_21,
+        NULL AS order_06,
+        NULL AS order_note,
+        'WORKERS_TOTAL' AS row_type
+    FROM totals t
+)
+
+SELECT
+    department_name,
+    outfit_13,
+    outfit_21,
+    outfit_06,
+    outfit_note,
+    order_13,
+    order_21,
+    order_06,
+    order_note,
+    row_type
+FROM report_data
+ORDER BY
+    sort_group,
+    sort_id,
+    department_name;
+
+
+====================================================================
+4. НАЛАШТУВАННЯ КОЛОНОК IR
+====================================================================
+
+DEPARTMENT_NAME -> Підрозділи
+
+Група "Наряди":
+OUTFIT_13   -> 13:00
+OUTFIT_21   -> 21:00
+OUTFIT_06   -> 06:00
+OUTFIT_NOTE -> Примітка
+
+Група "Розпорядження":
+ORDER_13   -> 13:00
+ORDER_21   -> 21:00
+ORDER_06   -> 06:00
+ORDER_NOTE -> Примітка
+
+ROW_TYPE -> службова колонка для Highlight.
+
+
+====================================================================
+5. HIGHLIGHT IR
+====================================================================
+
+ROW_TYPE = DETAIL
+    Cell Highlight для DEPARTMENT_NAME
+    світло-бежевий фон.
+
+ROW_TYPE = TOTAL
+    окреме оформлення "Всього".
+
+ROW_TYPE = WORKERS_TOTAL
+    окреме оформлення "Кількість працюючих".
+
+
+====================================================================
+6. ОНОВЛЕННЯ ПРИ ЗМІНІ UNIT АБО DATE
+====================================================================
+
+Після переходу на APEX_COLLECTION недостатньо робити тільки:
+    Change -> Refresh Interactive Report
+
+Бо IR тоді перечитає стару REP_SRC.
+
+Правильний порядок:
+
+    Change P11_UNIT або P11_REPORT_DATE
+        ↓
+    Execute Server-side Code
+        ↓
+    перебудувати REP_SRC
+        ↓
+    Refresh Interactive Report
+
+
+Створи Dynamic Action:
+
+Name:
+    REBUILD REPORT
+
+Event:
+    Change
+
+Selection Type:
+    Item(s)
+
+Items:
+    P11_UNIT,P11_REPORT_DATE
+
+
+TRUE ACTION 1:
+    Execute Server-side Code
+
+PL/SQL Code:
+    використай той самий PL/SQL блок із секції 2
+    "BEFORE HEADER — ПОЧАТКОВЕ ФОРМУВАННЯ REP_SRC".
+
+Items to Submit:
+    P11_REPORT_DATE
+    P11_UNIT
+
+Items to Return:
+    P11_REPORT_TITLE
+
+Wait for Result:
+    Yes
+
+Sequence:
+    10
+
+
+TRUE ACTION 2:
+    Refresh
+
+Affected Elements:
+    Region
+
+Region:
+    Interactive Report
+
+Sequence:
+    20
+
+
+ВАЖЛИВО:
+Wait for Result = Yes.
+Інакше Refresh IR може стартувати раніше, ніж створиться нова REP_SRC.
+
+
+====================================================================
+7. ЩО ВІДБУВАЄТЬСЯ ПРИ ЗМІНІ UNIT
+====================================================================
+
+Наприклад:
+P11_UNIT = 1 -> користувач вибирає 2
+
+    ↓
+
+Dynamic Action
+
+    ↓
+
+P11_UNIT потрапляє в Session State
+
+    ↓
+
+REP_SRC видаляється
+
+    ↓
+
+важкий query виконується повторно
+
+    ↓
+
+CASE :P11_UNIT бере U2_PEOPLE
+
+    ↓
+
+нова REP_SRC
+
+    ↓
+
+P11_REPORT_TITLE = "Тест 2"
+
+    ↓
+
+Refresh Interactive Report
+
+    ↓
+
+IR читає вже нову REP_SRC.
+
+
+====================================================================
+8. ЩО ВІДБУВАЄТЬСЯ ПРИ ЗМІНІ DATE
+====================================================================
+
+Наприклад:
+P11_REPORT_DATE = 16.08.2026
+
+Часові зрізи:
+15.08.2026 13:00
+15.08.2026 21:00
+16.08.2026 06:00
+
+Користувач змінює дату на 17.08.2026.
+
+Dynamic Action перебудовує REP_SRC.
+
+Нові зрізи:
+16.08.2026 13:00
+16.08.2026 21:00
+17.08.2026 06:00
+
+Після цього Refresh IR.
+
+
+====================================================================
+9. ОНОВЛЕННЯ ЗАГОЛОВКА
+====================================================================
+
+Region Title:
+    &P11_REPORT_TITLE.
+
+На повному Page Load значення буде сформовано Before Header.
+
+Якщо після AJAX-зміни UNIT Region Title у твоєму шаблоні
+не перемальовується, задай Static ID регіону:
+
+    outfit_report
+
+і додай між Server-side Code та Refresh IR
+ще одну True Action:
+
+Execute JavaScript Code:
+
+$("#outfit_report .t-Region-title")
+    .text($v("P11_REPORT_TITLE"));
+
+Тоді sequence:
+
+10 Execute Server-side Code
+20 Execute JavaScript Code
+30 Refresh Interactive Report
+
+
+====================================================================
+10. ПЕРЕВІРКА КОЛЕКЦІЇ
+====================================================================
+
+Для діагностики:
+
+SELECT
+    seq_id,
+    c001 AS performer_department_id,
+    c002 AS outfit_13,
+    c003 AS outfit_21,
+    c004 AS outfit_06,
+    c005 AS order_13,
+    c006 AS order_21,
+    c007 AS order_06
+FROM apex_collections
+WHERE collection_name = 'REP_SRC'
+ORDER BY seq_id;
+
+
+Якщо REP_SRC має записи, а DETAIL не видно, перевір:
+
+WITH base_data AS (
+    SELECT
+        TO_NUMBER(c001) AS performer_department_id,
+        NVL(TO_NUMBER(c002), 0) AS outfit_13,
+        NVL(TO_NUMBER(c003), 0) AS outfit_21,
+        NVL(TO_NUMBER(c004), 0) AS outfit_06,
+        NVL(TO_NUMBER(c005), 0) AS order_13,
+        NVL(TO_NUMBER(c006), 0) AS order_21,
+        NVL(TO_NUMBER(c007), 0) AS order_06
+    FROM apex_collections
+    WHERE collection_name = 'REP_SRC'
+)
+SELECT
+    b.performer_department_id,
+    NVL(d.short_name, 'ID ' || b.performer_department_id) AS department_name,
+    b.outfit_13,
+    b.outfit_21,
+    b.outfit_06,
+    b.order_13,
+    b.order_21,
+    b.order_06
+FROM base_data b
+LEFT JOIN kbs.spr_department d
+    ON d.id = b.performer_department_id
+ORDER BY b.performer_department_id;
+
+
+====================================================================
+11. ПІДСУМКОВА СХЕМА
+====================================================================
+
+PAGE LOAD
+   |
+   v
+Before Header
+   |
+   v
+Build REP_SRC from heavy VIEW
+   |
+   v
+Interactive Report reads REP_SRC
+
+
+CHANGE P11_UNIT / P11_REPORT_DATE
+   |
+   v
+Dynamic Action
+   |
+   v
+Execute Server-side Code
+   |
+   +--> update P11_REPORT_TITLE
+   |
+   +--> delete REP_SRC
+   |
+   +--> rebuild REP_SRC
+   |
+   v
+Refresh Interactive Report
+   |
+   v
+Report shows new data

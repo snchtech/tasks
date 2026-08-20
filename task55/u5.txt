@@ -1,0 +1,373 @@
+Так, сам підхід із колекцією тут цілком логічний. Для важкої `VIEW` він навіть кращий: важкий запит виконуємо **один раз**, результат агрегуємо до невеликої кількості рядків і кладемо в `APEX_COLLECTION`, а Interactive Report уже працює з легкою колекцією.
+
+За твоїми фото бачу, що архітектура зараз приблизно така:
+
+```text
+Before Header
+    ↓
+важка ARM_OUTFIT_TREE_COUNTER_V
+    ↓
+агрегація по performer_department_id
+    ↓
+APEX_COLLECTION REP_SRC
+    ↓
+Interactive Report
+    ↓
+приєднання назв підрозділів
+    ↓
+DETAIL + ВСЬОГО + КІЛЬКІСТЬ ПРАЦЮЮЧИХ
+```
+
+І це правильний напрямок.
+
+Проблема в тому, що якщо фінальний SQL IR написаний так, як на фото, то за наявності записів у `REP_SRC` він **обов'язково повинен повертати DETAIL-рядки**. Якщо ти бачиш лише `Всього` і `Кількість працюючих`, перше, що треба перевірити — чи реально в колекції є рядки.
+
+У SQL Commands або тимчасовому Classic Report виконай:
+
+```sql
+select
+    seq_id,
+    c001,
+    c002,
+    c003,
+    c004,
+    c005,
+    c006,
+    c007
+from apex_collections
+where collection_name = 'REP_SRC'
+order by seq_id;
+```
+
+Якщо тут **0 рядків**, проблема не в SQL Interactive Report, а в процесі `Before Header`.
+
+Якщо рядки є, наприклад:
+
+```text
+C001 = 1018
+C002 = 5
+C003 = 4
+C004 = 3
+C005 = 2
+C006 = 1
+C007 = 1
+```
+
+тоді твій IR повинен показувати цей підрозділ.
+
+### Я б трохи змінив структуру колекції
+
+Зараз ти використовуєш:
+
+```sql
+TO_NUMBER(c001) AS performer_department_id,
+TO_NUMBER(c002) AS outfit_13,
+...
+```
+
+Я б у процесі створення колекції **явно перетворював усі сім значень у VARCHAR2**. Тоді немає залежності від того, як bulk-варіант `APEX_COLLECTION` інтерпретує числові колонки.
+
+У `p_query` фінальний SELECT зроби таким:
+
+```sql
+SELECT
+    TO_CHAR(p.performer_department_id) AS performer_department_id,
+    TO_CHAR(p.outfit_13) AS outfit_13,
+    TO_CHAR(p.outfit_21) AS outfit_21,
+    TO_CHAR(p.outfit_06) AS outfit_06,
+    TO_CHAR(p.order_13)  AS order_13,
+    TO_CHAR(p.order_21)  AS order_21,
+    TO_CHAR(p.order_06)  AS order_06
+FROM performers p
+WHERE NVL(p.outfit_13, 0)
+    + NVL(p.outfit_21, 0)
+    + NVL(p.outfit_06, 0)
+    + NVL(p.order_13, 0)
+    + NVL(p.order_21, 0)
+    + NVL(p.order_06, 0) > 0
+```
+
+Тоді в `REP_SRC` гарантовано матимемо:
+
+```text
+C001 → performer_department_id
+C002 → Наряди 13:00
+C003 → Наряди 21:00
+C004 → Наряди 06:00
+
+C005 → Розпорядження 13:00
+C006 → Розпорядження 21:00
+C007 → Розпорядження 06:00
+```
+
+І фінальний IR я б залишив дуже простим:
+
+```sql
+WITH base_data AS (
+    SELECT
+        TO_NUMBER(c001) AS performer_department_id,
+
+        NVL(TO_NUMBER(c002), 0) AS outfit_13,
+        NVL(TO_NUMBER(c003), 0) AS outfit_21,
+        NVL(TO_NUMBER(c004), 0) AS outfit_06,
+
+        NVL(TO_NUMBER(c005), 0) AS order_13,
+        NVL(TO_NUMBER(c006), 0) AS order_21,
+        NVL(TO_NUMBER(c007), 0) AS order_06
+
+    FROM apex_collections
+    WHERE collection_name = 'REP_SRC'
+),
+
+detail_rows AS (
+    SELECT
+        b.performer_department_id,
+
+        NVL(
+            d.short_name,
+            'ID ' || b.performer_department_id
+        ) AS department_name,
+
+        b.outfit_13,
+        b.outfit_21,
+        b.outfit_06,
+
+        b.order_13,
+        b.order_21,
+        b.order_06
+
+    FROM base_data b
+
+    LEFT JOIN kbs.spr_department d
+        ON d.id = b.performer_department_id
+),
+
+totals AS (
+    SELECT
+        NVL(SUM(outfit_13), 0) AS outfit_13,
+        NVL(SUM(outfit_21), 0) AS outfit_21,
+        NVL(SUM(outfit_06), 0) AS outfit_06,
+
+        NVL(SUM(order_13), 0) AS order_13,
+        NVL(SUM(order_21), 0) AS order_21,
+        NVL(SUM(order_06), 0) AS order_06
+
+    FROM detail_rows
+)
+
+SELECT
+    10 AS sort_group,
+    performer_department_id AS sort_id,
+
+    department_name,
+
+    outfit_13,
+    outfit_21,
+    outfit_06,
+
+    CAST(NULL AS VARCHAR2(4000)) AS outfit_note,
+
+    order_13,
+    order_21,
+    order_06,
+
+    CAST(NULL AS VARCHAR2(4000)) AS order_note,
+
+    'DETAIL' AS row_type
+
+FROM detail_rows
+
+
+UNION ALL
+
+
+SELECT
+    900 AS sort_group,
+    NULL AS sort_id,
+
+    'Всього' AS department_name,
+
+    t.outfit_13,
+    t.outfit_21,
+    t.outfit_06,
+
+    NULL AS outfit_note,
+
+    t.order_13,
+    t.order_21,
+    t.order_06,
+
+    NULL AS order_note,
+
+    'TOTAL' AS row_type
+
+FROM totals t
+
+
+UNION ALL
+
+
+SELECT
+    1000 AS sort_group,
+    NULL AS sort_id,
+
+    'Кількість працюючих' AS department_name,
+
+    t.outfit_13 + t.order_13 AS outfit_13,
+    t.outfit_21 + t.order_21 AS outfit_21,
+    t.outfit_06 + t.order_06 AS outfit_06,
+
+    NULL AS outfit_note,
+
+    NULL AS order_13,
+    NULL AS order_21,
+    NULL AS order_06,
+
+    NULL AS order_note,
+
+    'WORKERS_TOTAL' AS row_type
+
+FROM totals t
+
+ORDER BY
+    sort_group,
+    sort_id,
+    department_name
+```
+
+Я спеціально додав:
+
+```sql
+NVL(
+    d.short_name,
+    'ID ' || b.performer_department_id
+) AS department_name
+```
+
+Це дуже корисно для діагностики.
+
+Якщо `performer_department_id` є в колекції, але для нього чомусь немає відповідного запису в:
+
+```sql
+kbs.spr_department
+```
+
+рядок **все одно відобразиться**:
+
+```text
+ID 1018 | 5 | 4 | 3 | ... 
+```
+
+а не зникне або матиме незрозуміло порожню назву.
+
+---
+
+### Але є ще важливіша проблема з `Before Header`
+
+Твоя поточна схема:
+
+```text
+Before Header → створити REP_SRC
+```
+
+працюватиме при **повному завантаженні сторінки**.
+
+Але коли користувач зробить:
+
+```text
+P11_UNIT = 1
+        ↓
+змінює на 2
+        ↓
+Refresh Interactive Report
+```
+
+процес **Before Header повторно не виконається**.
+
+Отже, Interactive Report перечитає стару `REP_SRC` і покаже старі дані.
+
+Так само з датою.
+
+Тобто після переходу на колекцію вже недостатньо просто:
+
+```text
+Change P11_UNIT
+→ Refresh IR
+```
+
+Треба:
+
+```text
+Change P11_UNIT
+        ↓
+перебудувати REP_SRC
+        ↓
+Refresh Interactive Report
+```
+
+І аналогічно:
+
+```text
+Change P11_REPORT_DATE
+        ↓
+перебудувати REP_SRC
+        ↓
+Refresh Interactive Report
+```
+
+Я б тому **виніс код формування колекції в окремий Ajax Callback або Execute Server-side Code Dynamic Action**, а `Before Header` використовував тільки для початкового завантаження.
+
+Схема тоді буде:
+
+```text
+              Відкриття Page 11
+                     ↓
+             створити REP_SRC
+                     ↓
+               показати IR
+
+
+P11_UNIT змінено                   P11_REPORT_DATE змінено
+       ↓                                    ↓
+перебудувати REP_SRC               перебудувати REP_SRC
+       ↓                                    ↓
+Refresh IR                          Refresh IR
+```
+
+### І ще один момент у важкому запиті
+
+На твоєму фото бачу дуже правильну оптимізацію:
+
+```sql
+WHERE t.status_start_date <= p.slice_06
+  AND (
+       t.status_end_date IS NULL
+       OR t.status_end_date >= p.slice_13
+  )
+```
+
+Тобто ще **до `GROUP BY`** відкидаєш записи, які гарантовано не могли бути активними в жодному з трьох зрізів.
+
+Це варто залишити.
+
+Виходить інтервал:
+
+```text
+потрібні тільки записи, які хоч якось перетинають:
+
+попередня доба 13:00
+        ↓
+попередня доба 21:00
+        ↓
+поточна доба 06:00
+```
+
+А вже потім окремі `CASE` визначають, чи активний запис конкретно о 13:00, 21:00 або 06:00.
+
+Це набагато краще, ніж ганяти всю `ARM_OUTFIT_TREE_COUNTER_V` через шість `SUM(CASE...)`.
+
+---
+
+Ще я б перевірив **Interactive Report → Actions → Filter**. Якщо ти багато разів міняв SQL одного й того ж IR, APEX міг зберегти старий user/default report із фільтром на `ROW_TYPE`, `DEPARTMENT_NAME` чи іншу колонку. Для тесту зроби `Actions → Report → Reset`. Тому що сам SQL на твоєму першому фото логічно повертає `DETAIL + TOTAL + WORKERS_TOTAL`; якщо `REP_SRC` непорожня, але видно лише два підсумкові рядки, дуже ймовірно, що або колекція фактично порожня, або на IR залишився старий фільтр.
+
+Я б зараз рухався в такому порядку: **спочатку перевірити `REP_SRC` простим SELECT**, потім перевірити `detail_rows` без `UNION ALL`, і лише після цього фінальний IR. Так ми за 2–3 запити точно побачимо, на якому етапі зникають підрозділи.
